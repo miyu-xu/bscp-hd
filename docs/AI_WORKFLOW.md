@@ -1,51 +1,93 @@
-# 完全 AI 开发与人工决策流程
+# 完全 AI 开发、验证与回读闭环
 
 ## 角色边界
 
-人工只负责方向和不可逆决策：产品优先级、guest 构件来源、协议兼容策略、安全边界、发布授权、外部系统权限与是否解除测试限制。AI 负责需求拆分、实现、构建、诊断、测试代码、非 unittest 自动验证、文档、回读、修复迭代和本地提交。
+人工只负责方向决策：产品优先级、Guest/组件来源、信任根、兼容策略、安全边界、不可逆迁移、外部权限和发布授权。AI 负责需求拆分、架构/协议、实现、打点、测试源码、构建、非 unittest 黑盒验证、失败诊断、修复迭代、文档、证据回读和经授权的本地提交。
 
-AI 不因“完全 AI 开发”获得额外权限：不得自行下载未批准 guest 镜像、push、发布、删除用户数据、覆盖用户改动或替人工选择会改变产品方向的方案。
+“AI 为主”不扩大权限。AI 不下载未批准镜像，不创建/使用未知凭据，不发布或 push，不删除用户数据，不 reset/rebase/清理脏树，也不替人工做会改变产品契约的选择。
 
-## 每个增量的闭环
+## 仓库内固化资产
+
+流程不是聊天约定，而由以下文件和程序共同强制：
+
+- `AGENTS.md`：角色、权限、MinGW、跨平台、数据安全和不运行 unittest 的最高层约束；
+- `automation/schemas/task.schema.json`：V2 任务卷，包括目标、范围、验收、gate、证据分层、方向决策、阻塞和下一迭代；
+- `automation/schemas/gate-report.schema.json`：每个可执行 gate 的命令、时间、退出码、日志和结果；
+- `automation/schemas/readback.schema.json`：gate 汇总、仓库 HEAD/dirty、证据状态、阻塞和结论；
+- `automation/tasks/*.json`：可跨会话继续的事实状态；
+- `xtask process-check`：逐个校验上述 schema/任务/样例/必需文档，并扫描自动脚本中的 unittest 调用；
+- `xtask quality`：流程、diff、格式、all-targets、Clippy、build 和独立 smoke；
+- `xtask ai-cycle`：执行质量门，即使失败也生成 gate report 与 readback；
+- `xtask readback`：合并已有 gate，回读 HD/crosvm/gfxstream/根仓库状态；
+- `scripts/integration-quality.ps1`：在同一 MinGW ABI 下执行跨仓编译和根发布验证；
+- `.github/workflows/ci.yml`：CI 调用同一入口，并在失败时仍上传回读证据。
+
+修改这些流程资产本身也必须通过 `process-check`，不能只在文档中声称已经固化。
+
+## 每轮确定性闭环
 
 ```text
-约束/脏树回读
-    ↓
-写出行为与完成证据
-    ↓
-最小协议/架构改动
-    ↓
-实现 + 打点 + 测试代码
-    ↓
-format/check/clippy → smoke → 集成编译 → ABI 审计
-    ↓                                  │
-失败证据 ───────── 自动修复并重跑 ←───┘
-    ↓
-diff/status/运行证据回读
-    ↓
-按嵌套仓库本地提交（不 push）
+AGENTS + 任务卷 + 脏树 + 上轮 readback
+                    │
+                    ▼
+       行为/错误码/事件/完成证据
+                    │
+                    ▼
+ portable V2 contract → 平台 adapter → runtime → UI/CLI
+                    │
+                    ▼
+      测试源码 + 黑盒场景 + 诊断/证据输出
+                    │
+                    ▼
+ process/diff/fmt/check/clippy/build/smoke/integration/runner
+                    │
+          失败日志 ─┴─→ AI 修复并按同一任务卷重跑
+                    │
+                    ▼
+ journal + gate + readback + diff/status/ABI 回读
+                    │
+                    ▼
+        全部证据通过，或精确外部阻塞
 ```
 
-AI 必须持续迭代到门禁通过，或遇到确实需要人工方向/外部状态的阻塞。不能因首次编译成功就停止，也不能用文档说明替代可执行验证。
+AI 不得在首次编译、单个 smoke 或 UI 可见时结束。只要存在范围内且安全的修复，就继续迭代；只有确实缺少人工方向、受限制品/签名、外部权限或目标硬件时，才保留 `in_progress`/外部 blocker 并明确所需输入。
 
-## 仓库内强制入口
+## 任务卷规则
 
-- `AGENTS.md` 是进入 HD 仓库的 AI 必读入口，固化角色、权限、测试禁令、跨平台边界和闭环命令。
-- `automation/schemas/` 定义版本化任务卷、gate report 和回读格式；`automation/tasks/` 保存会话间交接状态。
-- `xtask process-check` 校验上述资产、所有任务卷以及自动脚本未调用 unittest。
-- `xtask quality` 首先执行 `process-check`、工作区与暂存区的 `git diff --check`，随后执行 format、all-targets check、Clippy 和独立 smoke。
-- `xtask ai-cycle` 调用质量门，无论通过或失败都在 `out/ai/<task>/` 写 gate 日志、`hd-gates.json`、`readback.json` 和 `readback.md`。
-- `scripts/integration-quality.ps1` 使用统一 MinGW 继续编译 crosvm 功能/测试目标和 gfxstream backend，再合并生成跨仓回读。
+每项工作从 `automation/examples/task.example.json` 建立 `automation/tasks/<task-id>.json`，必须包含：
 
-Windows 单仓自动闭环：
+- 一个可验证 objective，不使用“完善一下”等开放措辞；
+- 精确 repositories/owned/excluded paths，防止夹带脏树；
+- schema/protocol/state/数据迁移影响；
+- Windows/Linux/macOS 与 ABI 影响；
+- 每项 acceptance 的 gate 或 artifact 证据；
+- 稳定事件名、错误码、失败注入和安全边界；
+- 人工已经作出的 direction decisions；
+- external blocker、影响和解除条件；
+- `code_present`、`tests_authored`、`contract_smoke_verified`、`real_guest_verified` 四个独立布尔值；
+- 可直接运行的 `next_iteration`。
+
+任务状态不能伪造证据。Host 子目标通过时可更新对应 acceptance/evidence，但原子交付存在 real-guest/zero-copy/device 缺口时，主任务仍保持 `in_progress`。只有 required gate 全部通过且没有所需工作时才使用 `complete`。
+
+## 打点与失败语义
+
+每个外部边界必须记录 started/succeeded/failed：能力/制品验证、迁移、租约、磁盘、Worker/crosvm spawn/exit、frame 握手、ADB connect/readiness/action/install、HTTP/IPC 拒绝、诊断打包和清理。事件包含稳定名称、trace/instance/run/operation id、耗时与错误码；不写 bearer、worker secret、签名私钥、完整环境或用户内容。
+
+高频 frame 路径只保留聚合 metrics，不逐帧写日志。错误按 config、artifact/trust、capability/certification、platform、store/lease、worker/VM、frame、ADB/device、HTTP/IPC、journal/diagnostic 分类；API 返回稳定 code，结构化日志保留具体上下文。
+
+启动或停止失败必须得到一个可回读终态。若子进程/endpoint 清理未被证明，设置 `cleanup_pending`，保留精确身份和租约；不能为了界面整洁把状态写成 Stopped。
+
+## 标准命令
+
+Windows 单仓：
 
 ```powershell
 cargo run --target x86_64-pc-windows-gnu -p xtask -- ai-cycle `
-  --task automation/tasks/ci-quality.json `
-  --output out/ai/local
+  --task automation/tasks/hd-p0-v2.json `
+  --output out/ai/hd-p0-v2
 ```
 
-跨仓联合闭环：
+跨仓：
 
 ```powershell
 .\scripts\integration-quality.ps1 `
@@ -53,62 +95,27 @@ cargo run --target x86_64-pc-windows-gnu -p xtask -- ai-cycle `
   -Output out/ai/integration
 ```
 
-AI 根据 gate log 修复后必须用同一任务卷重跑。脚本负责证据捕获和确定性门禁；代码修改仍由受本文件约束的 AI 完成，脚本不会获得额外写权限或自行改变产品方向。
+已有外部 runner gate 时重新回读：
 
-## 任务卷
+```powershell
+cargo run --target x86_64-pc-windows-gnu -p xtask -- readback `
+  --task automation/tasks/hd-p0-v2.json `
+  --output out/ai/hd-p0-v2 `
+  --gate-report <gate-report.json>
+```
 
-每个开发任务应具备：
+AI 从 gate log 定位失败，修复后使用相同任务卷和输出语义重跑。不得手工编辑 gate report 把失败改为通过。
 
-- 目标行为和非目标；
-- 影响的 schema/protocol/state；
-- 平台矩阵与 MinGW ABI 影响；
-- 日志事件、字段和失败码；
-- 测试代码与可执行 smoke/集成场景；
-- 回滚策略与数据迁移；
-- 完成证据；
-- 需要人工决定的项目。
+## 变更与提交回读
 
-任务卷使用 `automation/schemas/task.schema.json`，不得只存在于聊天上下文。状态为 `complete` 只表示当前任务验收完成；真实 guest 等未来里程碑阻塞要继续保留在 `blockers` 和独立证据状态中。
+- 进入工作前分别读取 HD、crosvm、gfxstream 和根仓库状态；已有改动默认属于用户。
+- 编辑时只触碰任务卷 owned path；与用户改动重叠时逐块审计，无法隔离就不提交。
+- 完成验证后回读 `git diff --check`、相关 diff、`git status --short`、生成物清单和 run journal。
+- 若用户要求本地提交，按嵌套仓库分别使用显式文件列表暂存，再执行 cached diff check；不 push。
+- 不自动删除 out/target、诊断、实例磁盘或用户文件；临时 smoke 只使用自动清理的独立目录。
 
-## 自动打点要求
+## 需要人工决策的边界
 
-每个外部边界至少记录开始、成功、失败：构件验证、磁盘复制、进程 spawn/exit、显示 attach/replace/rollback、ADB connect/action/install、IPC 协议拒绝。字段使用稳定名称，不写密钥或整份环境变量。高频渲染路径只聚合计数，不逐帧记录。
+只有以下问题暂停方向性实现：两种方案会改变 Guest/ADB/frame/存储兼容契约；需要受限制品、信任根、签名私钥或外部服务权限；需要破坏性迁移/删除；需要解除 unittest 禁令；真实测量与已批准指标冲突；必要改动无法与用户脏树安全隔离。
 
-错误必须分为：输入/config、外部构件、平台、VM、ADB、IPC、journal 和状态机；对用户返回稳定 error code，对日志保留具体上下文。
-
-## 自动提交策略
-
-- 只有相关门禁通过后提交。
-- `hd`、`external/crosvm`、`hardware/google/gfxstream` 分别提交，便于独立回滚。
-- 使用显式文件列表暂存；提交前再次 `git diff --cached --check` 和 `git status --short`。
-- 已存在的脏文件默认属于用户。若本次必须修改同一文件，报告重叠并只提交可确认属于本任务的完整 diff；无法隔离时不提交该仓库。
-- 根 AOSP 工作树可能包含跨项目用户改动，默认保留未提交并在交付报告列出。
-- 不自动 push、rebase、reset、清理或删除工作树。
-
-## 人工决策点
-
-以下情况暂停扩展实现并请求方向：
-
-- 两种 guest/ADB/存储方案会改变兼容契约；
-- 需要获取受限构件、凭据、签名或外部服务权限；
-- 需要破坏性迁移或删除已有实例磁盘；
-- 需要解除“不跑 unittest”约束；
-- 真实测量与既定产品指标冲突；
-- 用户已有改动与必要实现无法安全合并。
-
-其余可逆、范围内的实现与诊断由 AI 自主推进。
-
-## 回读报告格式
-
-每轮交付只报告可证实结论：
-
-1. 已实现的行为；
-2. 实际执行的门禁与结果；
-3. 未执行项及原因；
-4. 当前阻塞和所需人工决策；
-5. 本地提交及保留未提交文件；
-6. 下一自动迭代入口。
-
-“代码存在”“测试已编写”“mock 通过”“真实 guest 通过”是四种不同状态，禁止混写。
-
-`xtask readback` 自动采集所需 gate、HD/crosvm/gfxstream/根工作树 HEAD 与 dirty 状态，并同时生成 JSON 和 Markdown。机器报告是事实底稿，最终交付说明不得删去失败 gate、缺失证据、用户遗留改动或阻塞。
+缺少签名 bundle 或专用 runner 不妨碍继续修复 Host 范围内的问题，但阻止发布结论和认证签发。最终报告必须分别列出已实现行为、实际门禁、未执行项、外部阻塞、工作树状态和下一自动入口。

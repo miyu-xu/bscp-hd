@@ -1,0 +1,17 @@
+[package]
+name = "hd-frame"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hd-core = { path = "../hd-core" }
+hd-platform = { path = "../hd-platform" }
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,136 @@
+{
+  "schema_version": 2,
+  "task_id": "hd-p0-v2",
+  "objective": "一次性交付 HD V2：独立 host/worker、六项 P0、真实 Guest 契约、严格零拷贝显示契约、正式设备能力、诊断和三平台发布门禁。",
+  "status": "in_progress",
+  "scope": {
+    "repositories": ["hd", "external/crosvm", "hardware/google/gfxstream", "bscp-root"],
+    "owned_paths": ["hd/", "external/crosvm/", "hardware/google/gfxstream/host/", "scripts/"],
+    "excluded_paths": ["out/", "target/", "third_party/minijail/", "用户既有未提交改动中与本任务无关的部分"]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "windows_uses_mingw_only",
+    "preserve_user_changes",
+    "production_paths_are_real_or_blocked",
+    "zero_copy_or_block",
+    "no_partial_release",
+    "do_not_push"
+  ],
+  "acceptance": [
+    {
+      "id": "P0-V2-001",
+      "criterion": "旧版启动入口被 V2 契约、持久化迁移和异步 operation 完整替换，生产路径不存在模拟启动分支。",
+      "evidence": ["gate:hd-quality", "artifact:openapi-v2.json", "artifact:migration-smoke.json"]
+    },
+    {
+      "id": "P0-PROC-002",
+      "criterion": "hd-host、每实例 hd-worker 与 crosvm 分离；UI/daemon 退出和 daemon 重启不终止活动 worker。",
+      "evidence": ["gate:host-worker-smoke", "artifact:lifecycle-journal.jsonl"]
+    },
+    {
+      "id": "P0-CAP-003",
+      "criterion": "宿主能力发现覆盖虚拟化、GPU 外部资源、工具和签名制品，缺失能力阻止启动且无回退。",
+      "evidence": ["gate:capability-smoke", "artifact:host-capabilities.json"]
+    },
+    {
+      "id": "P0-API-004",
+      "criterion": "localhost V2 API 具备 bearer、Host/CORS、大小限制、幂等任务、类型化 action 和上传边界。",
+      "evidence": ["gate:http-security-smoke", "artifact:openapi-v2.json"]
+    },
+    {
+      "id": "P0-LEASE-005",
+      "criterion": "CPU/内存总量、CID、端口、磁盘、GPU、worker 和按实例单调的 frame generation 由事务租约管理，并可在并发启动和 Host 重启后协调。",
+      "evidence": ["gate:lease-smoke", "artifact:lease-audit.jsonl"]
+    },
+    {
+      "id": "P0-DIAG-006",
+      "criterion": "一键诊断包具备 manifest、脱敏、hash、大小和保留策略。",
+      "evidence": ["gate:diagnostic-smoke", "artifact:diagnostic-manifest.json"]
+    },
+    {
+      "id": "P0-GUEST-007",
+      "criterion": "Windows x86_64、Linux x86_64、macOS arm64 的固定 Android 15 Guest 在专用 runner 达到唯一 Ready 条件。",
+      "evidence": ["gate:windows-real-guest", "gate:linux-real-guest", "gate:macos-real-guest"]
+    },
+    {
+      "id": "P0-FRAME-008",
+      "criterion": "三平台外部纹理和同步链完成，readback/software blit 为零且不支持时阻止启动。",
+      "evidence": ["gate:windows-zero-copy", "gate:linux-zero-copy", "gate:macos-zero-copy"]
+    },
+    {
+      "id": "P0-DEVICE-009",
+      "criterion": "固定 Guest profile 的全部设备端点由正式组件、正式模拟后端或明确的软件 Guest 实现覆盖。",
+      "evidence": ["gate:device-profile-conformance", "artifact:device-capabilities.json"]
+    }
+  ],
+  "required_gates": [
+    "hd-quality",
+    "host-worker-smoke",
+    "capability-smoke",
+    "http-security-smoke",
+    "lease-smoke",
+    "diagnostic-smoke",
+    "windows-real-guest",
+    "linux-real-guest",
+    "macos-real-guest",
+    "windows-zero-copy",
+    "linux-zero-copy",
+    "macos-zero-copy",
+    "device-profile-conformance"
+  ],
+  "evidence_state": {
+    "code_present": true,
+    "tests_authored": true,
+    "contract_smoke_verified": true,
+    "real_guest_verified": false
+  },
+  "direction_decisions": [
+    {
+      "id": "D-P0-ATOMIC",
+      "decision": "六项 P0、real Guest、正式设备边界和三平台严格零拷贝作为单一原子交付，不发布中间实现。",
+      "owner": "human",
+      "rationale": "用户要求不以中间方案、回退或待办冒充完成。"
+    },
+    {
+      "id": "D-WINDOWS-GNU",
+      "decision": "Windows 全链采用 x86_64-pc-windows-gnu 与 MinGW-w64 GNU ABI。",
+      "owner": "human",
+      "rationale": "与 bscp 项目统一并保持跨平台抽象。"
+    },
+    {
+      "id": "D-NO-UNITTEST",
+      "decision": "测试目标编译，但不运行 Rust/C++/Python unittest。",
+      "owner": "human",
+      "rationale": "遵守仓库 AGENTS.md。"
+    },
+    {
+      "id": "D-ZERO-COPY",
+      "decision": "GPU/驱动不满足外部纹理和显式同步时阻止实例启动，禁止像素拷贝或编码回退。",
+      "owner": "human",
+      "rationale": "保证显示架构没有需要返工的兼容分支。"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "B-GUEST-BUNDLE",
+      "description": "当前 checkout 没有可认证的 Android Guest bundle，真实启动必须由固定源码矩阵构建并签名后才能验证。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "B-HARDWARE-RUNNERS",
+      "description": "当前会话只有 Windows 工作机，Linux KVM+GPU 与 macOS HVF+GPU 的必过证据只能由对应专用 runner 生成。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "B-OFFICIAL-DEVICES",
+      "description": "当前 checkout 不包含固定 RootCanal/Casimir 正式源码或已签名 host bundle，非正式脚本不具备发布验收资格。",
+      "scope": "external",
+      "state": "open"
+    }
+  ],
+  "human_decisions_needed": [],
+  "next_iteration": "持续回读并修复 V2 Host 门禁；获得固定签名 Guest/Host bundle 后，在 Windows/Linux/macOS 专用 runner 自动执行 real-guest、zero-copy 和 device-profile gate，失败即迭代直至全绿。"
+}

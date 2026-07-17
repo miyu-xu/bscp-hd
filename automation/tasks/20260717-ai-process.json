@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "task_id": "20260717-ai-process",
   "objective": "把 AI 主导开发、自动门禁、任务交接和回读流程固化为仓库内可执行资产。",
   "status": "complete",
@@ -42,7 +42,7 @@
   "evidence_state": {
     "code_present": true,
     "tests_authored": true,
-    "mock_verified": true,
+    "contract_smoke_verified": true,
     "real_guest_verified": false
   },
   "direction_decisions": [
@@ -61,12 +61,12 @@
   ],
   "blockers": [
     {
-      "id": "B-M3-BOOT",
-      "description": "真实 Android 启动仍等待 guest 构件、ADB bridge 和 readiness 契约。",
-      "scope": "future_milestone",
+      "id": "B-REAL-GUEST",
+      "description": "真实 Android 发布仍缺固定签名 Guest/Host bundle、原生 ADB/frame/device 证据和三平台专用 runner。",
+      "scope": "external",
       "state": "accepted"
     }
   ],
   "human_decisions_needed": [],
-  "next_iteration": "从 B-M3-BOOT 建立下一任务卷；guest 构件契约确定前继续保持真实 guest 未验证。"
+  "next_iteration": "继续使用 hd-p0-v2 任务卷；Host 范围自动迭代，获得外部 bundle/runner 后执行并回读真实 gate。"
 }

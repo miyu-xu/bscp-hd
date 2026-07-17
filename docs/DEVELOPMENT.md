@@ -1,95 +1,87 @@
-# 开发与构建
+# HD 开发与构建
 
-## Windows 工具链
+## 工具链
 
-Windows 只支持：
+Windows 唯一支持目标是 `x86_64-pc-windows-gnu`：Rust stable、MinGW-w64 `gcc/g++/ar/mingw32-make/objdump`，CMake C/C++ 项目使用 `MinGW Makefiles`。禁止 MSVC fallback，也禁止 GNU Rust exe 链接 MSVC C/C++ 产物。
 
-- Rust stable，目标 `x86_64-pc-windows-gnu`；
-- MinGW-w64 的 `gcc.exe`、`g++.exe`、`ar.exe`、`mingw32-make.exe`、`objdump.exe`；
-- CMake 的 `MinGW Makefiles` generator。
+`.cargo/config.toml` 固定 GNU linker/ar，`build.bat` 拒绝其他 Windows target，`xtask pe-audit` 拒绝 `VCRUNTIME`、`MSVCP`、`CONCRT` 和 `MFC` import。默认搜索：
 
-不允许 MSVC fallback，也不允许 GNU Rust 二进制链接 MSVC C/C++ 产物。`build.bat` 会拒绝其他 Windows target，`.cargo/config.toml` 对 GNU target 固定 gcc/ar，PE audit 会拒绝 `VCRUNTIME`、`MSVCP`、`CONCRT` 和 `MFC` imports。
+```text
+C:\workspace\mingw64
+C:\tools\mingw64
+C:\msys64\mingw64
+C:\mingw-w64\mingw64
+```
 
-默认查找 `C:\workspace\mingw64`、`C:\tools\mingw64`、`C:\msys64\mingw64`、`C:\mingw-w64\mingw64`。其他位置使用：
+自定义位置：
 
 ```bat
 set "MINGW_PATH=D:\toolchains\mingw64"
 ```
 
-## 构建命令
+Linux/macOS 使用各自原生 Rust/C 工具链；portable contract 相同，但目标平台的虚拟化、GPU、IPC、文件安全和进程身份必须由原生 runner 验证。
 
-HD release + PE audit：
+## 构建入口
+
+Host 质量门（不运行 unittest）：
+
+```powershell
+cargo run --target x86_64-pc-windows-gnu -p xtask -- quality
+```
+
+Windows workspace release + PE audit：
 
 ```bat
-cd hd
 build.bat
 ```
 
-项目统一流水线会依次构建 binder-rpc、可选 gfxstream、virtmgr/vm/crosvm、HD，并发布到 `out\dist\windows`：
+根仓库统一发布：
 
 ```bat
 build_all.bat
 ```
 
-若要构建本仓库 gfxstream/ANGLE 路径：
+根构建依次处理 binder-rpc、可选 gfxstream/ANGLE、virtmgr/vm/crosvm 和 HD，发布到 `out\dist\windows\bin`。HD 运行时必须包含：`hd.exe`、`hdctl.exe`、`hd-host.exe`、`hd-worker.exe`、`hd-device-sim.exe`。启用本仓库 gfxstream/ANGLE：
 
 ```bat
 set ENABLE_GFXSTREAM_ANGLE=1
 build_all.bat
 ```
 
-Linux/macOS 可移植编译：
+原生 Linux/macOS runner：
 
 ```bash
-cd hd
-cargo run -p xtask -- check-portable
+cargo run -p xtask -- quality
+cargo build --workspace --release
 ```
 
-这只证明 Rust 分层和宿主代码可编译，不代表 crosvm/display guest 已在对应平台完成运行验收。
+在非原生主机执行 `cargo check --target ...` 只能证明 Rust 编译；缺少 linker/SDK 时记录为环境阻塞，不能代替原生运行证据。
 
-## 日常变更流程
+## 变更方法
 
-1. 回读根仓库、`hd`、`external/crosvm`、`hardware/google/gfxstream` 的状态，标记用户已有改动。
-2. 为单一可验收行为更新配置/协议，保持 schema version 和向后策略明确。
-3. 在 portable core/trait 中定义能力，再写平台实现和 UI 入口。
-4. 增加测试用例；按仓库约束只编译测试目标，不执行 unittest。
-5. 运行质量、独立 smoke、相关 crosvm/gfxstream MinGW 编译和 diff audit。
-6. 回读 manifest/events/result，确认行为与文档一致。
-7. 只暂存本次拥有的文件；嵌套仓库分别提交，不 push。
+1. 阅读 `AGENTS.md`、当前任务卷、AI workflow/architecture/testing，并回读所有相关仓库状态。
+2. 把行为、schema/protocol/state、稳定错误码、事件和完成证据写入任务卷。
+3. 先修改 `hd-core` portable contract；OS 差异进入 `hd-platform`，运行编排进入 `hd-runtime`，最后接 UI/CLI。
+4. 同步编写测试源码和独立黑盒场景；测试目标必须编译，但不运行 unittest。
+5. 运行相同任务卷的 `xtask ai-cycle`；失败即回读 log、修复、重跑。
+6. 触碰 crosvm/gfxstream/根构建时运行 `integration-quality.ps1`。
+7. 回读 run journal、诊断、gate/readback、diff/status 和 PE ABI；不以代码存在代替运行证据。
+8. 只有用户要求时按嵌套仓库显式暂存并本地提交；不 push，不处理无关脏文件。
 
-任务开始前从 `automation/examples/task.example.json` 建立 `automation/tasks/<task-id>.json`。开发完成后优先执行：
+## 代码边界
 
-```powershell
-cargo run --target x86_64-pc-windows-gnu -p xtask -- ai-cycle `
-  --task automation/tasks/<task-id>.json `
-  --output out/ai/<task-id>
-```
+- `hd-core` 只包含可序列化数据、验证和状态，不引入窗口/进程/OS crate。
+- unsafe 仅在窄平台模块，逐块写 SAFETY 依据；原生 handle 不序列化。
+- Windows/Unix 私有文件在创建时就设置 owner ACL/mode；敏感读取 no-follow，更新使用同目录临时文件、fsync/flush 和原子替换。
+- 外部命令不得接受用户自由拼接参数；从类型化 V2 配置和已验证 bundle 生成。
+- Host/Worker/HTTP/IPC 边界必须有大小、超时、身份和版本检查。
+- 不能真实热应用的配置返回 restart-required；不能提供的能力返回 Blocked/unsupported，不静默降级。
+- 高风险租约只有在进程与 endpoint 清理得到证明后释放。
+- frame 路径不阻塞、不逐帧打日志、不暴露 CPU 像素回退。
 
-相邻仓库发生变化时执行 `scripts/integration-quality.ps1`。具体 gate、仓库状态和证据分层由 `xtask readback` 生成，AI 必须回读该结果后才能给出完成结论。
+## 依赖和供应链
 
-推荐命令：
-
-```powershell
-.\scripts\quality.ps1 -WindowsGnu
-git diff --check
-git status --short
-```
-
-`quality.ps1` 执行 format check、GNU all-target check、Clippy 和非 unittest smoke。它不会调用 `cargo test`。
-
-## 依赖与可重复性
-
-- 所有 Rust 版本写入 workspace `Cargo.toml` 并提交 `Cargo.lock`。
-- HD 不在运行时下载 kernel、镜像、ADB 或 crosvm。
-- 外部构件由配置指定，启动前验证非空 regular file，并记录实际 SHA-256；配置可要求预期 SHA-256。
-- Windows 发布以 PE import audit 作为 ABI 完成条件，不能只看 `cargo build` 返回码。
-- 添加依赖前说明跨平台影响、许可、二进制体积与供应链来源。
-
-## 代码约束
-
-- `hd-core` 不得引入窗口/进程/OS API。
-- 所有 IPC/日志 wire data 都要版本化且可序列化。
-- 原生句柄不跨进程持久化；unsafe 只能在窄平台模块内，并写 SAFETY 注释。
-- 不在帧路径打印日志或进行阻塞 IPC。
-- 启动失败必须进入 `Failed`/`Blocked` 并落 result；不能停留在中间状态。
-- 动态设置若不能真实热应用，必须返回需重启，不能只改配置后声称成功。
+- Rust 依赖固定在 workspace `Cargo.toml` 和 `Cargo.lock`，新增依赖需评估三平台、许可、体积和原生 ABI。
+- 运行时不下载 Guest、ADB、crosvm 或 device component。
+- Artifact store 只接受受信 Ed25519 签名、内容寻址、READY、逐文件大小/SHA-256 均通过的 V2 bundle。
+- 发布认证只由授权私钥在八类原始证据全部存在后签发；私钥不进入 data root、日志、诊断或仓库。

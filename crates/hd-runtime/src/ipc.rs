@@ -1,63 +1,47 @@
-use std::sync::Arc;
-
-#[cfg(not(windows))]
+#[cfg(unix)]
 use std::path::PathBuf;
-#[cfg(windows)]
 use std::time::Duration;
 
-use hd_core::{ControlRequestV1, ControlResponseV1};
+use hd_core::{WorkerRequestV2, WorkerResponseV2};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-
-use crate::Supervisor;
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader,
+};
+use tokio::sync::watch;
 
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub fn control_endpoint() -> Result<String, IpcError> {
+pub async fn run_worker_server<F, Fut>(
+    endpoint: &str,
+    handler: F,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), IpcError>
+where
+    F: Fn(WorkerRequestV2) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = WorkerResponseV2> + Send + 'static,
+{
     #[cfg(windows)]
     {
-        Ok(format!(
-            r"\\.\pipe\bscp-hd-control-{}",
-            windows_current_sid()?
-        ))
+        run_windows_server(endpoint, handler, shutdown).await
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        Ok(runtime
-            .join(format!("bscp-hd-{}.sock", current_uid()))
-            .to_string_lossy()
-            .into_owned())
+        run_unix_server(endpoint, handler, shutdown).await
     }
 }
 
-pub async fn run_control_server(
-    supervisor: Arc<Supervisor>,
+pub async fn send_worker_request(
     endpoint: &str,
-) -> Result<(), IpcError> {
-    #[cfg(windows)]
-    {
-        run_windows_server(supervisor, endpoint).await
-    }
-    #[cfg(not(windows))]
-    {
-        run_unix_server(supervisor, endpoint).await
-    }
-}
-
-pub async fn send_request(
-    endpoint: &str,
-    request: &ControlRequestV1,
-) -> Result<ControlResponseV1, IpcError> {
+    request: &WorkerRequestV2,
+) -> Result<WorkerResponseV2, IpcError> {
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ClientOptions;
         let mut last_error = None;
-        for _ in 0..40 {
+        for _ in 0..60 {
             match ClientOptions::new().open(endpoint) {
-                Ok(mut client) => return exchange(&mut client, request).await,
+                Ok(mut client) => return timeout_exchange(&mut client, request).await,
                 Err(error) => {
                     last_error = Some(error);
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -69,7 +53,7 @@ pub async fn send_request(
             source: last_error.unwrap_or_else(|| std::io::Error::other("connection retry ended")),
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         let mut stream = tokio::net::UnixStream::connect(endpoint)
             .await
@@ -77,85 +61,153 @@ pub async fn send_request(
                 endpoint: endpoint.to_owned(),
                 source,
             })?;
-        exchange(&mut stream, request).await
+        timeout_exchange(&mut stream, request).await
     }
+}
+
+async fn timeout_exchange<S>(
+    stream: &mut S,
+    request: &WorkerRequestV2,
+) -> Result<WorkerResponseV2, IpcError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let timeout = match &request.command {
+        hd_core::WorkerCommandV2::Start { .. } => Duration::from_secs(480),
+        hd_core::WorkerCommandV2::InstallApk { .. } => Duration::from_secs(360),
+        hd_core::WorkerCommandV2::Stop {
+            graceful_timeout_ms,
+            ..
+        } => {
+            Duration::from_millis(u64::from(*graceful_timeout_ms)).saturating_add(EXCHANGE_TIMEOUT)
+        }
+        _ => EXCHANGE_TIMEOUT,
+    };
+    tokio::time::timeout(timeout, exchange(stream, request))
+        .await
+        .map_err(|_| IpcError::Timeout)?
 }
 
 async fn exchange<S>(
     stream: &mut S,
-    request: &ControlRequestV1,
-) -> Result<ControlResponseV1, IpcError>
+    request: &WorkerRequestV2,
+) -> Result<WorkerResponseV2, IpcError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut bytes = serde_json::to_vec(request).map_err(IpcError::Encode)?;
+    write_message(stream, request).await?;
+    let bytes = read_message(stream).await?;
+    serde_json::from_slice(&bytes).map_err(IpcError::Decode)
+}
+
+async fn serve_connection<S, F, Fut>(mut stream: S, handler: F) -> Result<(), IpcError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: Fn(WorkerRequestV2) -> Fut,
+    Fut: std::future::Future<Output = WorkerResponseV2>,
+{
+    let bytes = read_message(&mut stream).await?;
+    let request: WorkerRequestV2 = serde_json::from_slice(&bytes).map_err(IpcError::Decode)?;
+    let response = handler(request).await;
+    write_message(&mut stream, &response).await
+}
+
+async fn write_message<S, T>(stream: &mut S, value: &T) -> Result<(), IpcError>
+where
+    S: AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
+    let mut bytes = serde_json::to_vec(value).map_err(IpcError::Encode)?;
     if bytes.len() > MAX_MESSAGE_BYTES {
         return Err(IpcError::MessageTooLarge(bytes.len()));
     }
     bytes.push(b'\n');
     stream.write_all(&bytes).await.map_err(IpcError::Io)?;
-    stream.flush().await.map_err(IpcError::Io)?;
-    let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .await
-        .map_err(IpcError::Io)?;
-    if line.len() > MAX_MESSAGE_BYTES {
-        return Err(IpcError::MessageTooLarge(line.len()));
-    }
-    serde_json::from_str(&line).map_err(IpcError::Decode)
-}
-
-async fn serve_connection<S>(stream: &mut S, supervisor: &Arc<Supervisor>) -> Result<(), IpcError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut line = String::new();
-    BufReader::new(&mut *stream)
-        .read_line(&mut line)
-        .await
-        .map_err(IpcError::Io)?;
-    if line.len() > MAX_MESSAGE_BYTES {
-        return Err(IpcError::MessageTooLarge(line.len()));
-    }
-    let request: ControlRequestV1 = serde_json::from_str(&line).map_err(IpcError::Decode)?;
-    let response = supervisor.handle(request).await;
-    let mut bytes = serde_json::to_vec(&response).map_err(IpcError::Encode)?;
-    bytes.push(b'\n');
-    stream.write_all(&bytes).await.map_err(IpcError::Io)?;
     stream.flush().await.map_err(IpcError::Io)
 }
 
+async fn read_message<S>(stream: &mut S) -> Result<Vec<u8>, IpcError>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut reader = BufReader::new(stream).take((MAX_MESSAGE_BYTES + 1) as u64);
+    let read = reader
+        .read_until(b'\n', &mut bytes)
+        .await
+        .map_err(IpcError::Io)?;
+    if read == 0 {
+        return Err(IpcError::UnexpectedEof);
+    }
+    if bytes.len() > MAX_MESSAGE_BYTES + 1 || !bytes.ends_with(b"\n") {
+        return Err(IpcError::MessageTooLarge(bytes.len()));
+    }
+    bytes.pop();
+    if bytes.len() > MAX_MESSAGE_BYTES {
+        return Err(IpcError::MessageTooLarge(bytes.len()));
+    }
+    Ok(bytes)
+}
+
 #[cfg(windows)]
-async fn run_windows_server(supervisor: Arc<Supervisor>, endpoint: &str) -> Result<(), IpcError> {
+async fn run_windows_server<F, Fut>(
+    endpoint: &str,
+    handler: F,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), IpcError>
+where
+    F: Fn(WorkerRequestV2) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = WorkerResponseV2> + Send + 'static,
+{
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let mut first = true;
-    while !supervisor.should_shutdown() {
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         let mut options = ServerOptions::new();
         options
             .first_pipe_instance(first)
             .reject_remote_clients(true);
-        let mut server = options.create(endpoint).map_err(|source| IpcError::Bind {
-            endpoint: endpoint.to_owned(),
-            source,
-        })?;
+        let server = hd_platform::create_owner_only_named_pipe(&options, endpoint)
+            .map_err(IpcError::Platform)?;
         first = false;
-        server.connect().await.map_err(IpcError::Io)?;
-        if let Err(error) = serve_connection(&mut server, &supervisor).await {
-            tracing::warn!(%error, "control connection failed");
+        tokio::select! {
+            result = server.connect() => {
+                result.map_err(IpcError::Io)?;
+                let connection_handler = handler.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_connection(server, connection_handler).await {
+                        tracing::warn!(event = "ipc.connection.failed", error_code = error.code(), %error, "worker IPC connection failed");
+                    }
+                });
+            }
+            changed = shutdown.changed() => {
+                changed.map_err(|_| IpcError::ShutdownChannel)?;
+            }
         }
     }
-    Ok(())
 }
 
-#[cfg(not(windows))]
-async fn run_unix_server(supervisor: Arc<Supervisor>, endpoint: &str) -> Result<(), IpcError> {
-    use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+async fn run_unix_server<F, Fut>(
+    endpoint: &str,
+    handler: F,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), IpcError>
+where
+    F: Fn(WorkerRequestV2) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = WorkerResponseV2> + Send + 'static,
+{
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
     use tokio::net::UnixListener;
 
     let path = PathBuf::from(endpoint);
-    if path.exists() {
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        if !metadata.file_type().is_socket() {
+            return Err(IpcError::UnsafeStaleEndpoint(path));
+        }
         std::fs::remove_file(&path).map_err(|source| IpcError::Bind {
             endpoint: endpoint.to_owned(),
             source,
@@ -165,109 +217,44 @@ async fn run_unix_server(supervisor: Arc<Supervisor>, endpoint: &str) -> Result<
         endpoint: endpoint.to_owned(),
         source,
     })?;
-    let _path_guard = UnixSocketPathGuard(path.clone());
+    let _guard = UnixSocketPathGuard(path.clone());
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
         IpcError::Bind {
             endpoint: endpoint.to_owned(),
             source,
         }
     })?;
-    while !supervisor.should_shutdown() {
-        let (mut stream, _) = listener.accept().await.map_err(IpcError::Io)?;
-        if let Err(error) = serve_connection(&mut stream, &supervisor).await {
-            tracing::warn!(%error, "control connection failed");
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.map_err(IpcError::Io)?;
+                let connection_handler = handler.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_connection(stream, connection_handler).await {
+                        tracing::warn!(event = "ipc.connection.failed", error_code = error.code(), %error, "worker IPC connection failed");
+                    }
+                });
+            }
+            changed = shutdown.changed() => {
+                changed.map_err(|_| IpcError::ShutdownChannel)?;
+            }
         }
     }
-    Ok(())
 }
 
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn windows_current_sid() -> Result<String, IpcError> {
-    use std::ffi::c_void;
-
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    let mut token: HANDLE = std::ptr::null_mut();
-    // SAFETY: GetCurrentProcess returns a pseudo handle; token points to valid writable memory.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        // SAFETY: GetLastError has no preconditions.
-        return Err(IpcError::Identity(unsafe { GetLastError() }));
-    }
-    let result = (|| {
-        let mut bytes = 0_u32;
-        // SAFETY: the null buffer/zero length probe is the documented sizing call.
-        unsafe {
-            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut bytes);
-        }
-        if bytes == 0 {
-            // SAFETY: GetLastError has no preconditions.
-            return Err(IpcError::Identity(unsafe { GetLastError() }));
-        }
-        let words = (bytes as usize).div_ceil(std::mem::size_of::<usize>());
-        let mut buffer = vec![0_usize; words];
-        // SAFETY: buffer is sized by the probe and remains live for the TOKEN_USER/SID access.
-        if unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                buffer.as_mut_ptr().cast::<c_void>(),
-                bytes,
-                &raw mut bytes,
-            )
-        } == 0
-        {
-            // SAFETY: GetLastError has no preconditions.
-            return Err(IpcError::Identity(unsafe { GetLastError() }));
-        }
-        // SAFETY: GetTokenInformation populated a TOKEN_USER at the start of buffer.
-        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
-        let mut sid_text = std::ptr::null_mut();
-        // SAFETY: user.User.Sid is valid while buffer lives; sid_text is an output pointer.
-        if unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut sid_text) } == 0 {
-            // SAFETY: GetLastError has no preconditions.
-            return Err(IpcError::Identity(unsafe { GetLastError() }));
-        }
-        let mut length = 0;
-        // SAFETY: ConvertSidToStringSidW returns a null-terminated LocalAlloc string.
-        while unsafe { *sid_text.add(length) } != 0 {
-            length += 1;
-        }
-        // SAFETY: the string is valid for `length` UTF-16 units.
-        let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_text, length) });
-        // SAFETY: the API contract requires LocalFree for this allocation.
-        unsafe {
-            LocalFree(sid_text.cast());
-        }
-        Ok(sid)
-    })();
-    // SAFETY: token is a real token handle opened above and is closed exactly once.
-    unsafe {
-        CloseHandle(token);
-    }
-    result
-}
-
-#[cfg(not(windows))]
-#[allow(unsafe_code)]
-fn current_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and does not retain pointers.
-    unsafe { libc::geteuid() }
-}
-
-#[cfg(not(windows))]
+#[cfg(unix)]
 struct UnixSocketPathGuard(PathBuf);
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 impl Drop for UnixSocketPathGuard {
     fn drop(&mut self) {
         if let Err(error) = std::fs::remove_file(&self.0)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            tracing::warn!(path = %self.0.display(), %error, "failed to remove Unix IPC socket");
+            tracing::warn!(event = "ipc.cleanup.failed", path = %self.0.display(), %error, "failed to remove IPC socket");
         }
     }
 }
@@ -294,7 +281,49 @@ pub enum IpcError {
     Decode(serde_json::Error),
     #[error("IPC message exceeds limit: {0} bytes")]
     MessageTooLarge(usize),
-    #[cfg(windows)]
-    #[error("failed to obtain current Windows SID (error {0})")]
-    Identity(u32),
+    #[error("IPC peer closed before sending a complete message")]
+    UnexpectedEof,
+    #[error("IPC exchange timed out")]
+    Timeout,
+    #[error("IPC shutdown channel closed unexpectedly")]
+    ShutdownChannel,
+    #[cfg(unix)]
+    #[error("refusing to replace a non-socket IPC path: {0}")]
+    UnsafeStaleEndpoint(PathBuf),
+    #[error(transparent)]
+    Platform(#[from] hd_platform::PlatformError),
+}
+
+impl IpcError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Bind { .. } => "ipc_bind",
+            Self::Connect { .. } => "ipc_connect",
+            Self::Io(_) => "ipc_io",
+            Self::Encode(_) => "ipc_encode",
+            Self::Decode(_) => "ipc_decode",
+            Self::MessageTooLarge(_) => "ipc_message_too_large",
+            Self::UnexpectedEof => "ipc_unexpected_eof",
+            Self::Timeout => "ipc_timeout",
+            Self::ShutdownChannel => "ipc_shutdown_channel",
+            #[cfg(unix)]
+            Self::UnsafeStaleEndpoint(_) => "ipc_unsafe_stale_endpoint",
+            Self::Platform(_) => "ipc_platform",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_message_is_rejected_before_write() {
+        let (mut left, _right) = tokio::io::duplex(MAX_MESSAGE_BYTES + 16);
+        let value = "x".repeat(MAX_MESSAGE_BYTES + 1);
+        let error = write_message(&mut left, &value)
+            .await
+            .expect_err("size limit");
+        assert!(matches!(error, IpcError::MessageTooLarge(_)));
+    }
 }

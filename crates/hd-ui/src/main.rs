@@ -1,22 +1,19 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use eframe::egui;
 use hd_core::{
-    ControlCommandV1, ControlPayloadV1, ControlRequestV1, InstanceAction, InstanceConfigV1,
-    InstanceSummaryV1, Orientation, VsyncMode,
+    AdbModeV2, ArtifactSelectionV2, CreateInstanceRequestV2, DiagnosticRequestV2,
+    HostCapabilitiesV2, InstanceActionV2, InstanceRecordV2, InstanceSpecV2, InstanceSummaryV2,
+    KeyActionV2, OperationKindV2, OrientationV2, RestartPolicyV2, StopModeV2,
+    UpdateInstanceRequestV2, VsyncModeV2,
 };
-use hd_platform::{
-    DataPaths, DisplayEmbedder, DisplayRect, NativeDisplayEmbedder, NativeWindowBinding,
-    PlatformDisplayLease,
-};
-use hd_runtime::{CrosvmBackend, Supervisor, control_endpoint, run_control_server};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use hd_platform::DataPaths;
+use hd_runtime::HostClientV2;
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -27,47 +24,35 @@ fn main() -> Result<()> {
     let _log_guard = init_logging(&paths)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_name("hd-runtime")
+        .thread_name("hd-ui-runtime")
         .build()
-        .context("create HD runtime")?;
-    let repo_root = discover_repo_root();
-    let supervisor = Arc::new(
-        Supervisor::new(paths, CrosvmBackend::discover(repo_root.as_deref()))
-            .context("create HD supervisor")?,
-    );
-    let endpoint = control_endpoint().context("derive local control endpoint")?;
-    let server_supervisor = Arc::clone(&supervisor);
-    runtime.spawn(async move {
-        if let Err(error) = run_control_server(server_supervisor, &endpoint).await {
-            tracing::error!(%error, "control server stopped");
-        }
-    });
+        .context("create HD UI runtime")?;
+    let client = runtime
+        .block_on(HostClientV2::connect_or_start(paths))
+        .context("connect to HD host")?;
 
     let mut options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("HD Android")
-            .with_inner_size([1400.0, 900.0])
-            .with_min_inner_size([960.0, 640.0]),
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([1040.0, 680.0]),
         ..Default::default()
     };
     #[cfg(windows)]
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
         setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
     }
-
     eframe::run_native(
         "HD Android",
         options,
-        Box::new(move |creation_context| {
-            Ok(Box::new(HdApp::new(creation_context, runtime, supervisor)))
-        }),
+        Box::new(move |_context| Ok(Box::new(HdApp::new(runtime, client)))),
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 fn init_logging(paths: &DataPaths) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    let appender = tracing_appender::rolling::daily(&paths.logs, "hd.jsonl");
+    let appender = tracing_appender::rolling::daily(&paths.logs, "ui-v2.jsonl");
     let (writer, guard) = tracing_appender::non_blocking(appender);
     tracing_subscriber::fmt()
         .json()
@@ -80,600 +65,767 @@ fn init_logging(paths: &DataPaths) -> Result<tracing_appender::non_blocking::Wor
     Ok(guard)
 }
 
-fn discover_repo_root() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("BSCP_ROOT") {
-        return Some(PathBuf::from(root));
-    }
-    let current = std::env::current_dir().ok()?;
-    for candidate in current.ancestors() {
-        if candidate.join("build_all.bat").is_file() && candidate.join("external/crosvm").is_dir() {
-            return Some(candidate.to_owned());
-        }
-    }
-    None
+#[derive(Debug)]
+struct Snapshot {
+    summaries: Vec<InstanceSummaryV2>,
+    selected: Option<InstanceRecordV2>,
+    capabilities: HostCapabilitiesV2,
+}
+
+#[derive(Debug)]
+enum UiMessage {
+    Snapshot(Result<Box<Snapshot>, String>),
+    Completed(Result<String, String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelTab {
+    Display,
+    Settings,
+    Devices,
+    Diagnostics,
 }
 
 struct HdApp {
     runtime: Runtime,
-    supervisor: Arc<Supervisor>,
-    embedder: NativeDisplayEmbedder,
-    root_window: NativeWindowBinding,
-    viewport_leases: HashMap<Uuid, PlatformDisplayLease>,
-    viewport_rect: DisplayRect,
-    summaries: Vec<InstanceSummaryV1>,
-    selected: Option<Uuid>,
-    draft: Option<InstanceConfigV1>,
-    extra_args: String,
-    adb_path: String,
-    apk_path: String,
-    mock_start: bool,
+    client: HostClientV2,
+    sender: Sender<UiMessage>,
+    receiver: Receiver<UiMessage>,
+    pending: usize,
+    summaries: Vec<InstanceSummaryV2>,
+    selected_id: Option<Uuid>,
+    selected_record: Option<InstanceRecordV2>,
+    draft: Option<InstanceSpecV2>,
+    capabilities: Option<HostCapabilitiesV2>,
+    tab: PanelTab,
     status: String,
     last_refresh: Instant,
-    shutdown_sent: bool,
+    refresh_requested: bool,
+    artifact_store: String,
+    guest_digest: String,
+    host_digest: String,
+    adb_executable: String,
+    apk_path: String,
+    new_name: String,
 }
 
 impl HdApp {
-    fn new(
-        creation_context: &eframe::CreationContext<'_>,
-        runtime: Runtime,
-        supervisor: Arc<Supervisor>,
-    ) -> Self {
-        let root_window = native_binding(creation_context);
-        let summaries = runtime.block_on(supervisor.summaries());
-        let selected = summaries.first().map(|summary| summary.id);
-        let draft = selected.and_then(|id| runtime.block_on(supervisor.config(id)));
-        let extra_args = draft
-            .as_ref()
-            .map(|config| config.extra_kernel_args.join(" "))
-            .unwrap_or_default();
-        let adb_path = draft
-            .as_ref()
-            .and_then(|config| config.adb.adb_path.as_ref())
-            .map_or_else(String::new, |path| path.display().to_string());
-        Self {
+    fn new(runtime: Runtime, client: HostClientV2) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let now = Instant::now();
+        let mut app = Self {
             runtime,
-            supervisor,
-            embedder: NativeDisplayEmbedder::default(),
-            root_window,
-            viewport_leases: HashMap::new(),
-            viewport_rect: DisplayRect {
-                x: 280,
-                y: 88,
-                width: 1080,
-                height: 760,
-            },
-            summaries,
-            selected,
-            draft,
-            extra_args,
-            adb_path,
+            client,
+            sender,
+            receiver,
+            pending: 0,
+            summaries: Vec::new(),
+            selected_id: None,
+            selected_record: None,
+            draft: None,
+            capabilities: None,
+            tab: PanelTab::Display,
+            status: "正在读取宿主状态…".to_owned(),
+            last_refresh: now.checked_sub(Duration::from_secs(10)).unwrap_or(now),
+            refresh_requested: true,
+            artifact_store: String::new(),
+            guest_digest: String::new(),
+            host_digest: String::new(),
+            adb_executable: String::new(),
             apk_path: String::new(),
-            mock_start: true,
-            status: "就绪；阶段 0 可使用 mock 后端验收完整流程".to_owned(),
-            last_refresh: Instant::now(),
-            shutdown_sent: false,
-        }
+            new_name: "Android".to_owned(),
+        };
+        app.refresh();
+        app
+    }
+
+    fn spawn<F>(&mut self, future: F)
+    where
+        F: std::future::Future<Output = UiMessage> + Send + 'static,
+    {
+        self.pending = self.pending.saturating_add(1);
+        let sender = self.sender.clone();
+        self.runtime.spawn(async move {
+            let message = future.await;
+            let _ = sender.send(message);
+        });
     }
 
     fn refresh(&mut self) {
-        self.summaries = self.runtime.block_on(self.supervisor.summaries());
-        if self
-            .selected
-            .is_some_and(|id| !self.summaries.iter().any(|summary| summary.id == id))
-        {
-            self.select(self.summaries.first().map(|summary| summary.id));
+        if self.pending > 0 && !self.refresh_requested {
+            return;
         }
+        self.refresh_requested = false;
         self.last_refresh = Instant::now();
+        let client = self.client.clone();
+        let selected_id = self.selected_id;
+        self.spawn(async move {
+            let result = async {
+                let summaries = client
+                    .list_instances()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let selected_id = selected_id
+                    .filter(|id| summaries.iter().any(|summary| summary.id == *id))
+                    .or_else(|| summaries.first().map(|summary| summary.id));
+                let selected = match selected_id {
+                    Some(id) => Some(
+                        client
+                            .get_instance(id)
+                            .await
+                            .map_err(|error| error.to_string())?,
+                    ),
+                    None => None,
+                };
+                let capabilities = client
+                    .capabilities(selected_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(Box::new(Snapshot {
+                    summaries,
+                    selected,
+                    capabilities,
+                }))
+            }
+            .await;
+            UiMessage::Snapshot(result)
+        });
     }
 
-    fn select(&mut self, id: Option<Uuid>) {
-        self.selected = id;
-        self.draft = id.and_then(|id| self.runtime.block_on(self.supervisor.config(id)));
-        self.extra_args = self
-            .draft
-            .as_ref()
-            .map(|config| config.extra_kernel_args.join(" "))
-            .unwrap_or_default();
-        self.adb_path = self
-            .draft
-            .as_ref()
-            .and_then(|config| config.adb.adb_path.as_ref())
-            .map_or_else(String::new, |path| path.display().to_string());
-    }
-
-    fn execute(&mut self, command: ControlCommandV1) -> bool {
-        let response = self
-            .runtime
-            .block_on(self.supervisor.handle(ControlRequestV1::new(command)));
-        if response.ok {
-            self.status = match response.payload {
-                Some(ControlPayloadV1::Diagnosis(diagnosis)) => diagnosis
-                    .checks
-                    .iter()
-                    .map(|check| format!("{}: {:?} — {}", check.name, check.status, check.detail))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => "操作成功".to_owned(),
-            };
+    fn process_messages(&mut self) {
+        while let Ok(message) = self.receiver.try_recv() {
+            self.pending = self.pending.saturating_sub(1);
+            match message {
+                UiMessage::Snapshot(Ok(snapshot)) => {
+                    let snapshot = *snapshot;
+                    self.summaries = snapshot.summaries;
+                    self.capabilities = Some(snapshot.capabilities);
+                    let new_id = snapshot.selected.as_ref().map(|record| record.spec.id);
+                    let should_replace_draft = self.selected_id != new_id || self.draft.is_none();
+                    self.selected_id = new_id;
+                    self.selected_record = snapshot.selected;
+                    if should_replace_draft {
+                        self.reset_draft();
+                    }
+                    "宿主状态已同步".clone_into(&mut self.status);
+                }
+                UiMessage::Snapshot(Err(error)) | UiMessage::Completed(Err(error)) => {
+                    self.status = error;
+                }
+                UiMessage::Completed(Ok(message)) => {
+                    self.status = message;
+                    self.refresh_requested = true;
+                }
+            }
+        }
+        if self.refresh_requested && self.pending == 0 {
             self.refresh();
-            true
-        } else {
-            self.status = response.error.map_or_else(
-                || "未知错误".to_owned(),
-                |error| format!("{}: {}", error.code, error.message),
-            );
-            false
         }
     }
 
-    fn ensure_viewport(&mut self, id: Uuid) -> bool {
-        if self.viewport_leases.contains_key(&id) {
-            return true;
-        }
-        match self.embedder.acquire(&self.root_window, self.viewport_rect) {
-            Ok(lease) => {
-                if let Err(error) = self
-                    .runtime
-                    .block_on(self.supervisor.set_display_lease(id, Some(lease.clone())))
-                {
-                    let _ = self.embedder.release(lease.contract.lease_id);
-                    self.status = format!("绑定显示窗口失败: {error}");
-                    return false;
-                }
-                self.viewport_leases.insert(id, lease);
-                true
-            }
-            Err(error) => {
-                self.status = format!("创建显示窗口失败: {error}");
-                false
-            }
+    fn select(&mut self, id: Uuid) {
+        if self.selected_id != Some(id) {
+            self.selected_id = Some(id);
+            self.selected_record = None;
+            self.draft = None;
+            self.refresh_requested = true;
         }
     }
 
-    fn release_viewport(&mut self, id: Uuid) {
-        if let Some(lease) = self.viewport_leases.remove(&id) {
-            let _ = self
-                .runtime
-                .block_on(self.supervisor.set_display_lease(id, None));
-            if let Err(error) = self.embedder.release(lease.contract.lease_id) {
-                self.status = format!("释放显示窗口失败: {error}");
-            }
-        }
-    }
-
-    fn update_native_viewports(&mut self) {
-        for (id, lease) in &self.viewport_leases {
-            let rect = if Some(*id) == self.selected {
-                self.viewport_rect
+    fn reset_draft(&mut self) {
+        self.draft = self
+            .selected_record
+            .as_ref()
+            .map(|record| record.spec.clone());
+        if let Some(spec) = &self.draft {
+            self.adb_executable = spec
+                .adb
+                .executable
+                .as_ref()
+                .map_or_else(String::new, |path| path.display().to_string());
+            if let Some(artifacts) = &spec.artifacts {
+                self.artifact_store = artifacts.store_root.display().to_string();
+                self.guest_digest.clone_from(&artifacts.guest_bundle_digest);
+                self.host_digest.clone_from(&artifacts.host_bundle_digest);
             } else {
-                DisplayRect {
-                    x: -32_000,
-                    y: -32_000,
-                    width: 1,
-                    height: 1,
-                }
-            };
-            if let Err(error) = self.embedder.resize(lease.contract.lease_id, rect) {
-                tracing::warn!(%id, %error, "failed to resize native viewport");
+                self.artifact_store.clear();
+                self.guest_digest.clear();
+                self.host_digest.clear();
             }
         }
     }
 
-    fn save_draft(&mut self) {
-        let Some(mut draft) = self.draft.clone() else {
+    fn create_instance(&mut self) {
+        let spec = InstanceSpecV2 {
+            name: self.new_name.trim().to_owned(),
+            ..InstanceSpecV2::default()
+        };
+        if let Err(error) = spec.validate() {
+            self.status = error.to_string();
+            return;
+        }
+        let client = self.client.clone();
+        self.spawn(async move {
+            UiMessage::Completed(
+                client
+                    .create_instance(&CreateInstanceRequestV2 { spec })
+                    .await
+                    .map(|record| format!("已创建实例 {}", record.spec.name))
+                    .map_err(|error| error.to_string()),
+            )
+        });
+    }
+
+    fn save_spec(&mut self) {
+        let Some(mut spec) = self.draft.clone() else {
             return;
         };
-        draft.extra_kernel_args = self
-            .extra_args
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-        draft.adb.adb_path = if self.adb_path.trim().is_empty() {
+        let Some(record) = &self.selected_record else {
+            return;
+        };
+        spec.adb.executable = non_empty_path(&self.adb_executable);
+        spec.artifacts = if self.artifact_store.trim().is_empty()
+            && self.guest_digest.trim().is_empty()
+            && self.host_digest.trim().is_empty()
+        {
             None
         } else {
-            Some(PathBuf::from(self.adb_path.trim()))
+            Some(ArtifactSelectionV2 {
+                store_root: PathBuf::from(self.artifact_store.trim()),
+                guest_bundle_digest: self.guest_digest.trim().to_owned(),
+                host_bundle_digest: self.host_digest.trim().to_owned(),
+            })
         };
-        if self.execute(ControlCommandV1::Update {
-            config: draft.clone(),
-        }) {
-            self.draft = Some(draft);
-        }
-    }
-
-    fn start_instance(&mut self, id: Uuid) {
-        let mock = self.mock_start;
-        if !mock && !self.ensure_viewport(id) {
+        if let Err(error) = spec.validate() {
+            self.status = error.to_string();
             return;
         }
-        if !self.execute(ControlCommandV1::Start { id, mock }) && !mock {
-            self.release_viewport(id);
-        }
+        let expected_revision = record.status.revision;
+        let id = spec.id;
+        let client = self.client.clone();
+        self.spawn(async move {
+            UiMessage::Completed(
+                client
+                    .update_instance(
+                        id,
+                        &UpdateInstanceRequestV2 {
+                            expected_revision,
+                            spec,
+                        },
+                    )
+                    .await
+                    .map(|_| "实例设置已原子保存".to_owned())
+                    .map_err(|error| error.to_string()),
+            )
+        });
     }
 
-    fn draw_toolbar(&mut self, root: &mut egui::Ui) {
-        egui::Panel::top("toolbar")
-            .exact_size(52.0)
-            .show(root, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.heading("HD");
-                    ui.separator();
-                    let selected = self.selected;
-                    let start = ui
-                        .add_enabled(selected.is_some(), egui::Button::new("启动"))
-                        .clicked();
-                    let stop = ui
-                        .add_enabled(selected.is_some(), egui::Button::new("停止"))
-                        .clicked();
-                    ui.checkbox(&mut self.mock_start, "Mock 启动");
-                    ui.separator();
-                    for (label, action) in [
-                        ("主页", InstanceAction::Home),
-                        ("最近", InstanceAction::Recent),
-                        ("返回", InstanceAction::Back),
-                        ("旋转", InstanceAction::Rotate),
-                        ("电源", InstanceAction::Power),
-                        ("音量+", InstanceAction::VolumeUp),
-                        ("音量-", InstanceAction::VolumeDown),
-                    ] {
-                        if ui
-                            .add_enabled(selected.is_some(), egui::Button::new(label))
-                            .clicked()
-                            && let Some(id) = selected
-                        {
-                            self.execute(ControlCommandV1::Action { id, action });
-                        }
-                    }
-                    if let Some(summary) = selected
-                        .and_then(|id| self.summaries.iter().find(|summary| summary.id == id))
-                    {
-                        ui.separator();
-                        ui.label(format!("{:?}", summary.state.state));
-                        if let Some(fps) = summary.host_fps_milli {
-                            ui.monospace(format!("{:.1} FPS", f64::from(fps) / 1000.0));
-                        }
-                    }
-                    if start && let Some(id) = selected {
-                        self.start_instance(id);
-                    }
-                    if stop
-                        && let Some(id) = selected
-                        && self.execute(ControlCommandV1::Stop { id })
-                    {
-                        self.release_viewport(id);
-                    }
-                });
-            });
+    fn operation(&mut self, kind: OperationKindV2, timeout: Duration, label: &'static str) {
+        let Some(id) = self.selected_id else {
+            return;
+        };
+        let client = self.client.clone();
+        self.spawn(async move {
+            let result = async {
+                let key = format!("hd-ui-{}", Uuid::new_v4());
+                let operation = client
+                    .create_operation(id, kind, &key)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                client
+                    .wait_operation(operation.id, timeout)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(format!("{label}完成"))
+            }
+            .await;
+            UiMessage::Completed(result)
+        });
     }
 
-    fn draw_instances(&mut self, root: &mut egui::Ui) {
+    fn action(&mut self, action: InstanceActionV2, label: &'static str) {
+        let Some(id) = self.selected_id else {
+            return;
+        };
+        let client = self.client.clone();
+        self.spawn(async move {
+            UiMessage::Completed(
+                client
+                    .action(id, action)
+                    .await
+                    .map(|_| format!("{label}已送达并回读"))
+                    .map_err(|error| error.to_string()),
+            )
+        });
+    }
+
+    fn install_apk(&mut self) {
+        let Some(id) = self.selected_id else {
+            return;
+        };
+        let path = PathBuf::from(self.apk_path.trim());
+        let client = self.client.clone();
+        self.spawn(async move {
+            let result = async {
+                let upload = client
+                    .upload_apk(&path)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let key = format!("hd-ui-install-{}", Uuid::new_v4());
+                let operation = client
+                    .create_operation(
+                        id,
+                        OperationKindV2::InstallApk {
+                            upload_id: upload.id,
+                            sha256: upload.sha256,
+                        },
+                        &key,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                client
+                    .wait_operation(operation.id, Duration::from_secs(600))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok("APK 已校验、安装并回读包路径".to_owned())
+            }
+            .await;
+            UiMessage::Completed(result)
+        });
+    }
+
+    fn diagnostics(&mut self, include_guest_logs: bool) {
+        let client = self.client.clone();
+        let instance_id = self.selected_id;
+        self.spawn(async move {
+            UiMessage::Completed(
+                client
+                    .collect_diagnostics(&DiagnosticRequestV2 {
+                        instance_id,
+                        include_guest_logs,
+                    })
+                    .await
+                    .map(|bundle| format!("诊断包：{}", bundle.path.display()))
+                    .map_err(|error| error.to_string()),
+            )
+        });
+    }
+
+    fn sidebar(&mut self, root: &mut egui::Ui) {
         egui::Panel::left("instances")
             .resizable(true)
-            .default_size(260.0)
-            .min_size(220.0)
+            .default_size(270.0)
             .show(root, |ui| {
+                ui.heading("HD 实例");
                 ui.horizontal(|ui| {
-                    ui.heading("实例");
-                    if ui.button("＋").on_hover_text("新建实例").clicked() {
-                        let count = self.summaries.len() + 1;
-                        let config = InstanceConfigV1 {
-                            name: format!("Android {count}"),
-                            ..Default::default()
-                        };
-                        let id = config.id;
-                        if self.execute(ControlCommandV1::Create { config }) {
-                            self.select(Some(id));
-                        }
+                    ui.text_edit_singleline(&mut self.new_name);
+                    if ui
+                        .add_enabled(self.pending == 0, egui::Button::new("新建"))
+                        .clicked()
+                    {
+                        self.create_instance();
                     }
                 });
                 ui.separator();
                 let summaries = self.summaries.clone();
                 for summary in summaries {
-                    let selected = self.selected == Some(summary.id);
-                    let label = format!("{}\n{:?}", summary.name, summary.state.state);
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.select(Some(summary.id));
+                    let selected = self.selected_id == Some(summary.id);
+                    let text = format!("{}\n{:?}", summary.name, summary.status.observed);
+                    if ui.selectable_label(selected, text).clicked() {
+                        self.select(summary.id);
                     }
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    if let Some(id) = self.selected {
-                        if ui.button("诊断").clicked() {
-                            self.execute(ControlCommandV1::Diagnose { id });
-                        }
-                        if ui.button("删除已停止实例").clicked()
-                            && self.execute(ControlCommandV1::Delete { id })
-                        {
-                            self.release_viewport(id);
-                            self.select(None);
-                        }
+                    ui.small(format!("待处理任务：{}", self.pending));
+                    if ui.button("立即刷新").clicked() && self.pending == 0 {
+                        self.refresh();
                     }
                 });
             });
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn draw_settings(&mut self, root: &mut egui::Ui) {
-        let mut save_requested = false;
-        let mut display_requested = None;
-        let mut install_requested = false;
-        let selected = self.selected;
-        let draft_slot = &mut self.draft;
-        let adb_path = &mut self.adb_path;
-        let extra_args = &mut self.extra_args;
-        let apk_path = &mut self.apk_path;
-        egui::Panel::right("settings")
-            .resizable(true)
-            .default_size(330.0)
-            .min_size(280.0)
-            .show(root, |ui| {
-                ui.heading("启动与设备设置");
+    fn top_bar(&mut self, root: &mut egui::Ui) {
+        egui::Panel::top("toolbar").show(root, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (tab, label) in [
+                    (PanelTab::Display, "显示与控制"),
+                    (PanelTab::Settings, "启动设置"),
+                    (PanelTab::Devices, "设备模拟"),
+                    (PanelTab::Diagnostics, "能力与诊断"),
+                ] {
+                    if ui.selectable_label(self.tab == tab, label).clicked() {
+                        self.tab = tab;
+                    }
+                }
                 ui.separator();
-                let Some(draft) = draft_slot.as_mut() else {
-                    ui.label("选择一个实例后编辑设置");
-                    return;
-                };
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::Grid::new("settings_grid")
-                        .num_columns(2)
-                        .spacing([12.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("名称");
-                            ui.text_edit_singleline(&mut draft.name);
-                            ui.end_row();
-                            ui.label("CPU");
-                            ui.add(egui::DragValue::new(&mut draft.cpu_count).range(1..=256));
-                            ui.end_row();
-                            ui.label("内存 MiB");
-                            ui.add(
-                                egui::DragValue::new(&mut draft.memory_mib)
-                                    .speed(128)
-                                    .range(512..=1_048_576),
-                            );
-                            ui.end_row();
-                            ui.label("分辨率");
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::DragValue::new(&mut draft.display.width)
-                                        .range(320..=16_384),
-                                );
-                                ui.label("×");
-                                ui.add(
-                                    egui::DragValue::new(&mut draft.display.height)
-                                        .range(320..=16_384),
-                                );
-                            });
-                            ui.end_row();
-                            ui.label("DPI");
-                            ui.add(egui::DragValue::new(&mut draft.display.dpi).range(72..=960));
-                            ui.end_row();
-                            ui.label("刷新率");
-                            ui.add(
-                                egui::DragValue::new(&mut draft.display.refresh_rate_hz)
-                                    .range(1..=1000)
-                                    .suffix(" Hz"),
-                            );
-                            ui.end_row();
-                            ui.label("方向");
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(
-                                    &mut draft.display.orientation,
-                                    Orientation::Landscape,
-                                    "横屏",
-                                );
-                                ui.selectable_value(
-                                    &mut draft.display.orientation,
-                                    Orientation::Portrait,
-                                    "竖屏",
-                                );
-                            });
-                            ui.end_row();
-                            ui.label("垂直同步");
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(&mut draft.display.vsync, VsyncMode::On, "开");
-                                ui.selectable_value(&mut draft.display.vsync, VsyncMode::Off, "关");
-                            })
-                            .response
-                            .on_hover_text("VSync 在下次启动时生效；运行中不会静默伪装为已应用");
-                            ui.end_row();
-                            ui.label("宿主 FPS");
-                            ui.checkbox(&mut draft.display.show_host_fps, "显示");
-                            ui.end_row();
-                            ui.label("ADB");
-                            ui.checkbox(&mut draft.adb.enabled, "启用");
-                            ui.end_row();
-                            ui.label("ADB 端口");
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut draft.adb.auto_port, "自动");
-                                let port = draft.adb.host_port.get_or_insert(6520);
-                                ui.add_enabled(
-                                    !draft.adb.auto_port,
-                                    egui::DragValue::new(port).range(1..=u16::MAX),
-                                );
-                            });
-                            ui.end_row();
-                            ui.label("ADB root");
-                            ui.checkbox(&mut draft.adb.auto_root, "自动 root");
-                            ui.end_row();
-                        });
-                    ui.label("ADB 路径（空值使用 PATH）");
-                    ui.text_edit_singleline(adb_path);
-                    ui.label("额外 kernel 参数");
-                    ui.text_edit_multiline(extra_args);
-                    ui.collapsing("外部构件（HD 不下载、不构建）", |ui| {
-                        path_editor(ui, "Kernel", &mut draft.artifacts.kernel);
-                        path_editor(ui, "Initrd", &mut draft.artifacts.initrd);
-                        path_editor(ui, "Rootfs", &mut draft.artifacts.rootfs);
-                        path_editor(ui, "Fstab", &mut draft.artifacts.android_fstab);
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("保存启动设置").clicked() {
-                            save_requested = true;
-                        }
-                        if ui.button("仅应用显示").clicked() {
-                            display_requested = Some(draft.display.clone());
-                        }
-                    });
-                    ui.separator();
-                    ui.label("安装 APK");
-                    ui.text_edit_singleline(apk_path);
-                    if ui.button("安装").clicked() {
-                        install_requested = true;
-                    }
-                });
+                ui.label(&self.status);
             });
-        if save_requested {
-            self.save_draft();
-        }
-        if let (Some(id), Some(display)) = (selected, display_requested) {
-            self.execute(ControlCommandV1::ApplyDisplay { id, display });
-        }
-        if install_requested && let Some(id) = selected {
-            self.execute(ControlCommandV1::InstallApk {
-                id,
-                path: PathBuf::from(self.apk_path.trim()),
-            });
-        }
-    }
-
-    fn draw_center(&mut self, root: &mut egui::Ui) {
-        let scale = root.ctx().pixels_per_point();
-        egui::CentralPanel::default().show(root, |ui| {
-            let available = ui.available_rect_before_wrap();
-            self.viewport_rect = DisplayRect {
-                x: physical_position(available.min.x * scale),
-                y: physical_position(available.min.y * scale),
-                width: physical_extent(available.width() * scale),
-                height: physical_extent(available.height() * scale),
-            };
-            let painter = ui.painter();
-            painter.rect_filled(available, 8.0, egui::Color32::from_rgb(16, 19, 24));
-            if self.selected.is_none() {
-                painter.text(
-                    available.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "新建或选择实例",
-                    egui::FontId::proportional(24.0),
-                    egui::Color32::GRAY,
-                );
-            } else if self
-                .selected
-                .is_some_and(|id| !self.viewport_leases.contains_key(&id))
-            {
-                let selected_state = self.selected.and_then(|id| {
-                    self.summaries
-                        .iter()
-                        .find(|summary| summary.id == id)
-                        .map(|summary| summary.state.state)
-                });
-                let message = if selected_state == Some(hd_core::InstanceState::Ready) {
-                    "Mock 实例已就绪\n可验证控制、设置、日志和多实例流程"
-                } else {
-                    "Android 显示区域\n真实启动后由 crosvm/gfxstream 子窗口接管"
-                };
-                painter.text(
-                    available.center(),
-                    egui::Align2::CENTER_CENTER,
-                    message,
-                    egui::FontId::proportional(20.0),
-                    egui::Color32::LIGHT_GRAY,
-                );
-            }
         });
     }
 
-    fn draw_status(&mut self, root: &mut egui::Ui) {
-        egui::Panel::bottom("status")
-            .resizable(true)
-            .default_size(36.0)
-            .show(root, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.monospace(&self.status);
-                });
+    #[allow(clippy::too_many_lines)]
+    fn display_panel(&mut self, ui: &mut egui::Ui) {
+        let ready = self
+            .selected_record
+            .as_ref()
+            .is_some_and(|record| record.status.observed == hd_core::ObservedStateV2::Ready);
+        ui.horizontal_wrapped(|ui| {
+            let enabled = self.pending == 0 && self.selected_id.is_some();
+            if ui.add_enabled(enabled, egui::Button::new("启动")).clicked() {
+                self.operation(OperationKindV2::Start, Duration::from_secs(600), "启动");
+            }
+            if ui.add_enabled(enabled, egui::Button::new("停止")).clicked() {
+                self.operation(
+                    OperationKindV2::Stop {
+                        mode: StopModeV2::Graceful,
+                        graceful_timeout_ms: 20_000,
+                    },
+                    Duration::from_secs(90),
+                    "停止",
+                );
+            }
+            if ui.add_enabled(enabled, egui::Button::new("重启")).clicked() {
+                self.operation(OperationKindV2::Restart, Duration::from_secs(660), "重启");
+            }
+            if ui.add_enabled(enabled, egui::Button::new("暂停")).clicked() {
+                self.operation(OperationKindV2::Pause, Duration::from_secs(30), "暂停");
+            }
+            if ui.add_enabled(enabled, egui::Button::new("恢复")).clicked() {
+                self.operation(OperationKindV2::Resume, Duration::from_secs(30), "恢复");
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (label, key) in [
+                ("Home", KeyActionV2::Home),
+                ("最近任务", KeyActionV2::Recent),
+                ("返回", KeyActionV2::Back),
+                ("电源", KeyActionV2::Power),
+                ("音量 +", KeyActionV2::VolumeUp),
+                ("音量 -", KeyActionV2::VolumeDown),
+            ] {
+                if ui
+                    .add_enabled(ready && self.pending == 0, egui::Button::new(label))
+                    .clicked()
+                {
+                    self.action(InstanceActionV2::Key { key }, label);
+                }
+            }
+            if ui
+                .add_enabled(ready && self.pending == 0, egui::Button::new("旋转"))
+                .clicked()
+            {
+                let orientation =
+                    self.selected_record
+                        .as_ref()
+                        .map_or(OrientationV2::Landscape, |record| {
+                            if record.spec.display.orientation.is_portrait() {
+                                OrientationV2::Landscape
+                            } else {
+                                OrientationV2::Portrait
+                            }
+                        });
+                self.action(InstanceActionV2::Rotate { orientation }, "旋转");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("APK");
+            ui.text_edit_singleline(&mut self.apk_path);
+            if ui
+                .add_enabled(ready && self.pending == 0, egui::Button::new("安装并验证"))
+                .clicked()
+            {
+                self.install_apk();
+            }
+        });
+        ui.separator();
+        let available = ui.available_size();
+        let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, 8.0, egui::Color32::from_rgb(18, 20, 24));
+        let text = match &self.selected_record {
+            None => "请选择或创建实例".to_owned(),
+            Some(record) if record.status.observed == hd_core::ObservedStateV2::Ready => format!(
+                "认证 Guest 已就绪；显示消费者等待原生外部纹理会话\n{} × {} · {} dpi · {} Hz\nframe generation {}",
+                record.spec.display.oriented_size().0,
+                record.spec.display.oriented_size().1,
+                record.spec.display.dpi,
+                record.spec.display.refresh_rate_hz,
+                record.frame_generation
+            ),
+            Some(record) => {
+                format!(
+                    "Android 显示尚未就绪\n状态：{:?}\n{}",
+                    record.status.observed,
+                    record.status.reason.as_deref().unwrap_or(
+                        "启动只会在签名 Guest、正式设备后端和严格零拷贝门禁全部通过后继续"
+                    )
+                )
+            }
+        };
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(18.0),
+            egui::Color32::LIGHT_GRAY,
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(draft) = self.draft.as_mut() else {
+            ui.label("请选择实例");
+            return;
+        };
+        let mut save_clicked = false;
+        let mut reset_clicked = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("实例与启动资源");
+            egui::Grid::new("resources").num_columns(2).show(ui, |ui| {
+                ui.label("名称");
+                ui.text_edit_singleline(&mut draft.name);
+                ui.end_row();
+                ui.label("CPU");
+                ui.add(egui::DragValue::new(&mut draft.cpu_count).range(1..=256));
+                ui.end_row();
+                ui.label("内存 MiB");
+                ui.add(egui::DragValue::new(&mut draft.memory_mib).range(2048..=1_048_576));
+                ui.end_row();
+                ui.label("重启策略");
+                egui::ComboBox::from_id_salt("restart-policy")
+                    .selected_text(format!("{:?}", draft.restart_policy))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut draft.restart_policy, RestartPolicyV2::OnFailure, "失败恢复");
+                        ui.selectable_value(&mut draft.restart_policy, RestartPolicyV2::Never, "不自动恢复");
+                    });
+                ui.end_row();
             });
+            ui.separator();
+            ui.heading("显示");
+            egui::Grid::new("display-settings").num_columns(2).show(ui, |ui| {
+                ui.label("宽度");
+                ui.add(egui::DragValue::new(&mut draft.display.width).range(320..=8192));
+                ui.end_row();
+                ui.label("高度");
+                ui.add(egui::DragValue::new(&mut draft.display.height).range(320..=8192));
+                ui.end_row();
+                ui.label("DPI");
+                ui.add(egui::DragValue::new(&mut draft.display.dpi).range(72..=960));
+                ui.end_row();
+                ui.label("帧率");
+                egui::ComboBox::from_id_salt("refresh-rate")
+                    .selected_text(draft.display.refresh_rate_hz.to_string())
+                    .show_ui(ui, |ui| {
+                        for rate in [30, 60, 90, 120] {
+                            ui.selectable_value(&mut draft.display.refresh_rate_hz, rate, rate.to_string());
+                        }
+                    });
+                ui.end_row();
+                ui.label("方向");
+                egui::ComboBox::from_id_salt("orientation")
+                    .selected_text(format!("{:?}", draft.display.orientation))
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [
+                            (OrientationV2::Portrait, "竖屏"),
+                            (OrientationV2::Landscape, "横屏"),
+                            (OrientationV2::ReversePortrait, "反向竖屏"),
+                            (OrientationV2::ReverseLandscape, "反向横屏"),
+                        ] {
+                            ui.selectable_value(&mut draft.display.orientation, value, label);
+                        }
+                    });
+                ui.end_row();
+                ui.label("垂直同步");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut draft.display.vsync, VsyncModeV2::On, "开");
+                    ui.selectable_value(&mut draft.display.vsync, VsyncModeV2::Off, "关");
+                });
+                ui.end_row();
+                ui.label("显示宿主 FPS");
+                ui.checkbox(&mut draft.display.show_host_fps, "启用");
+                ui.end_row();
+            });
+            ui.separator();
+            ui.heading("ADB");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut draft.adb.mode, AdbModeV2::Loopback, "仅本机");
+                ui.selectable_value(&mut draft.adb.mode, AdbModeV2::Disabled, "关闭");
+            });
+            if draft.adb.mode == AdbModeV2::Loopback {
+                ui.horizontal(|ui| {
+                    ui.label("宿主端口（留空自动分配）");
+                    let mut port = draft.adb.host_port.unwrap_or(0);
+                    if ui.add(egui::DragValue::new(&mut port).range(0..=u16::MAX)).changed() {
+                        draft.adb.host_port = (port != 0).then_some(port);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("ADB 可执行文件（留空使用签名 bundle）");
+                    ui.text_edit_singleline(&mut self.adb_executable);
+                });
+            } else {
+                draft.adb.host_port = None;
+            }
+            ui.separator();
+            ui.heading("受信制品");
+            ui.label("只有 Ed25519 签名、SHA-256 固定且 READY 完整的 Guest/host bundle 才能启动。");
+            ui.horizontal(|ui| {
+                ui.label("制品仓库");
+                ui.text_edit_singleline(&mut self.artifact_store);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Guest digest");
+                ui.text_edit_singleline(&mut self.guest_digest);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Host digest");
+                ui.text_edit_singleline(&mut self.host_digest);
+            });
+            ui.separator();
+            ui.heading("固定启动参数");
+            ui.horizontal(|ui| {
+                ui.label("内核日志级别");
+                ui.add(egui::DragValue::new(&mut draft.boot.kernel_log_level).range(0..=7));
+                ui.label("panic 秒数");
+                ui.add(egui::DragValue::new(&mut draft.boot.panic_timeout_seconds).range(0..=300));
+                ui.checkbox(&mut draft.boot.boot_animation, "启动动画");
+            });
+            ui.label("V2 不接受自由拼接的内核或 crosvm 参数；全部参数由类型化配置生成并写入 run manifest。");
+            ui.separator();
+            if ui
+                .add_enabled(self.pending == 0, egui::Button::new("原子保存设置"))
+                .clicked()
+            {
+                save_clicked = true;
+            }
+            if ui.button("放弃未保存更改").clicked() {
+                reset_clicked = true;
+            }
+        });
+        if save_clicked {
+            self.save_spec();
+        }
+        if reset_clicked {
+            self.reset_draft();
+        }
+    }
+
+    fn devices_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(draft) = self.draft.as_mut() else {
+            ui.label("请选择实例");
+            return;
+        };
+        ui.heading("Android 15 phone profile");
+        ui.label(
+            "启用的设备必须有正式组件、正式模拟器或明确的软件 Guest 边界；缺失时启动会被阻止。",
+        );
+        egui::Grid::new("devices").num_columns(3).show(ui, |ui| {
+            for (label, enabled) in [
+                ("Bluetooth / RootCanal", &mut draft.devices.bluetooth),
+                ("NFC / Casimir", &mut draft.devices.nfc),
+                ("UWB", &mut draft.devices.uwb),
+                ("Modem", &mut draft.devices.modem),
+                ("GNSS / Location", &mut draft.devices.gnss),
+                ("Sensors", &mut draft.devices.sensors),
+                ("Network", &mut draft.devices.network),
+                ("Audio", &mut draft.devices.audio),
+                ("Camera", &mut draft.devices.camera),
+                ("Power / software security", &mut draft.devices.power),
+            ] {
+                ui.label(label);
+                ui.checkbox(enabled, "启用");
+                ui.end_row();
+            }
+        });
+        let save_clicked = ui
+            .add_enabled(self.pending == 0, egui::Button::new("保存设备配置"))
+            .clicked();
+        if save_clicked {
+            self.save_spec();
+        }
+        ui.separator();
+        if let Some(capabilities) = &self.capabilities {
+            for device in &capabilities.devices.devices {
+                ui.collapsing(format!("{} · {:?}", device.id, device.backend), |ui| {
+                    ui.label(if device.available { "可用" } else { "阻塞" });
+                    ui.label(&device.boundary);
+                    ui.label(device.features.join(" · "));
+                });
+            }
+        }
+    }
+
+    fn diagnostics_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.pending == 0, egui::Button::new("生成诊断包"))
+                .clicked()
+            {
+                self.diagnostics(false);
+            }
+            if ui
+                .add_enabled(self.pending == 0, egui::Button::new("诊断包 + Guest 日志"))
+                .clicked()
+            {
+                self.diagnostics(true);
+            }
+            if ui
+                .add_enabled(
+                    self.pending == 0 && self.selected_id.is_some(),
+                    egui::Button::new("删除实例"),
+                )
+                .clicked()
+            {
+                self.operation(OperationKindV2::Delete, Duration::from_secs(60), "删除");
+            }
+        });
+        ui.separator();
+        if let Some(capabilities) = &self.capabilities {
+            ui.heading(format!(
+                "{} / {} · fingerprint {}",
+                capabilities.platform, capabilities.architecture, capabilities.fingerprint
+            ));
+            ui.label(if capabilities.certified {
+                "本机与当前 bundle 已具备签名验收证据"
+            } else {
+                "当前组合尚无签名 real-guest / zero-copy 验收证据，不允许发布启动"
+            });
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for probe in &capabilities.probes {
+                    ui.collapsing(format!("{:?} · {}", probe.status, probe.id), |ui| {
+                        ui.label(&probe.detail);
+                        for (key, value) in &probe.properties {
+                            ui.monospace(format!("{key}: {value}"));
+                        }
+                    });
+                }
+            });
+        }
     }
 }
 
 impl eframe::App for HdApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.supervisor.should_shutdown() {
-            self.shutdown_sent = true;
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        if self.last_refresh.elapsed() >= Duration::from_millis(500) {
+    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_messages();
+        if self.pending == 0 && self.last_refresh.elapsed() >= Duration::from_secs(2) {
             self.refresh();
         }
-        self.draw_toolbar(ui);
-        self.draw_instances(ui);
-        self.draw_settings(ui);
-        self.draw_status(ui);
-        self.draw_center(ui);
-        self.update_native_viewports();
-        ui.ctx().request_repaint_after(Duration::from_millis(250));
+        context.request_repaint_after(Duration::from_millis(100));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.sidebar(ui);
+        self.top_bar(ui);
+        egui::CentralPanel::default().show(ui, |ui| match self.tab {
+            PanelTab::Display => self.display_panel(ui),
+            PanelTab::Settings => self.settings_panel(ui),
+            PanelTab::Devices => self.devices_panel(ui),
+            PanelTab::Diagnostics => self.diagnostics_panel(ui),
+        });
     }
 }
 
-impl Drop for HdApp {
-    fn drop(&mut self) {
-        if !self.shutdown_sent {
-            let _ = self.runtime.block_on(
-                self.supervisor
-                    .handle(ControlRequestV1::new(ControlCommandV1::Shutdown)),
-            );
-            self.shutdown_sent = true;
-        }
-    }
-}
-
-fn path_editor(ui: &mut egui::Ui, label: &str, path: &mut PathBuf) {
-    let mut value = path.display().to_string();
-    ui.label(label);
-    if ui.text_edit_singleline(&mut value).changed() {
-        *path = PathBuf::from(value);
-    }
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-fn physical_position(value: f32) -> i32 {
-    if value.is_finite() {
-        value.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32
-    } else {
-        0
-    }
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-fn physical_extent(value: f32) -> u32 {
-    if value.is_finite() {
-        value.round().clamp(1.0, u32::MAX as f32) as u32
-    } else {
-        1
-    }
-}
-
-fn native_binding(context: &eframe::CreationContext<'_>) -> NativeWindowBinding {
-    let Ok(handle) = context.window_handle() else {
-        return NativeWindowBinding::Unsupported;
-    };
-    match handle.as_raw() {
-        #[cfg(windows)]
-        RawWindowHandle::Win32(handle) => u64::try_from(handle.hwnd.get()).map_or(
-            NativeWindowBinding::Unsupported,
-            NativeWindowBinding::Win32Hwnd,
-        ),
-        #[cfg(target_os = "linux")]
-        RawWindowHandle::Xlib(handle) => NativeWindowBinding::X11Window(handle.window),
-        #[cfg(target_os = "linux")]
-        RawWindowHandle::Wayland(handle) => {
-            NativeWindowBinding::WaylandSurface(format!("{:p}", handle.surface.as_ptr()))
-        }
-        #[cfg(target_os = "macos")]
-        RawWindowHandle::AppKit(handle) => {
-            NativeWindowBinding::AppKitView(handle.ns_view.as_ptr() as usize as u64)
-        }
-        _ => NativeWindowBinding::Unsupported,
-    }
+fn non_empty_path(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| PathBuf::from(value))
 }

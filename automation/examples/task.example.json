@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "task_id": "example-host-change",
   "objective": "以可回滚方式实现一个宿主功能并生成可验证回读。",
   "status": "planned",
@@ -24,7 +24,7 @@
   "evidence_state": {
     "code_present": false,
     "tests_authored": false,
-    "mock_verified": false,
+    "contract_smoke_verified": false,
     "real_guest_verified": false
   },
   "direction_decisions": [],

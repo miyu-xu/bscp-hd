@@ -16,7 +16,6 @@ egui.workspace = true
 hd-core = { path = "../hd-core" }
 hd-platform = { path = "../hd-platform" }
 hd-runtime = { path = "../hd-runtime" }
-raw-window-handle.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true

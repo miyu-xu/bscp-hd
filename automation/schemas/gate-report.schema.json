@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://bscp.dev/hd/schemas/gate-report-v1.json",
+  "$id": "https://bscp.dev/hd/schemas/gate-report-v2.json",
   "title": "HD gate report",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "generated_at", "source", "gates"],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "generated_at": { "type": "string", "format": "date-time" },
     "source": { "type": "string", "minLength": 1 },
     "gates": {

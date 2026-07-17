@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "generated_at": "2026-01-01T00:00:00Z",
   "source": "xtask ai-cycle",
   "gates": [

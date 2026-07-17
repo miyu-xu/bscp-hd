@@ -1,21 +1,35 @@
-//! HD supervisor, IPC, artifact validation, process control and crosvm adapter.
+//! HD V2 host daemon, per-instance worker, API, persistence and integration runtime.
 
 mod adb;
 mod artifacts;
 mod backend;
+mod capabilities;
+mod client;
+mod diagnostics;
 mod disk;
+mod host;
+mod http;
 mod ipc;
 mod journal;
+mod leases;
 mod process;
-mod supervisor;
-mod telemetry;
+mod store;
+mod uploads;
+mod worker;
 
 pub use adb::*;
 pub use artifacts::*;
 pub use backend::*;
+pub use capabilities::*;
+pub use client::*;
+pub use diagnostics::*;
 pub use disk::*;
+pub use host::*;
+pub use http::*;
 pub use ipc::*;
 pub use journal::*;
+pub use leases::*;
 pub use process::*;
-pub use supervisor::*;
-pub use telemetry::*;
+pub use store::*;
+pub use uploads::*;
+pub use worker::*;

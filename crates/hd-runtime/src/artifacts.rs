@@ -1,115 +1,614 @@
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufReader, Read};
+use std::path::{Component, Path, PathBuf};
 
-use hd_core::{ArtifactConfig, DiagnosticCheckV1, DiagnosticStatus};
-use serde::{Deserialize, Serialize};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use hd_core::{
+    ARTIFACT_INDEX_VERSION, ArtifactBundleKindV2, ArtifactBundleV2, ArtifactReadyMarkerV2,
+    ArtifactSelectionV2, DiagnosticCheckV2, DiagnosticStatusV2, ResolvedGuestArtifactsV2,
+};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArtifactFingerprintV1 {
-    pub name: String,
-    pub path: PathBuf,
-    pub bytes: u64,
-    pub sha256: String,
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MANIFEST_FILE: &str = "manifest-v2.json";
+const READY_FILE: &str = "READY-v2.json";
+
+#[derive(Debug, Clone)]
+pub struct ArtifactTrustStore {
+    keys: BTreeMap<String, VerifyingKey>,
 }
 
-pub async fn validate_artifacts(
-    config: &ArtifactConfig,
-) -> Result<Vec<ArtifactFingerprintV1>, ArtifactError> {
-    let mut files = vec![
-        ("kernel", config.kernel.clone()),
-        ("initrd", config.initrd.clone()),
-        ("rootfs", config.rootfs.clone()),
-        ("android_fstab", config.android_fstab.clone()),
-    ];
-    if let Some(path) = &config.system_image {
-        files.push(("system_image", path.clone()));
-    }
-    if let Some(path) = &config.vendor_image {
-        files.push(("vendor_image", path.clone()));
+impl ArtifactTrustStore {
+    pub fn load(path: &Path) -> Result<Self, ArtifactError> {
+        let bytes = read_limited(path, MAX_MANIFEST_BYTES)?;
+        let document: TrustedKeysDocumentV2 =
+            serde_json::from_slice(&bytes).map_err(ArtifactError::Decode)?;
+        if document.schema_version != ARTIFACT_INDEX_VERSION {
+            return Err(ArtifactError::UnsupportedVersion(document.schema_version));
+        }
+        let mut keys = BTreeMap::new();
+        for (id, encoded) in document.keys {
+            if id.is_empty()
+                || id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(ArtifactError::Trust("invalid key id".to_owned()));
+            }
+            let raw = BASE64
+                .decode(encoded)
+                .map_err(|error| ArtifactError::Trust(format!("decode key {id}: {error}")))?;
+            let raw: [u8; 32] = raw.try_into().map_err(|value: Vec<u8>| {
+                ArtifactError::Trust(format!("key {id} is {} bytes instead of 32", value.len()))
+            })?;
+            let key = VerifyingKey::from_bytes(&raw)
+                .map_err(|error| ArtifactError::Trust(format!("parse key {id}: {error}")))?;
+            if keys.insert(id.clone(), key).is_some() {
+                return Err(ArtifactError::Trust(format!("duplicate key id {id}")));
+            }
+        }
+        if keys.is_empty() {
+            return Err(ArtifactError::Trust(
+                "trusted key document contains no keys".to_owned(),
+            ));
+        }
+        Ok(Self { keys })
     }
 
-    let mut fingerprints = Vec::with_capacity(files.len());
-    for (name, path) in files {
-        let expected = config.expected_sha256.get(name).cloned();
-        let path_for_hash = path.clone();
-        let name_owned = name.to_owned();
-        let fingerprint =
-            tokio::task::spawn_blocking(move || fingerprint_file(&name_owned, &path_for_hash))
-                .await
-                .map_err(|error| ArtifactError::Worker(error.to_string()))??;
-        if let Some(expected) = expected
-            && !fingerprint.sha256.eq_ignore_ascii_case(expected.trim())
+    fn verify(&self, manifest: &ArtifactBundleV2) -> Result<(), ArtifactError> {
+        let key = self
+            .keys
+            .get(&manifest.signer_key_id)
+            .ok_or_else(|| ArtifactError::UntrustedSigner(manifest.signer_key_id.clone()))?;
+        let signature_bytes = BASE64
+            .decode(&manifest.signature_ed25519)
+            .map_err(|error| ArtifactError::Signature(format!("decode signature: {error}")))?;
+        let signature = Signature::from_slice(&signature_bytes)
+            .map_err(|error| ArtifactError::Signature(format!("parse signature: {error}")))?;
+        let payload = canonical_payload(manifest)?;
+        key.verify(&payload, &signature)
+            .map_err(|error| ArtifactError::Signature(error.to_string()))
+    }
+
+    pub fn verify_detached(
+        &self,
+        signer_key_id: &str,
+        signature_ed25519: &str,
+        payload: &[u8],
+    ) -> Result<(), ArtifactError> {
+        let key = self
+            .keys
+            .get(signer_key_id)
+            .ok_or_else(|| ArtifactError::UntrustedSigner(signer_key_id.to_owned()))?;
+        let signature_bytes = BASE64
+            .decode(signature_ed25519)
+            .map_err(|error| ArtifactError::Signature(format!("decode signature: {error}")))?;
+        let signature = Signature::from_slice(&signature_bytes)
+            .map_err(|error| ArtifactError::Signature(format!("parse signature: {error}")))?;
+        key.verify(payload, &signature)
+            .map_err(|error| ArtifactError::Signature(error.to_string()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedBundleSetV2 {
+    pub guest_manifest: ArtifactBundleV2,
+    pub host_manifest: ArtifactBundleV2,
+    pub artifacts: ResolvedGuestArtifactsV2,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArtifactResolver {
+    trust: ArtifactTrustStore,
+}
+
+impl ArtifactResolver {
+    pub fn new(trust: ArtifactTrustStore) -> Self {
+        Self { trust }
+    }
+
+    pub fn resolve(
+        &self,
+        selection: &ArtifactSelectionV2,
+    ) -> Result<ResolvedBundleSetV2, ArtifactError> {
+        let guest_root = bundle_root(&selection.store_root, &selection.guest_bundle_digest);
+        let host_root = bundle_root(&selection.store_root, &selection.host_bundle_digest);
+        let guest = self.verify_bundle(
+            &guest_root,
+            &selection.guest_bundle_digest,
+            ArtifactBundleKindV2::Guest,
+        )?;
+        let host = self.verify_bundle(
+            &host_root,
+            &selection.host_bundle_digest,
+            ArtifactBundleKindV2::HostTools,
+        )?;
+        validate_platform(&host)?;
+        validate_guest_architecture(&guest)?;
+        let guest_files = role_map(&guest_root, &guest)?;
+        let host_tools = role_map(&host_root, &host)?;
+        for role in ["kernel", "initrd", "rootfs", "android_fstab"] {
+            require_role(&guest_files, role)?;
+        }
+        for role in ["crosvm", "adb", "aapt2", "hd-device-sim", "frame-producer"] {
+            require_role(&host_tools, role)?;
+        }
+        for role in [
+            "adb-bridge",
+            "rootcanal-adapter",
+            "casimir-adapter",
+            "modem-adapter",
+            "uwb-adapter",
+            "network-adapter",
+            "audio-adapter",
+            "camera-adapter",
+        ] {
+            require_role(&host_tools, role)?;
+        }
+        require_executable_roles(
+            &host,
+            &[
+                "crosvm",
+                "adb",
+                "aapt2",
+                "hd-device-sim",
+                "frame-producer",
+                "adb-bridge",
+                "rootcanal-adapter",
+                "casimir-adapter",
+                "modem-adapter",
+                "uwb-adapter",
+                "network-adapter",
+                "audio-adapter",
+                "camera-adapter",
+            ],
+        )?;
+        require_capabilities(
+            &guest,
+            &[
+                "android-15.0.0_r14",
+                "hd-guest-profile-v2",
+                "hd-device-bridge-v2",
+            ],
+        )?;
+        let frame_transport = match hd_platform::platform_name() {
+            "windows" => "frame-vulkan-win32-v2",
+            "linux" => "frame-vulkan-dmabuf-v2",
+            "macos" => "frame-metal-iosurface-v2",
+            _ => return Err(ArtifactError::UnsupportedHost),
+        };
+        require_capabilities(
+            &host,
+            &[
+                "hd-host-tools-v2",
+                "input-external-v2",
+                "device-profile-cf-phone-v2",
+                frame_transport,
+            ],
+        )?;
+        require_capabilities(&host, &["adb-loopback-vsock-v2"])?;
+        Ok(ResolvedBundleSetV2 {
+            artifacts: ResolvedGuestArtifactsV2 {
+                guest_bundle_digest: guest.digest.clone(),
+                host_bundle_digest: host.digest.clone(),
+                guest_bundle_root: guest_root,
+                host_bundle_root: host_root,
+                kernel: guest_files["kernel"].clone(),
+                initrd: guest_files["initrd"].clone(),
+                rootfs: guest_files["rootfs"].clone(),
+                android_fstab: guest_files["android_fstab"].clone(),
+                system_image: guest_files.get("system_image").cloned(),
+                vendor_image: guest_files.get("vendor_image").cloned(),
+                host_tools,
+            },
+            guest_manifest: guest,
+            host_manifest: host,
+        })
+    }
+
+    pub fn verify_bundle(
+        &self,
+        root: &Path,
+        expected_digest: &str,
+        expected_kind: ArtifactBundleKindV2,
+    ) -> Result<ArtifactBundleV2, ArtifactError> {
+        validate_digest(expected_digest)?;
+        let manifest_path = root.join(MANIFEST_FILE);
+        let ready_path = root.join(READY_FILE);
+        let manifest_bytes = read_limited(&manifest_path, MAX_MANIFEST_BYTES)?;
+        let ready_bytes = read_limited(&ready_path, MAX_MANIFEST_BYTES)?;
+        let manifest: ArtifactBundleV2 =
+            serde_json::from_slice(&manifest_bytes).map_err(ArtifactError::Decode)?;
+        let ready: ArtifactReadyMarkerV2 =
+            serde_json::from_slice(&ready_bytes).map_err(ArtifactError::Decode)?;
+        if manifest.schema_version != ARTIFACT_INDEX_VERSION
+            || ready.schema_version != ARTIFACT_INDEX_VERSION
         {
-            return Err(ArtifactError::ChecksumMismatch {
-                name: name.to_owned(),
-                expected,
-                actual: fingerprint.sha256,
+            return Err(ArtifactError::UnsupportedVersion(
+                manifest.schema_version.min(ready.schema_version),
+            ));
+        }
+        if manifest.kind != expected_kind {
+            return Err(ArtifactError::WrongKind {
+                expected: expected_kind,
+                actual: manifest.kind,
             });
         }
-        fingerprints.push(fingerprint);
+        let computed_digest = hex::encode(Sha256::digest(canonical_payload(&manifest)?));
+        if manifest.digest != expected_digest || manifest.digest != computed_digest {
+            return Err(ArtifactError::DigestMismatch {
+                label: "bundle manifest".to_owned(),
+                expected: expected_digest.to_owned(),
+                actual: computed_digest,
+            });
+        }
+        if ready.bundle_digest != manifest.digest {
+            return Err(ArtifactError::DigestMismatch {
+                label: "READY bundle".to_owned(),
+                expected: manifest.digest.clone(),
+                actual: ready.bundle_digest,
+            });
+        }
+        let actual_manifest_sha = hex::encode(Sha256::digest(&manifest_bytes));
+        if ready.manifest_sha256 != actual_manifest_sha {
+            return Err(ArtifactError::DigestMismatch {
+                label: "READY manifest".to_owned(),
+                expected: ready.manifest_sha256,
+                actual: actual_manifest_sha,
+            });
+        }
+        self.trust.verify(&manifest)?;
+        validate_bundle_contents(root, &manifest)?;
+        Ok(manifest)
     }
-    Ok(fingerprints)
 }
 
-pub fn artifact_diagnostics(config: &ArtifactConfig) -> Vec<DiagnosticCheckV1> {
-    [
-        ("kernel", &config.kernel),
-        ("initrd", &config.initrd),
-        ("rootfs", &config.rootfs),
-        ("android_fstab", &config.android_fstab),
-    ]
-    .into_iter()
-    .map(|(name, path)| match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => DiagnosticCheckV1 {
-            name: format!("artifact.{name}"),
-            status: DiagnosticStatus::Pass,
-            detail: format!("{} ({} bytes)", path.display(), metadata.len()),
-        },
-        Ok(_) => DiagnosticCheckV1 {
-            name: format!("artifact.{name}"),
-            status: DiagnosticStatus::Fail,
-            detail: format!("{} is not a non-empty regular file", path.display()),
-        },
-        Err(error) => DiagnosticCheckV1 {
-            name: format!("artifact.{name}"),
-            status: DiagnosticStatus::Blocked,
-            detail: format!("{}: {error}", path.display()),
-        },
-    })
-    .collect()
+fn validate_bundle_contents(root: &Path, manifest: &ArtifactBundleV2) -> Result<(), ArtifactError> {
+    validate_digest(&manifest.source_manifest_digest)?;
+    if manifest.files.is_empty() {
+        return Err(ArtifactError::Manifest("bundle has no files".to_owned()));
+    }
+    let mut roles = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for file in &manifest.files {
+        validate_relative_path(&file.relative_path)?;
+        if file.role.is_empty()
+            || file.role.len() > 128
+            || !file
+                .role
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ArtifactError::Manifest("invalid file role".to_owned()));
+        }
+        if !roles.insert(file.role.clone()) {
+            return Err(ArtifactError::Manifest(format!(
+                "duplicate file role {}",
+                file.role
+            )));
+        }
+        if !paths.insert(file.relative_path.clone()) {
+            return Err(ArtifactError::Manifest(format!(
+                "duplicate artifact path {}",
+                file.relative_path.display()
+            )));
+        }
+        if file.size_bytes == 0 {
+            return Err(ArtifactError::Manifest(format!(
+                "artifact {} is empty",
+                file.relative_path.display()
+            )));
+        }
+        validate_digest(&file.sha256)?;
+        verify_file(root, file)?;
+    }
+    let mut capabilities = BTreeSet::new();
+    if manifest.capabilities.is_empty() || manifest.capabilities.len() > 128 {
+        return Err(ArtifactError::Manifest(
+            "bundle capabilities must contain 1..=128 entries".to_owned(),
+        ));
+    }
+    for capability in &manifest.capabilities {
+        if capability.is_empty()
+            || capability.len() > 128
+            || !capability
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || !capabilities.insert(capability)
+        {
+            return Err(ArtifactError::Manifest(format!(
+                "invalid or duplicate bundle capability {capability}"
+            )));
+        }
+    }
+    Ok(())
 }
 
-fn fingerprint_file(name: &str, path: &Path) -> Result<ArtifactFingerprintV1, ArtifactError> {
-    let metadata = std::fs::metadata(path).map_err(|source| ArtifactError::Io {
-        operation: "read metadata",
-        path: path.to_owned(),
-        source,
-    })?;
-    if !metadata.is_file() || metadata.len() == 0 {
-        return Err(ArtifactError::InvalidFile(path.to_owned()));
+pub fn artifact_diagnostics(
+    selection: Option<&ArtifactSelectionV2>,
+    trust_path: &Path,
+) -> Vec<DiagnosticCheckV2> {
+    let mut checks = Vec::new();
+    checks.push(path_check("artifact.trust_store", trust_path));
+    if let Some(selection) = selection {
+        checks.push(path_check(
+            "artifact.guest_ready",
+            &bundle_root(&selection.store_root, &selection.guest_bundle_digest).join(READY_FILE),
+        ));
+        checks.push(path_check(
+            "artifact.host_ready",
+            &bundle_root(&selection.store_root, &selection.host_bundle_digest).join(READY_FILE),
+        ));
+    } else {
+        checks.push(DiagnosticCheckV2 {
+            id: "artifact.selection".to_owned(),
+            status: DiagnosticStatusV2::Blocked,
+            detail: "no signed artifact bundle is selected".to_owned(),
+            fields: BTreeMap::new(),
+        });
     }
-    let mut file = std::fs::File::open(path).map_err(|source| ArtifactError::Io {
-        operation: "open",
-        path: path.to_owned(),
+    checks
+}
+
+pub fn canonical_payload(manifest: &ArtifactBundleV2) -> Result<Vec<u8>, ArtifactError> {
+    let mut payload = manifest.clone();
+    payload.digest.clear();
+    payload.signature_ed25519.clear();
+    serde_json::to_vec(&payload).map_err(ArtifactError::Encode)
+}
+
+fn bundle_root(store_root: &Path, digest: &str) -> PathBuf {
+    store_root.join("bundles").join(digest)
+}
+
+fn role_map(
+    root: &Path,
+    manifest: &ArtifactBundleV2,
+) -> Result<BTreeMap<String, PathBuf>, ArtifactError> {
+    manifest
+        .files
+        .iter()
+        .map(|file| {
+            validate_relative_path(&file.relative_path)?;
+            Ok((file.role.clone(), root.join(&file.relative_path)))
+        })
+        .collect()
+}
+
+fn require_role(files: &BTreeMap<String, PathBuf>, role: &str) -> Result<(), ArtifactError> {
+    if files.contains_key(role) {
+        Ok(())
+    } else {
+        Err(ArtifactError::MissingRole(role.to_owned()))
+    }
+}
+
+fn require_executable_roles(
+    manifest: &ArtifactBundleV2,
+    roles: &[&str],
+) -> Result<(), ArtifactError> {
+    for role in roles {
+        let executable = manifest
+            .files
+            .iter()
+            .find(|file| file.role == *role)
+            .is_some_and(|file| file.executable);
+        if !executable {
+            return Err(ArtifactError::Manifest(format!(
+                "host tool role {role} is not declared executable"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_capabilities(
+    manifest: &ArtifactBundleV2,
+    required: &[&str],
+) -> Result<(), ArtifactError> {
+    for capability in required {
+        if !manifest
+            .capabilities
+            .iter()
+            .any(|value| value == capability)
+        {
+            return Err(ArtifactError::MissingCapability((*capability).to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_platform(manifest: &ArtifactBundleV2) -> Result<(), ArtifactError> {
+    let expected_platform = hd_platform::platform_name();
+    let expected_architecture = hd_platform::architecture_name();
+    if manifest.platform != expected_platform || manifest.architecture != expected_architecture {
+        return Err(ArtifactError::HostMismatch {
+            expected: format!("{expected_platform}/{expected_architecture}"),
+            actual: format!("{}/{}", manifest.platform, manifest.architecture),
+        });
+    }
+    Ok(())
+}
+
+fn validate_guest_architecture(manifest: &ArtifactBundleV2) -> Result<(), ArtifactError> {
+    if manifest.platform != "android" {
+        return Err(ArtifactError::GuestMismatch {
+            expected: "android".to_owned(),
+            actual: manifest.platform.clone(),
+        });
+    }
+    let expected_architecture = if cfg!(target_os = "macos") {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    if manifest.architecture != expected_architecture {
+        return Err(ArtifactError::GuestMismatch {
+            expected: expected_architecture.to_owned(),
+            actual: manifest.architecture.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_file(root: &Path, file: &hd_core::ArtifactFileV2) -> Result<(), ArtifactError> {
+    let path = root.join(&file.relative_path);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|source| ArtifactError::Io {
+        operation: "read artifact metadata",
+        path: path.clone(),
         source,
     })?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|source| ArtifactError::Io {
-        operation: "hash",
-        path: path.to_owned(),
-        source,
-    })?;
-    Ok(ArtifactFingerprintV1 {
-        name: name.to_owned(),
-        path: path.to_owned(),
-        bytes: metadata.len(),
-        sha256: hex::encode(hasher.finalize()),
-    })
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(ArtifactError::Manifest(format!(
+            "artifact {} is not a regular non-symlink file",
+            path.display()
+        )));
+    }
+    if metadata.len() != file.size_bytes {
+        return Err(ArtifactError::SizeMismatch {
+            path,
+            expected: file.size_bytes,
+            actual: metadata.len(),
+        });
+    }
+    let actual = sha256_file(&path)?;
+    if actual != file.sha256 {
+        return Err(ArtifactError::DigestMismatch {
+            label: path.display().to_string(),
+            expected: file.sha256.clone(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+pub fn sha256_file(path: &Path) -> Result<String, ArtifactError> {
+    let file = hd_platform::open_regular_read_nofollow(path)?;
+    let mut reader = BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024].into_boxed_slice();
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|source| ArtifactError::Io {
+                operation: "hash artifact",
+                path: path.to_owned(),
+                source,
+            })?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, ArtifactError> {
+    hd_platform::read_regular_nofollow_limited(path, limit).map_err(ArtifactError::Platform)
+}
+
+fn validate_relative_path(path: &Path) -> Result<(), ArtifactError> {
+    if path.as_os_str().is_empty()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ArtifactError::UnsafePath(path.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_digest(value: &str) -> Result<(), ArtifactError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ArtifactError::Manifest(
+            "digest must be a lowercase SHA-256 value".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn path_check(id: &str, path: &Path) -> DiagnosticCheckV2 {
+    let exists = path.is_file();
+    DiagnosticCheckV2 {
+        id: id.to_owned(),
+        status: if exists {
+            DiagnosticStatusV2::Pass
+        } else {
+            DiagnosticStatusV2::Blocked
+        },
+        detail: if exists {
+            "present".to_owned()
+        } else {
+            "missing".to_owned()
+        },
+        fields: BTreeMap::from([("path".to_owned(), path.display().to_string())]),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedKeysDocumentV2 {
+    schema_version: u32,
+    keys: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Error)]
 pub enum ArtifactError {
+    #[error("unsupported artifact schema version {0}")]
+    UnsupportedVersion(u32),
+    #[error("artifact trust configuration is invalid: {0}")]
+    Trust(String),
+    #[error("artifact signer is not trusted: {0}")]
+    UntrustedSigner(String),
+    #[error("artifact signature verification failed: {0}")]
+    Signature(String),
+    #[error("artifact manifest is invalid: {0}")]
+    Manifest(String),
+    #[error("artifact bundle has kind {actual:?}, expected {expected:?}")]
+    WrongKind {
+        expected: ArtifactBundleKindV2,
+        actual: ArtifactBundleKindV2,
+    },
+    #[error("artifact digest mismatch for {label}: expected {expected}, actual {actual}")]
+    DigestMismatch {
+        label: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("artifact size mismatch for {path}: expected {expected}, actual {actual}")]
+    SizeMismatch {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("artifact path is unsafe: {0}")]
+    UnsafePath(PathBuf),
+    #[error("artifact bundle is missing required role {0}")]
+    MissingRole(String),
+    #[error("artifact bundle is missing required capability {0}")]
+    MissingCapability(String),
+    #[error("the current host platform is unsupported")]
+    UnsupportedHost,
+    #[error("host bundle mismatch: expected {expected}, actual {actual}")]
+    HostMismatch { expected: String, actual: String },
+    #[error("guest bundle mismatch: expected {expected}, actual {actual}")]
+    GuestMismatch { expected: String, actual: String },
+    #[error("failed to decode artifact document: {0}")]
+    Decode(serde_json::Error),
+    #[error("failed to encode artifact signing payload: {0}")]
+    Encode(serde_json::Error),
     #[error("{operation} failed for {path}: {source}")]
     Io {
         operation: &'static str,
@@ -117,30 +616,6 @@ pub enum ArtifactError {
         #[source]
         source: std::io::Error,
     },
-    #[error("artifact is not a non-empty regular file: {0}")]
-    InvalidFile(PathBuf),
-    #[error("checksum mismatch for {name}: expected {expected}, got {actual}")]
-    ChecksumMismatch {
-        name: String,
-        expected: String,
-        actual: String,
-    },
-    #[error("artifact validation worker failed: {0}")]
-    Worker(String),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn fingerprints_are_reproducible() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("artifact.bin");
-        std::fs::write(&path, b"hd").expect("write");
-        let first = fingerprint_file("test", &path).expect("fingerprint");
-        let second = fingerprint_file("test", &path).expect("fingerprint");
-        assert_eq!(first, second);
-        assert_eq!(first.bytes, 2);
-    }
+    #[error(transparent)]
+    Platform(#[from] hd_platform::PlatformError),
 }

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://bscp.dev/hd/schemas/task-v1.json",
+  "$id": "https://bscp.dev/hd/schemas/task-v2.json",
   "title": "HD AI task record",
   "type": "object",
   "additionalProperties": false,
@@ -20,7 +20,7 @@
     "next_iteration"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "task_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{2,63}$" },
     "objective": { "type": "string", "minLength": 1 },
     "status": { "enum": ["planned", "in_progress", "blocked", "complete"] },
@@ -62,11 +62,11 @@
     "evidence_state": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["code_present", "tests_authored", "mock_verified", "real_guest_verified"],
+      "required": ["code_present", "tests_authored", "contract_smoke_verified", "real_guest_verified"],
       "properties": {
         "code_present": { "type": "boolean" },
         "tests_authored": { "type": "boolean" },
-        "mock_verified": { "type": "boolean" },
+        "contract_smoke_verified": { "type": "boolean" },
         "real_guest_verified": { "type": "boolean" }
       }
     },

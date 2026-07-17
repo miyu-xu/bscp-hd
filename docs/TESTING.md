@@ -1,53 +1,82 @@
-# 测试、质量与回读
+# HD 质量、证据与回读
 
-## 仓库执行约束
+## 执行约束
 
-当前仓库明确要求“不跑 unittest”。因此质量门禁不会调用 Rust `cargo test`、C++ gtest 或 Python unittest。测试代码仍应随功能编写，并通过 `cargo check --workspace --all-targets` 编译；可执行流程由独立 `xtask smoke` 验证。若未来允许执行 unittest，必须由人工明确变更该约束后再开启。
+仓库明确要求不运行 unittest。因此禁止 `cargo test`、`cargo nextest`、C++ gtest/ctest 和 Python unittest。测试源码仍随功能维护，并由 `cargo check --workspace --all-targets` 和 Clippy 编译；可执行行为由独立黑盒 smoke、进程场景、集成构建和专用 real-guest runner 验证。只有人工明确修改仓库约束后才能启用测试 harness。
 
-## 自动门禁
+## Host 质量门
 
 Windows：
 
 ```powershell
 cd hd
-.\scripts\quality.ps1 -WindowsGnu
+cargo run --target x86_64-pc-windows-gnu -p xtask -- quality
 ```
 
-门禁依次执行：
+`xtask quality` 固定执行：
 
-1. `xtask process-check`，校验 AGENTS、schema、任务卷和 unittest 禁令；
-2. 工作区和暂存区的 `git diff --check`；
+1. `process-check`：校验 AGENTS、V2 schema、样例、所有任务卷和脚本中的 unittest 禁令；
+2. 工作区与暂存区 `git diff --check`；
 3. `cargo fmt --all -- --check`；
-4. GNU target 的 `cargo check --workspace --all-targets`，包括测试代码编译；
-5. GNU target 的 `cargo clippy --workspace --all-targets -- -D warnings`；
-6. `xtask smoke`；
-7. 可选 `build.bat` release 链接和 PE import audit。
+4. MinGW `cargo check --workspace --all-targets`；
+5. MinGW `cargo clippy --workspace --all-targets -- -D warnings`；
+6. MinGW `cargo build --workspace --bins`；
+7. 独立 `xtask smoke`。
 
-`xtask smoke` 不使用测试 harness，当前覆盖：
+`xtask smoke` 当前以临时私有 data root 执行真实文件、数据库、HTTP 和进程边界，覆盖：
 
-- 创建持久化实例；
-- mock start 逐步达到 Ready；
-- Home/Recent/Back/Rotate；
-- mock APK 安装；
-- 显示配置事务；
-- stop 写入终态；
-- 缺少真实构件时进入 Blocked；
-- Blocked 可正常 stop；
-- 两次运行均存在 manifest/events/result。
+- V1 文件迁移到 V2、原始 backup 和 redb 结果；
+- 单 data root 的 Host 独占锁；
+- Host runtime descriptor、健康身份和客户端连接；
+- 实例创建、列表、持久化与幂等 start operation；
+- 缺失认证时 start 必须失败并进入 `Blocked`，不能产生 Ready；
+- 无 bearer、恶意 Origin 和错误 Host 的 HTTP 拒绝；
+- 两实例 CPU/内存/CID/ADB/GPU/磁盘/Worker/frame generation 租约隔离、generation 单调、audit 及完全释放；
+- Blocked 实例 stop、租约完全释放和实例删除；
+- APK 流式上传、ZIP/APK 结构校验与诊断 archive/hash 精确回读；
+- Host shutdown 后 descriptor 清理；
+- 真正 detached `hd-worker` 进程、PID/启动标记/nonce、实例 OS lock、重复 Worker 拒绝、正确 secret Ping、错误 secret 拒绝、descriptor 删除后认证重建、认证 Shutdown、进程退出和 descriptor 清理。
 
-## 自动回读
+这个 smoke 被命名为 contract/process smoke，只证明 Host 控制面和硬阻断正确，不生成 Android 运行成功证据。
 
-推荐使用 `ai-cycle` 代替裸 `quality`，使失败也保留日志和仓库状态：
+## 构建与平台门
+
+Windows release：
+
+```bat
+build.bat
+```
+
+它构建整个 workspace，并用 MinGW `objdump -p` 审计所有 exe；任何 `VCRUNTIME`、`MSVCP`、`CONCRT` 或 `MFC` import 都阻断。根 `build_all.bat` 还编译 bscp/crosvm/可选 gfxstream，并验证发布目录包含五个 HD 运行时 exe。
+
+portable Rust 编译：
+
+```bash
+cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu
+cargo check --workspace --all-targets --target aarch64-apple-darwin
+```
+
+交叉编译失败若来自缺少目标 linker/SDK，只能记录为 runner/toolchain 阻塞；不能把 Windows 编译结果填写为 Linux/macOS pass。最终平台门必须在原生 runner 执行 check、Clippy、build、package 和运行场景。
+
+## 自动证据闭环
+
+推荐入口：
 
 ```powershell
 cargo run --target x86_64-pc-windows-gnu -p xtask -- ai-cycle `
-  --task automation/tasks/ci-quality.json `
-  --output out/ai/local
+  --task automation/tasks/hd-p0-v2.json `
+  --output out/ai/hd-p0-v2
 ```
 
-输出包含 `logs/hd-quality.log`、`hd-gates.json`、`readback.json` 和 `readback.md`。CI 在 `always()` 步骤上传该目录，因此质量门失败时仍能回读原因。
+无论门禁成功或失败，输出均保留：
 
-涉及相邻仓库时运行：
+- `logs/<gate>.log`：完整命令输出；
+- `hd-gates.json`：版本化 gate report；
+- `readback.json`：机器事实底稿；
+- `readback.md`：人类可读摘要；
+- 每个相关仓库的 HEAD/dirty 状态。
+
+涉及 crosvm/gfxstream/根发布链时：
 
 ```powershell
 .\scripts\integration-quality.ps1 `
@@ -55,53 +84,37 @@ cargo run --target x86_64-pc-windows-gnu -p xtask -- ai-cycle `
   -Output out/ai/integration
 ```
 
-该脚本不执行测试 harness；crosvm 的 `--tests` 只编译测试目标。`-RunRootBuild` 会额外运行完整 `build_all.bat`，默认联合门仅覆盖 HD、crosvm 和 gfxstream，避免无意重建其他脏模块。
+脚本只编译 C++/Rust 测试目标，不运行测试 harness。`-RunRootBuild` 明确授权后才执行完整根构建；已有脏文件不会被自动清理、reset 或覆盖。
 
-## 集成编译矩阵
+## 真实 Android 与零拷贝矩阵
 
-| 层 | Windows GNU 门禁 | Linux/macOS 门禁 | 运行回读 |
-|---|---|---|---|
-| HD Rust workspace | check/clippy/all-targets | check/clippy/all-targets | mock smoke |
-| crosvm vm_control | GNU cargo check | 后续 CI | 命令协议待真实 VM |
-| crosvm gpu_display/devices/crosvm | 指定 features 的 GNU cargo check | 后续 CI | 子 HWND 待真实 guest |
-| gfxstream Vulkan backend | CMake MinGW Release build | 后续 CI | VSync/FPS 待真实 present |
-| 发布目录 | release build + objdump | 平台包后续 | 启动/UI 人工方向验收 |
+每个平台专用 runner 必须自动执行：
 
-## 回读清单
+1. 从空 data root 加载固定签名 Guest/Host bundle并回读所有 capability；
+2. 冷启动到唯一 Ready 条件，保存 manifest/events/result 和诊断包；
+3. 两实例并行，验证 CID/ADB port/disk/GPU/frame/设备 endpoint 隔离；
+4. Home、Recent、Back、Power、Volume 的 Guest UI/系统状态回读；
+5. APK 安装后用 package manager 回读精确包路径；
+6. 四种方向、分辨率、DPI、30/60/90/120 Hz 与 Android rotation 一致，失败事务回滚；
+7. VSync on/off、同适配器外部纹理、显式同步、三缓冲 generation，CPU readback/software blit/编码计数均为零；
+8. 定位、电池、网络、五类传感器、RootCanal、Casimir 及启用 adapter 的 profile conformance；
+9. crosvm/Worker/Host 异常退出、ADB 超时、坏签名/hash、磁盘不足、端口占用和 frame producer 退出的故障注入；
+10. 100 次启动停止、2 小时长稳、资源/句柄/任务/日志上限。
 
-任何“完成”结论都必须同时回读：
+平台 gate 生成原始证据文件，`xtask certify` 只在八类聚合证据名称精确匹配时签发最多 31 天的认证：`hd_quality`、`host_worker_smoke`、`http_security_smoke`、`lease_recovery_smoke`、`diagnostic_smoke`、`real_guest`、`zero_copy`、`device_profile_conformance`。认证不执行测试，也不能替代证据；它只把已经通过的证据 digest 绑定到当前 bundle/能力。
 
-- 命令退出码和 warning；
-- `git diff --check`；
-- 任务卷要求的每个 gate 均为 `pass`，不存在 `missing`/`skipped`；
-- 自动生成的 `readback.json` 与 `readback.md`；
-- 各嵌套仓库 `git status --short`，确认没有夹带用户文件；
-- smoke 的运行目录；
-- `manifest.json` 中的命令、环境、构件指纹和 toolchain；
-- `events.jsonl` 状态顺序、事件序号和失败原因；
-- `result.json` 最终状态与退出码；
-- Windows PE imports，不含 MSVC runtime。
+## 回读与判定
 
-只看到 UI 按钮、状态字段或 mock Ready 不等于真实功能通过。
+每轮必须回读：
 
-## 真实 Android 验收（M3 解阻后）
+- 每个命令退出码和 warning；
+- required gate 是否全部存在且为 pass；
+- `readback.json` 与任务卷 evidence state；
+- 所有相关嵌套仓库 `git status --short` 和 diff check；
+- run `manifest.json` 的 bundle/launch/toolchain，`events.jsonl` 的序号/边界/错误，`result.json` 的终态；
+- Worker/Host descriptor 与进程身份、redb lease 和 cleanup_pending；
+- 诊断 manifest/hash/脱敏结果；
+- Windows PE imports；
+- real-guest、zero-copy、device profile 的原始 runner 证据及签名有效期。
 
-自动场景：
-
-1. 空数据目录冷启动并等待唯一 readiness probe；
-2. 20 次启动/停止循环；
-3. 两个实例并行启动、独立磁盘与独立 ADB serial；
-4. Home/Recent/Back/Power/Volume 的 guest 回读；
-5. APK 安装后用 package manager 验证；
-6. 横竖屏显示尺寸和 Android rotation 一致；失败注入验证回滚；
-7. VSync on/off present mode 与 FPS 聚合回读；
-8. crosvm 异常退出、ADB 超时、坏 checksum、磁盘不足等失败注入；
-9. 100 次窗口创建/销毁和实例切换，检查 handle/process/task 泄漏；
-10. 2 小时长稳与日志体积上限。
-
-## 质量判定
-
-- P0：数据损坏、越权 IPC、孤儿 VM、句柄复用、状态虚报；不得发布。
-- P1：核心动作、显示事务、启动/停止失败；不得进入下一里程碑。
-- P2：诊断、兼容性或体验问题；必须有 issue、证据和明确降级。
-- 性能回归：CPU/内存、启动耗时、present FPS 和日志量超过已批准基线时阻断。
+证据状态严格分层：代码存在、测试源码已编译、contract smoke 通过、真实 Guest 通过。前三项不能推出第四项；UI 按钮、协议类型、Blocked 行为或人工截图也不能推出真实功能通过。

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "task_id": "ci-quality",
   "objective": "在单一 HD checkout 中执行可移植质量门并保留失败或成功回读。",
   "status": "complete",
@@ -24,7 +24,7 @@
   "evidence_state": {
     "code_present": true,
     "tests_authored": true,
-    "mock_verified": true,
+    "contract_smoke_verified": true,
     "real_guest_verified": false
   },
   "direction_decisions": [
@@ -37,9 +37,9 @@
   ],
   "blockers": [
     {
-      "id": "B-M3-BOOT",
-      "description": "真实 Android guest 的构件契约、ADB bridge 和 readiness 尚未闭环。",
-      "scope": "future_milestone",
+      "id": "B-REAL-GUEST",
+      "description": "真实 Android 发布仍缺认证 Guest/Host bundle、ADB/frame/device 实现证据和三平台 runner 证据；不属于单仓 Host 质量任务的完成条件。",
+      "scope": "external",
       "state": "accepted"
     }
   ],

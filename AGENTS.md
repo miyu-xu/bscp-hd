@@ -22,13 +22,15 @@
 7. 回读生成的 `readback.json`/`readback.md`、运行 journal、diff 和仓库状态。
 8. 只有所需门禁通过后才按嵌套仓库分别本地提交；不 push。
 
-不能因为代码存在或首次编译成功就结束。代码存在、测试已编写、mock 通过、真实 guest 通过必须分别陈述。
+不能因为代码存在或首次编译成功就结束。代码存在、测试源码已编译、contract/process smoke
+通过、真实 Guest 通过必须分别陈述。
 
 ## 测试与构建硬约束
 
 - 不运行 unittest：禁止 `cargo test`、`cargo nextest`、C++ gtest/ctest 和 Python unittest。
 - 测试源码仍需随功能编写，并通过 `cargo check --workspace --all-targets` 或等价测试目标编译。
-- 可执行验证使用独立 `xtask smoke`、进程级 smoke 和集成构建，不得用 mock 结果替代真实 guest 验收。
+- 可执行验证使用独立 `xtask smoke`、真实进程 smoke 和集成构建，不得用 Host contract 结果
+  替代真实 Guest 验收。
 - Windows 只使用 `x86_64-pc-windows-gnu` 和 MinGW-w64；禁止 MSVC fallback 或混合 ABI。
 - Windows release 必须执行 PE import audit，拒绝 VCRUNTIME、MSVCP、CONCRT 和 MFC。
 
@@ -44,7 +46,8 @@
 - 外部边界至少记录开始、成功和失败，使用稳定事件名、error code、instance/run id 和必要耗时。
 - 不记录密钥、完整环境变量或用户私有数据；高频帧路径只做聚合，不逐帧写日志。
 - 磁盘和配置写入必须使用校验、临时文件与原子替换；失败不得破坏上一次有效状态。
-- 真实启动缺少构件、ADB bridge 或 readiness 时进入 `Blocked`/`GuestBooting`，绝不伪造 `Ready`。
+- 真实启动缺少签名构件、发布认证、严格 frame、ADB bridge 或 readiness 时进入
+  `Blocked`/失败终态，绝不伪造 `Ready`。
 
 ## 标准命令
 

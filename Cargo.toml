@@ -2,9 +2,13 @@
 resolver = "2"
 members = [
     "crates/hd-core",
+    "crates/hd-device-sim",
+    "crates/hd-frame",
+    "crates/hd-host",
     "crates/hd-platform",
     "crates/hd-runtime",
     "crates/hd-ui",
+    "crates/hd-worker",
     "crates/hdctl",
     "xtask",
 ]
@@ -18,28 +22,43 @@ rust-version = "1.92"
 [workspace.dependencies]
 anyhow = "1.0.102"
 async-trait = "0.1.89"
+axum = { version = "0.8.8", features = ["http1", "json", "multipart", "tokio"] }
+base64 = "0.22.1"
+bytes = "1.11.1"
 clap = { version = "4.5.60", features = ["derive"] }
 dirs = "6.0.0"
+ed25519-dalek = "2.2.0"
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 egui = "0.35.0"
 fs2 = "0.4.3"
 futures = "0.3.32"
+getrandom = "0.4.2"
 hex = "0.4.3"
 libc = "0.2.186"
 parking_lot = "0.12.5"
 raw-window-handle = "0.6.2"
+redb = "2.6.3"
 reflink-copy = "0.1.30"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "multipart", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
+subtle = "2.6.1"
+tar = "0.4.44"
 tempfile = "3.25.0"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["formatting", "macros", "parsing", "serde"] }
-tokio = { version = "1.52.4", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.52.4", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
+tower-http = { version = "0.6.8", features = ["cors", "limit", "request-id", "trace"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
+url = "2.5.8"
+walkdir = "2.5.0"
+zstd = "0.13.3"
 
 [profile.release]
 lto = "thin"

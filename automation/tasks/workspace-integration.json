@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "task_id": "workspace-integration",
   "objective": "验证 HD、crosvm 和 gfxstream 在统一 MinGW 工具链下的宿主集成。",
   "status": "complete",
@@ -47,7 +47,7 @@
   "evidence_state": {
     "code_present": true,
     "tests_authored": true,
-    "mock_verified": true,
+    "contract_smoke_verified": true,
     "real_guest_verified": false
   },
   "direction_decisions": [
@@ -66,12 +66,12 @@
   ],
   "blockers": [
     {
-      "id": "B-M3-BOOT",
-      "description": "联合编译不代表真实 Android guest 已完成启动验收。",
-      "scope": "future_milestone",
+      "id": "B-REAL-GUEST",
+      "description": "联合编译不代表真实 Android Guest、严格零拷贝和设备 profile 已完成三平台运行验收。",
+      "scope": "external",
       "state": "accepted"
     }
   ],
   "human_decisions_needed": [],
-  "next_iteration": "M3 构件契约确定后增加真实 guest、ADB 和显示回读 gate。"
+  "next_iteration": "获得固定签名 bundle 与专用 runner 后，接入 real-guest、zero-copy 和 device-profile gate 并继续同一回读闭环。"
 }

@@ -1,69 +1,73 @@
-# HD 实施计划与完成定义
+# HD 原子交付计划与完成定义
 
-## 产品目标
+## 目标与发布原则
 
-HD 提供常见 Android 模拟器的桌面管理体验，同时把虚拟化、显示、guest 构件和宿主平台细节放在明确的适配层中。首个落地目标是 Windows + MinGW + crosvm + gfxstream；可移植核心必须持续在 Linux/macOS 编译，平台能力不能散落到 UI 或协议层。
+HD V2 以固定 Android 15 Guest、独立 Host/Worker、多实例、严格零拷贝显示、正式设备 profile 和三平台证据作为一个发布单元。仓库允许在实现和验证期间保持 `in_progress`，但不发布模拟启动、软件显示回退、未认证 bundle 或只在单平台验证的中间产品。
 
-## 里程碑
+Windows 使用 MinGW/GNU ABI；Linux x86_64 使用 KVM；macOS arm64 使用 Hypervisor.framework。跨平台差异必须位于 `hd-platform` 或签名 Host component，不能泄漏到 `hd-core` 或 UI 业务逻辑。
 
-### M0：工程与流程基线（已完成）
+## 六项 Host P0
 
-- Rust workspace、独立 Git 子仓库、MinGW 构建和根 `build_all.bat` 接入。
-- 配置 schema、控制协议、GPU 遥测协议和实例状态机。
-- 结构化应用日志与每次运行的 manifest/events/result。
-- 所有测试目标只编译；独立 `xtask smoke` 执行 mock 与阻塞启动流程，不调用 unittest。
-- AI 开发、回读、差异审计、提交和人工决策规则文档化。
+| ID | 已落地主干 | 可执行完成证据 |
+|---|---|---|
+| P0-1 V2 数据与操作 | 严格 `InstanceSpecV2`、V1→V2 原子迁移/备份、redb、revision、幂等异步 operation、状态机 | all-targets 编译；migration/operation contract smoke |
+| P0-2 进程与恢复 | 常驻 `hd-host`、每实例 `hd-worker`、crosvm 分层；PID+启动标记+nonce 身份；每实例 OS lock；退出监控；失败清理证明；descriptor 丢失时按认证 endpoint 恢复 | 真实 detached worker Ping/auth/Shutdown/重复 Worker 拒绝/descriptor 重建 smoke |
+| P0-3 能力与供应链 | 平台/虚拟化/实例 CPU/内存/磁盘、工具 JSON probe、Ed25519 bundle、READY、逐文件 hash、精确签名认证 | capability 输出；不认证 start 必须进入 Blocked |
+| P0-4 本机 API 与客户端 | loopback 随机端口、owner-only bearer descriptor、Host/Origin 校验、请求/响应限额、上传流、SSE、UI/CLI 同一客户端 | HTTP security smoke；OpenAPI V2 路由契约 |
+| P0-5 事务租约 | CPU/内存总量、CID、ADB port、disk、GPU、worker、frame generation 在 redb 单事务保留/绑定/释放；frame generation 按实例单调；启动和清理失败不提前释放 | 双实例隔离与容量 smoke；lease audit；Blocked→Stop 后租约为空；重启 reconcile |
+| P0-6 诊断与证据 | manifest/events/result、稳定 boundary 事件、结构化日志、诊断 tar.zst、manifest/hash/archive hash/脱敏/限额/保留 | diagnostic smoke；包自身 SHA-256 与 API 回读精确相等 |
 
-完成证据：格式检查、GNU `cargo check --all-targets`、Clippy、烟测、release 链接、PE 审计通过。
+这六项的代码和 Host contract smoke 通过，不等于 Android 发布完成。任务卷 `automation/tasks/hd-p0-v2.json` 只有在下述运行验收全部具有真实证据后才能置为 `complete`。
 
-### M1：桌面多实例与常规控制（已完成阶段 0）
+## 真实运行验收
 
-- 实例列表、创建、保存、启动、停止、删除和诊断。
-- 主页、最近、返回、旋转、电源、音量与 APK 安装入口。
-- CPU、内存、显示、VSync、FPS、ADB、构件路径和额外 kernel 参数设置。
-- Mock 后端在无 Android 构件时完成确定性流程验收。
+### Guest 启动闭环
 
-真实 guest 控制只有在 ADB bridge 建立且状态达到 `Ready` 后才算完成，当前不得把阶段 0 UI 入口等同于真实设备验收。
+固定源码版本生成 Guest bundle，包含 kernel、initrd、rootfs、fstab，以及配置要求的 system/vendor 镜像。bundle 必须声明 `android-15.0.0_r14`、`hd-guest-profile-v2` 和 `hd-device-bridge-v2`，经受信密钥签名并内容寻址。
 
-### M2：Windows 嵌入显示链（代码完成，待真实 guest 回读）
+唯一 `Ready` 条件是同一次 `run_id` 同时满足：crosvm 进程存活、严格 frame generation 握手通过、ADB loopback bridge 已建立、`adb wait-for-device` 成功、`sys.boot_completed=1`、package manager 可查询。任何超时或进程退出写入稳定错误码和 `result.json`，不能推进到 `Ready`。
 
-- HD 创建由 UI 所有的容器 HWND。
-- crosvm 接收 launch-only `parent-window-handle`，gpu_display 使用 `WS_CHILD`。
-- crosvm `gpu replace-display` 保持 scanout id，支持动态显示参数。
-- gfxstream VSync on 强制 FIFO；off 按 IMMEDIATE、MAILBOX、FIFO 降级并记录告警。
-- gfxstream 仅统计 `vkQueuePresentKHR` 成功帧，按秒上报 FPS。
+### 严格零拷贝显示
 
-完成定义：真实 guest 连续启动/停止 100 次无孤儿窗口；窗口缩放、最小化、切换实例和旋转无句柄泄漏；VSync/FPS 与外部测量一致。
+每个平台只接受三缓冲外部 GPU 资源和显式同步：Windows Vulkan external Win32 handle，Linux Vulkan dma-buf，macOS Metal IOSurface。producer/consumer 必须证明同一物理适配器，buffer generation 和同步值严格单调；readback、CPU copy、软件 blit、视频编码回退计数必须为零。不满足时启动被能力门阻止。
 
-### M3：cuttlefish guest 启动闭环（当前阻塞）
+### 正式设备 profile
 
-需要人工方向决策并提供或确认：
+Host bundle 必须完整提供并探测 `hd-device-sim`、RootCanal adapter、Casimir adapter、UWB、modem、network、audio 和 camera adapter；实例开关只决定本次运行激活哪些端点，不能改变发布认证身份。每个组件返回 V2 正式 probe，Guest bundle 提供固定串口/virtio 端点契约。对外只声明 conformance 场景真实覆盖的能力；不把无 RF、secure element、IMS、carrier 或硬件认证的模拟能力写成物理设备能力。
 
-1. kernel/initrd/rootfs/fstab 的正式来源、版本和 SHA-256 清单；
-2. Windows crosvm 的 guest block/boot 参数最终契约；
-3. ADB 采用 TCP、vsock 或代理桥接的正式方式及 guest service port；
-4. “已启动”的唯一就绪条件，例如 boot-completed + package manager + surface；
-5. system/vendor 独立镜像是否作为额外磁盘挂载。
+### 三平台矩阵
 
-实现内容：端口租约、ADB connect/retry/root、启动超时、进程退出监控、真实状态推进、错误分类和诊断采集。
+| Runner | 必须通过 |
+|---|---|
+| Windows 11 x86_64 + WHPX + MinGW + Vulkan GPU | 冷启动、双实例、动作/APK/旋转、100 次 start/stop、zero-copy、PE audit |
+| Ubuntu 24.04 x86_64 + KVM + Vulkan GPU | 同一 Guest/profile、双实例、dma-buf/显式同步、打包与长稳 |
+| macOS 15 arm64 + HVF + Metal GPU | arm64 Guest、IOSurface/显式同步、双实例、打包与长稳 |
 
-完成定义：干净数据目录完成真实 Android 首启；连续 20 次启动成功率 100%；Home/Recent/Back/APK/旋转均在 guest 回读确认；失败运行具备完整证据包。
+当前会话只有 Windows 开发机，且没有认证 Guest/Host bundle；因此这些 gate 状态必须保持缺失/阻塞，不能人工改写为通过。
 
-### M4：跨平台宿主实现
+## 自动迭代顺序
 
-- Linux：明确 X11 与 Wayland 子表面/外部窗口策略，并接入平台 VM 后端。
-- macOS：AppKit view 与 Hypervisor/crosvm 显示策略。
-- 保持 `hd-core` 无平台 API，平台句柄只存在于 `hd-platform` 的进程内 lease。
+每轮固定执行：
 
-完成定义：Linux、macOS 可移植检查持续通过；每个平台有独立 smoke/集成证据，不以 Windows 条件分支冒充实现。
+1. 回读 `AGENTS.md`、任务卷、相关嵌套仓库状态和上轮 readback；
+2. 在版本化 portable contract 中完成行为，再实现平台/运行时/UI；
+3. 同步加入稳定事件、错误码、测试源码和独立黑盒场景；
+4. 运行 process-check、diff check、fmt、all-targets check、Clippy、build、contract/process smoke；
+5. 涉及 crosvm/gfxstream 时运行联合 MinGW 编译与 ABI 审计；
+6. 在专用 runner 运行 real-guest/zero-copy/device-profile 场景；
+7. 自动回读 gate log、run journal、诊断包、PE imports 和所有工作树；
+8. 失败由 AI 修复并从相同任务卷重跑，直到全绿或确认是外部权限/硬件/制品阻塞。
 
-### M5：产品化与长期质量
+人工只决定产品方向、Guest/组件来源、信任根、不可逆迁移和发布授权；AI 负责实现、诊断、构建、验证、回读和自动迭代。不存在需要人工手工点 UI 才能完成的发布 gate。
 
-- 实例克隆、快照策略、升级迁移、磁盘配额与数据回收。
-- 崩溃恢复、运行锁、单 supervisor 发现/拉起策略。
-- 性能基线、长稳、输入延迟、GPU 兼容矩阵和可观测性面板。
-- 签名、发布清单、SBOM、依赖许可与供应链扫描。
+## 完成判定
 
-## 优先级与退出条件
+原子交付完成必须同时满足：
 
-任何迭代按以下顺序处理：数据安全与状态正确性 > 可诊断性 > 功能正确性 > 性能 > 体验。若真实 guest 不可用，AI 继续完善可验证的宿主契约、mock 和构建链，但必须把真实验收标为阻塞，不能用 mock 结果替代。
+- 任务卷所有 required gate 为 `pass`，没有 `missing`、`skipped` 或过期证据；
+- `code_present`、`tests_authored`、`contract_smoke_verified`、`real_guest_verified` 均为 true；
+- 三平台认证与当前 platform/architecture、Guest/Host digest、能力指纹精确匹配，且有效期不超过 31 天；
+- 无生产模拟分支、软件显示回退、静默能力降级、孤儿 VM/Worker、租约泄漏或数据迁移损坏；
+- readback 清楚保留用户既有改动，发布目录的运行时可执行文件齐全，Windows PE 不含 MSVC runtime。
+
+任何一项不满足时，只能报告已经验证的 Host 能力和具体阻塞，不能宣称 HD V2 发布完成。

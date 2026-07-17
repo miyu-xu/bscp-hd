@@ -174,7 +174,7 @@ if ($RunRootBuild) {
 
 $gateReportPath = Join-Path $outputPath "integration-gates.json"
 $gateReport = [ordered]@{
-    schema_version = 1
+    schema_version = 2
     generated_at = (Get-Date).ToUniversalTime().ToString("o")
     source = "scripts/integration-quality.ps1"
     gates = $records

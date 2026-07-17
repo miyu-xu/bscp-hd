@@ -10,7 +10,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-const PROCESS_SCHEMA_VERSION: u32 = 1;
+const PROCESS_SCHEMA_VERSION: u32 = 2;
 const MAX_STATUS_LINES: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,7 +54,7 @@ struct AcceptanceCriterion {
 struct EvidenceState {
     code_present: bool,
     tests_authored: bool,
-    mock_verified: bool,
+    contract_smoke_verified: bool,
     real_guest_verified: bool,
 }
 
@@ -280,15 +280,15 @@ pub(crate) fn process_check(root: &Path) -> Result<()> {
 
     validate_schema(
         &root.join("automation/schemas/task.schema.json"),
-        "https://bscp.dev/hd/schemas/task-v1.json",
+        "https://bscp.dev/hd/schemas/task-v2.json",
     )?;
     validate_schema(
         &root.join("automation/schemas/gate-report.schema.json"),
-        "https://bscp.dev/hd/schemas/gate-report-v1.json",
+        "https://bscp.dev/hd/schemas/gate-report-v2.json",
     )?;
     validate_schema(
         &root.join("automation/schemas/readback.schema.json"),
-        "https://bscp.dev/hd/schemas/readback-v1.json",
+        "https://bscp.dev/hd/schemas/readback-v2.json",
     )?;
 
     let example_task: TaskRecord = read_json(&root.join("automation/examples/task.example.json"))?;
@@ -881,10 +881,10 @@ fn render_markdown(report: &ReadbackReport) -> String {
     text.push_str("\n## 证据分层\n\n");
     let _ = writeln!(
         text,
-        "- 代码存在：{}\n- 测试源码已编写：{}\n- mock 已验证：{}\n- 真实 guest 已验证：{}",
+        "- 代码存在：{}\n- 测试源码已编写：{}\n- 契约/进程烟测已验证：{}\n- 真实 Guest 已验证：{}",
         yes_no(report.evidence_state.code_present),
         yes_no(report.evidence_state.tests_authored),
-        yes_no(report.evidence_state.mock_verified),
+        yes_no(report.evidence_state.contract_smoke_verified),
         yes_no(report.evidence_state.real_guest_verified)
     );
 

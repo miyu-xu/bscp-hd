@@ -1,4 +1,4 @@
-//! Portable contracts shared by the HD UI, supervisor, CLI and VM adapters.
+//! Portable contracts shared by the HD UI, host, worker, CLI and VM adapters.
 
 mod config;
 mod protocol;

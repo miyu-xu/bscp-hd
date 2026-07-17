@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://bscp.dev/hd/schemas/readback-v1.json",
+  "$id": "https://bscp.dev/hd/schemas/readback-v2.json",
   "title": "HD AI readback report",
   "type": "object",
   "additionalProperties": false,
@@ -24,7 +24,7 @@
     "next_iteration"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "generated_at": { "type": "string", "format": "date-time" },
     "task_id": { "type": "string" },
     "objective": { "type": "string" },
