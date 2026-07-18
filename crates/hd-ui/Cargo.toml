@@ -1,0 +1,27 @@
+[package]
+name = "hd-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+eframe.workspace = true
+egui.workspace = true
+hd-core = { path = "../hd-core" }
+hd-platform = { path = "../hd-platform" }
+hd-runtime = { path = "../hd-runtime" }
+raw-window-handle.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

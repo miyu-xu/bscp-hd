@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hd-core",
+    "crates/hd-platform",
+    "crates/hd-runtime",
+    "crates/hd-ui",
+    "crates/hdctl",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.92"
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+clap = { version = "4.5.60", features = ["derive"] }
+dirs = "6.0.0"
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+egui = "0.35.0"
+fs2 = "0.4.3"
+futures = "0.3.32"
+hex = "0.4.3"
+libc = "0.2.186"
+parking_lot = "0.12.5"
+raw-window-handle = "0.6.2"
+reflink-copy = "0.1.30"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+tempfile = "3.25.0"
+thiserror = "2.0.18"
+time = { version = "0.3.47", features = ["formatting", "macros", "parsing", "serde"] }
+tokio = { version = "1.52.4", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.4"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1.22.0", features = ["v4", "serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+struct_excessive_bools = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

@@ -1,0 +1,8 @@
+/target/
+/.artifacts/
+/dist/
+*.log
+*.jsonl
+*.tmp
+*.bak
+.DS_Store
