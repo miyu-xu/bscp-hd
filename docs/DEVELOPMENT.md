@@ -57,6 +57,16 @@ cargo run -p xtask -- check-portable
 6. 回读 manifest/events/result，确认行为与文档一致。
 7. 只暂存本次拥有的文件；嵌套仓库分别提交，不 push。
 
+任务开始前从 `automation/examples/task.example.json` 建立 `automation/tasks/<task-id>.json`。开发完成后优先执行：
+
+```powershell
+cargo run --target x86_64-pc-windows-gnu -p xtask -- ai-cycle `
+  --task automation/tasks/<task-id>.json `
+  --output out/ai/<task-id>
+```
+
+相邻仓库发生变化时执行 `scripts/integration-quality.ps1`。具体 gate、仓库状态和证据分层由 `xtask readback` 生成，AI 必须回读该结果后才能给出完成结论。
+
 推荐命令：
 
 ```powershell

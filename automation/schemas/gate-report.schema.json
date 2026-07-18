@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bscp.dev/hd/schemas/gate-report-v1.json",
+  "title": "HD gate report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "source", "gates"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "source": { "type": "string", "minLength": 1 },
+    "gates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "command", "status", "summary"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "command": { "type": "string" },
+          "status": { "enum": ["pass", "fail", "skipped", "missing"] },
+          "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+          "log_path": { "type": ["string", "null"] },
+          "summary": { "type": "string" }
+        }
+      }
+    }
+  }
+}

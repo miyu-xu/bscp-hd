@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-01-01T00:00:00Z",
+  "source": "xtask ai-cycle",
+  "gates": [
+    {
+      "name": "hd-quality",
+      "command": "xtask quality",
+      "status": "pass",
+      "duration_ms": 1000,
+      "log_path": "logs/hd-quality.log",
+      "summary": "exit 0"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 /target/
 /.artifacts/
 /dist/
+/out/
 *.log
 *.jsonl
 *.tmp

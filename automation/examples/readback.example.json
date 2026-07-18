@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-01-01T00:00:00Z",
+  "task_id": "example-host-change",
+  "objective": "以可回滚方式实现一个宿主功能并生成可验证回读。",
+  "task_status": "complete",
+  "verdict": "pass",
+  "scope": {
+    "repositories": ["hd"],
+    "owned_paths": ["crates/hd-runtime/"],
+    "excluded_paths": ["target/", "out/"]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "windows_uses_mingw_only",
+    "preserve_user_changes"
+  ],
+  "required_gates": ["hd-quality"],
+  "gates": [
+    {
+      "name": "hd-quality",
+      "command": "xtask quality",
+      "status": "pass",
+      "duration_ms": 1000,
+      "log_path": "logs/hd-quality.log",
+      "summary": "process-check、format、check、Clippy 和 smoke 通过。"
+    }
+  ],
+  "repositories": [
+    {
+      "name": "hd",
+      "path": "hd",
+      "available": true,
+      "head": "0123456789ab",
+      "dirty": false,
+      "changes": []
+    }
+  ],
+  "acceptance": [
+    {
+      "id": "A-001",
+      "criterion": "功能通过 HD 质量门并产生结构化回读。",
+      "evidence": ["gate:hd-quality", "artifact:readback.json"]
+    }
+  ],
+  "evidence_state": {
+    "code_present": true,
+    "tests_authored": true,
+    "mock_verified": true,
+    "real_guest_verified": false
+  },
+  "direction_decisions": [],
+  "blockers": [],
+  "human_decisions_needed": [],
+  "next_iteration": "从下一份任务卷继续。"
+}

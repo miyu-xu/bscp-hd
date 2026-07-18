@@ -28,7 +28,34 @@ diff/status/运行证据回读
 
 AI 必须持续迭代到门禁通过，或遇到确实需要人工方向/外部状态的阻塞。不能因首次编译成功就停止，也不能用文档说明替代可执行验证。
 
-## 任务卷模板
+## 仓库内强制入口
+
+- `AGENTS.md` 是进入 HD 仓库的 AI 必读入口，固化角色、权限、测试禁令、跨平台边界和闭环命令。
+- `automation/schemas/` 定义版本化任务卷、gate report 和回读格式；`automation/tasks/` 保存会话间交接状态。
+- `xtask process-check` 校验上述资产、所有任务卷以及自动脚本未调用 unittest。
+- `xtask quality` 首先执行 `process-check`、工作区与暂存区的 `git diff --check`，随后执行 format、all-targets check、Clippy 和独立 smoke。
+- `xtask ai-cycle` 调用质量门，无论通过或失败都在 `out/ai/<task>/` 写 gate 日志、`hd-gates.json`、`readback.json` 和 `readback.md`。
+- `scripts/integration-quality.ps1` 使用统一 MinGW 继续编译 crosvm 功能/测试目标和 gfxstream backend，再合并生成跨仓回读。
+
+Windows 单仓自动闭环：
+
+```powershell
+cargo run --target x86_64-pc-windows-gnu -p xtask -- ai-cycle `
+  --task automation/tasks/ci-quality.json `
+  --output out/ai/local
+```
+
+跨仓联合闭环：
+
+```powershell
+.\scripts\integration-quality.ps1 `
+  -Task automation/tasks/workspace-integration.json `
+  -Output out/ai/integration
+```
+
+AI 根据 gate log 修复后必须用同一任务卷重跑。脚本负责证据捕获和确定性门禁；代码修改仍由受本文件约束的 AI 完成，脚本不会获得额外写权限或自行改变产品方向。
+
+## 任务卷
 
 每个开发任务应具备：
 
@@ -40,6 +67,8 @@ AI 必须持续迭代到门禁通过，或遇到确实需要人工方向/外部�
 - 回滚策略与数据迁移；
 - 完成证据；
 - 需要人工决定的项目。
+
+任务卷使用 `automation/schemas/task.schema.json`，不得只存在于聊天上下文。状态为 `complete` 只表示当前任务验收完成；真实 guest 等未来里程碑阻塞要继续保留在 `blockers` 和独立证据状态中。
 
 ## 自动打点要求
 
@@ -81,3 +110,5 @@ AI 必须持续迭代到门禁通过，或遇到确实需要人工方向/外部�
 6. 下一自动迭代入口。
 
 “代码存在”“测试已编写”“mock 通过”“真实 guest 通过”是四种不同状态，禁止混写。
+
+`xtask readback` 自动采集所需 gate、HD/crosvm/gfxstream/根工作树 HEAD 与 dirty 状态，并同时生成 JSON 和 Markdown。机器报告是事实底稿，最终交付说明不得删去失败 gate、缺失证据、用户遗留改动或阻塞。

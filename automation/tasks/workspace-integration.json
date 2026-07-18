@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "task_id": "workspace-integration",
+  "objective": "验证 HD、crosvm 和 gfxstream 在统一 MinGW 工具链下的宿主集成。",
+  "status": "complete",
+  "scope": {
+    "repositories": ["hd", "external/crosvm", "hardware/google/gfxstream"],
+    "owned_paths": ["hd/", "external/crosvm/", "hardware/google/gfxstream/host/vulkan/"],
+    "excluded_paths": ["out/", "target/", "third_party/minijail/"]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "windows_uses_mingw_only",
+    "preserve_user_changes",
+    "do_not_push"
+  ],
+  "acceptance": [
+    {
+      "id": "INT-001",
+      "criterion": "HD GNU 质量门通过。",
+      "evidence": ["gate:hd-quality"]
+    },
+    {
+      "id": "INT-002",
+      "criterion": "crosvm Windows GNU 功能和测试目标编译通过但不运行测试。",
+      "evidence": ["gate:crosvm-windows-gnu-check", "gate:crosvm-test-targets-compile"]
+    },
+    {
+      "id": "INT-003",
+      "criterion": "gfxstream backend 使用 MinGW 增量构建通过。",
+      "evidence": ["gate:gfxstream-mingw-build"]
+    },
+    {
+      "id": "INT-004",
+      "criterion": "crosvm 与 gfxstream 当前 diff 不含 whitespace error。",
+      "evidence": ["gate:crosvm-diff-check", "gate:gfxstream-diff-check"]
+    }
+  ],
+  "required_gates": [
+    "hd-quality",
+    "crosvm-windows-gnu-check",
+    "crosvm-test-targets-compile",
+    "gfxstream-mingw-build",
+    "crosvm-diff-check",
+    "gfxstream-diff-check"
+  ],
+  "evidence_state": {
+    "code_present": true,
+    "tests_authored": true,
+    "mock_verified": true,
+    "real_guest_verified": false
+  },
+  "direction_decisions": [
+    {
+      "id": "D-TOOLCHAIN-001",
+      "decision": "Windows 全链统一使用 MinGW/GNU，禁止 MSVC fallback。",
+      "owner": "human",
+      "rationale": "与 bscp 既有 Windows 工具链和 ABI 保持一致。"
+    },
+    {
+      "id": "D-TEST-001",
+      "decision": "只编译测试目标，不运行 unittest。",
+      "owner": "human",
+      "rationale": "遵守仓库当前测试执行约束。"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "B-M3-BOOT",
+      "description": "联合编译不代表真实 Android guest 已完成启动验收。",
+      "scope": "future_milestone",
+      "state": "accepted"
+    }
+  ],
+  "human_decisions_needed": [],
+  "next_iteration": "M3 构件契约确定后增加真实 guest、ADB 和显示回读 gate。"
+}

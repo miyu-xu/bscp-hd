@@ -94,4 +94,5 @@ logs/hd.jsonl.<date>
 - [开发和构建](docs/DEVELOPMENT.md)
 - [测试、质量与回读](docs/TESTING.md)
 - [完全 AI 开发流程](docs/AI_WORKFLOW.md)
+- [AI 自动迭代资产](automation/README.md)
 - [运行与故障处理](docs/RUNBOOK.md)

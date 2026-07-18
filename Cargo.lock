@@ -4178,7 +4178,10 @@ dependencies = [
  "hd-core",
  "hd-platform",
  "hd-runtime",
+ "serde",
+ "serde_json",
  "tempfile",
+ "time",
  "tokio",
 ]
 

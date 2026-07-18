@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bscp.dev/hd/schemas/readback-v1.json",
+  "title": "HD AI readback report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at",
+    "task_id",
+    "objective",
+    "task_status",
+    "verdict",
+    "scope",
+    "constraints",
+    "required_gates",
+    "gates",
+    "repositories",
+    "acceptance",
+    "evidence_state",
+    "direction_decisions",
+    "blockers",
+    "human_decisions_needed",
+    "next_iteration"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "task_id": { "type": "string" },
+    "objective": { "type": "string" },
+    "task_status": { "enum": ["planned", "in_progress", "blocked", "complete"] },
+    "verdict": { "enum": ["pass", "fail", "blocked", "incomplete"] },
+    "scope": { "$ref": "task.schema.json#/properties/scope" },
+    "constraints": { "$ref": "task.schema.json#/properties/constraints" },
+    "required_gates": { "$ref": "task.schema.json#/properties/required_gates" },
+    "gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "command", "status", "summary"],
+        "properties": {
+          "name": { "type": "string" },
+          "command": { "type": "string" },
+          "status": { "enum": ["pass", "fail", "skipped", "missing"] },
+          "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+          "log_path": { "type": ["string", "null"] },
+          "summary": { "type": "string" }
+        }
+      }
+    },
+    "repositories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "path", "available", "head", "dirty", "changes"],
+        "properties": {
+          "name": { "type": "string" },
+          "path": { "type": "string" },
+          "available": { "type": "boolean" },
+          "head": { "type": ["string", "null"] },
+          "dirty": { "type": "boolean" },
+          "changes": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "acceptance": { "$ref": "task.schema.json#/properties/acceptance" },
+    "evidence_state": { "$ref": "task.schema.json#/properties/evidence_state" },
+    "direction_decisions": { "$ref": "task.schema.json#/properties/direction_decisions" },
+    "blockers": { "$ref": "task.schema.json#/properties/blockers" },
+    "human_decisions_needed": { "$ref": "task.schema.json#/properties/human_decisions_needed" },
+    "next_iteration": { "$ref": "task.schema.json#/properties/next_iteration" }
+  }
+}

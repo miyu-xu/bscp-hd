@@ -4,7 +4,7 @@ setlocal EnableExtensions
 set "HD_ROOT=%~dp0"
 if /I "%~1"=="--help" (
     echo Usage: %~nx0
-    echo   Builds the complete HD workspace for x86_64-pc-windows-gnu and audits PE imports.
+    echo   Validates the AI process contract, builds HD for x86_64-pc-windows-gnu, and audits PE imports.
     exit /b 0
 )
 if not "%~1"=="" (
@@ -38,6 +38,9 @@ set "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=%MINGW_PATH%\bin\gcc.exe"
 set "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_AR=%MINGW_PATH%\bin\ar.exe"
 
 echo Building HD with %CC% for %RUST_TARGET%
+cargo run --manifest-path "%HD_ROOT%Cargo.toml" --target "%RUST_TARGET%" -p xtask -- process-check
+if errorlevel 1 exit /b 1
+
 cargo build --manifest-path "%HD_ROOT%Cargo.toml" --workspace --release --target "%RUST_TARGET%"
 if errorlevel 1 exit /b 1
 

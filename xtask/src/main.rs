@@ -12,6 +12,8 @@ use hd_core::{
 use hd_platform::DataPaths;
 use hd_runtime::{CrosvmBackend, Supervisor};
 
+mod process;
+
 #[derive(Debug, Parser)]
 #[command(about = "HD developer and quality tasks")]
 struct Cli {
@@ -21,7 +23,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Task {
-    /// Run formatting, compile, Clippy and the non-unittest mock smoke gate.
+    /// Validate the machine-readable AI process contract.
+    ProcessCheck,
+    /// Run process validation, formatting, compile, Clippy and non-unittest smoke.
     Quality,
     /// Compile the portable workspace for the current host.
     CheckPortable,
@@ -41,13 +45,33 @@ enum Task {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Run the HD quality cycle and always emit gate logs and readback evidence.
+    AiCycle {
+        #[arg(long)]
+        task: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Generate JSON and Markdown readback from task, gate and repository evidence.
+    Readback {
+        #[arg(long)]
+        task: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long = "gate-report")]
+        gate_reports: Vec<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root()?;
     match Cli::parse().command {
+        Task::ProcessCheck => process::process_check(&root),
         Task::Quality => {
             require_windows_gnu()?;
+            process::process_check(&root)?;
+            run(&root, "git", &["diff", "--check"])?;
+            run(&root, "git", &["diff", "--cached", "--check"])?;
             run(&root, "cargo", &["fmt", "--all", "--", "--check"])?;
             let target = quality_target_args();
             let mut check = vec!["check", "--workspace", "--all-targets"];
@@ -72,6 +96,15 @@ fn main() -> Result<()> {
         }
         Task::PeAudit { bin_dir, objdump } => pe_audit(&bin_dir, &objdump),
         Task::Package { target_dir, output } => package(&root, &target_dir, &output),
+        Task::AiCycle { task, output } => {
+            require_windows_gnu()?;
+            process::ai_cycle(&root, &task, &output)
+        }
+        Task::Readback {
+            task,
+            output,
+            gate_reports,
+        } => process::readback(&root, &task, &output, &gate_reports),
     }
 }
 
@@ -308,6 +341,8 @@ fn package(root: &Path, target_dir: &Path, output: &Path) -> Result<()> {
     }
     std::fs::copy(root.join("README.md"), output.join("README.md"))?;
     std::fs::copy(root.join("LICENSE"), output.join("LICENSE"))?;
+    std::fs::copy(root.join("AGENTS.md"), output.join("AGENTS.md"))?;
+    copy_tree(&root.join("automation"), &output.join("automation"))?;
     let docs_output = output.join("docs");
     std::fs::create_dir_all(&docs_output)?;
     for name in [
@@ -319,6 +354,31 @@ fn package(root: &Path, target_dir: &Path, output: &Path) -> Result<()> {
         "RUNBOOK.md",
     ] {
         std::fs::copy(root.join("docs").join(name), docs_output.join(name))?;
+    }
+    Ok(())
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::create_dir_all(destination)
+        .with_context(|| format!("create package directory {}", destination.display()))?;
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("read package source {}", source.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), &target).with_context(|| {
+                format!("copy {} to {}", entry.path().display(), target.display())
+            })?;
+        } else {
+            bail!(
+                "unsupported package source entry {}",
+                entry.path().display()
+            );
+        }
     }
     Ok(())
 }

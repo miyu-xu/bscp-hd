@@ -12,7 +12,10 @@ clap.workspace = true
 hd-core = { path = "../crates/hd-core" }
 hd-platform = { path = "../crates/hd-platform" }
 hd-runtime = { path = "../crates/hd-runtime" }
+serde.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
+time.workspace = true
 tokio.workspace = true
 
 [lints]

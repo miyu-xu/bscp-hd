@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "task_id": "20260717-ai-process",
+  "objective": "把 AI 主导开发、自动门禁、任务交接和回读流程固化为仓库内可执行资产。",
+  "status": "complete",
+  "scope": {
+    "repositories": ["hd"],
+    "owned_paths": ["AGENTS.md", "automation/", ".github/workflows/ci.yml", "docs/", "scripts/", "xtask/"],
+    "excluded_paths": ["target/", "dist/", "out/", "相邻仓库既有用户改动"]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "windows_uses_mingw_only",
+    "preserve_user_changes",
+    "do_not_push"
+  ],
+  "acceptance": [
+    {
+      "id": "AI-001",
+      "criterion": "新 AI 会话能从 AGENTS.md 和任务卷恢复角色、约束和迭代入口。",
+      "evidence": ["file:AGENTS.md", "gate:hd-quality"]
+    },
+    {
+      "id": "AI-002",
+      "criterion": "成功和失败门禁都能生成结构化 gate log 与 readback.json/md。",
+      "evidence": ["artifact:hd-gates.json", "artifact:readback.json", "artifact:readback.md"]
+    },
+    {
+      "id": "AI-003",
+      "criterion": "跨仓 MinGW 联合门禁能够验证 HD、crosvm 和 gfxstream。",
+      "evidence": ["gate:crosvm-windows-gnu-check", "gate:crosvm-test-targets-compile", "gate:gfxstream-mingw-build", "gate:crosvm-diff-check", "gate:gfxstream-diff-check"]
+    }
+  ],
+  "required_gates": [
+    "hd-quality",
+    "crosvm-windows-gnu-check",
+    "crosvm-test-targets-compile",
+    "gfxstream-mingw-build",
+    "crosvm-diff-check",
+    "gfxstream-diff-check"
+  ],
+  "evidence_state": {
+    "code_present": true,
+    "tests_authored": true,
+    "mock_verified": true,
+    "real_guest_verified": false
+  },
+  "direction_decisions": [
+    {
+      "id": "D-AI-001",
+      "decision": "人工只做方向决策，AI 负责实现、验证、回读和自动修复迭代。",
+      "owner": "human",
+      "rationale": "用户明确要求完全 AI 开发流程。"
+    },
+    {
+      "id": "D-TEST-001",
+      "decision": "不运行 unittest，只编译测试目标并执行独立 smoke。",
+      "owner": "human",
+      "rationale": "仓库执行约束。"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "B-M3-BOOT",
+      "description": "真实 Android 启动仍等待 guest 构件、ADB bridge 和 readiness 契约。",
+      "scope": "future_milestone",
+      "state": "accepted"
+    }
+  ],
+  "human_decisions_needed": [],
+  "next_iteration": "从 B-M3-BOOT 建立下一任务卷；guest 构件契约确定前继续保持真实 guest 未验证。"
+}

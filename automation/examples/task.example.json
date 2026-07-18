@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "task_id": "example-host-change",
+  "objective": "以可回滚方式实现一个宿主功能并生成可验证回读。",
+  "status": "planned",
+  "scope": {
+    "repositories": ["hd"],
+    "owned_paths": ["crates/hd-runtime/"],
+    "excluded_paths": ["target/", "out/"]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "windows_uses_mingw_only",
+    "preserve_user_changes"
+  ],
+  "acceptance": [
+    {
+      "id": "A-001",
+      "criterion": "功能通过 HD 质量门并产生结构化回读。",
+      "evidence": ["gate:hd-quality", "artifact:readback.json"]
+    }
+  ],
+  "required_gates": ["hd-quality"],
+  "evidence_state": {
+    "code_present": false,
+    "tests_authored": false,
+    "mock_verified": false,
+    "real_guest_verified": false
+  },
+  "direction_decisions": [],
+  "blockers": [],
+  "human_decisions_needed": [],
+  "next_iteration": "实现最小行为、打点和测试代码后运行 xtask ai-cycle。"
+}

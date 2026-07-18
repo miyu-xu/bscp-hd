@@ -16,20 +16,30 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
       - name: Linux window dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libx11-xcb-dev
-      - name: Quality without unittest
-        run: cargo run -p xtask -- quality
+      - name: AI quality cycle without unittest
+        run: >-
+          cargo run -p xtask -- ai-cycle
+          --task automation/tasks/ci-quality.json
+          --output out/ai/ci-${{ runner.os }}
+      - name: Upload AI readback
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hd-readback-${{ runner.os }}
+          path: out/ai/ci-${{ runner.os }}
+          if-no-files-found: warn
 
   windows-gnu:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -39,12 +49,21 @@ jobs:
         with:
           targets: x86_64-pc-windows-gnu
           components: clippy,rustfmt
-      - name: GNU quality without unittest
+      - name: GNU AI quality cycle without unittest
         shell: pwsh
         run: |
           $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
           $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "C:\msys64\mingw64\bin\gcc.exe"
-          cargo run --target x86_64-pc-windows-gnu -p xtask -- quality
+          cargo run --target x86_64-pc-windows-gnu -p xtask -- ai-cycle `
+            --task automation/tasks/ci-quality.json `
+            --output out/ai/ci-Windows
+      - name: Upload Windows AI readback
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hd-readback-Windows
+          path: out/ai/ci-Windows
+          if-no-files-found: warn
       - name: GNU release and PE audit
         shell: cmd
         run: |

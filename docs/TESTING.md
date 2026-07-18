@@ -15,11 +15,13 @@ cd hd
 
 门禁依次执行：
 
-1. `cargo fmt --all -- --check`；
-2. GNU target 的 `cargo check --workspace --all-targets`，包括测试代码编译；
-3. GNU target 的 `cargo clippy --workspace --all-targets -- -D warnings`；
-4. `xtask smoke`；
-5. 可选 `build.bat` release 链接和 PE import audit。
+1. `xtask process-check`，校验 AGENTS、schema、任务卷和 unittest 禁令；
+2. 工作区和暂存区的 `git diff --check`；
+3. `cargo fmt --all -- --check`；
+4. GNU target 的 `cargo check --workspace --all-targets`，包括测试代码编译；
+5. GNU target 的 `cargo clippy --workspace --all-targets -- -D warnings`；
+6. `xtask smoke`；
+7. 可选 `build.bat` release 链接和 PE import audit。
 
 `xtask smoke` 不使用测试 harness，当前覆盖：
 
@@ -32,6 +34,28 @@ cd hd
 - 缺少真实构件时进入 Blocked；
 - Blocked 可正常 stop；
 - 两次运行均存在 manifest/events/result。
+
+## 自动回读
+
+推荐使用 `ai-cycle` 代替裸 `quality`，使失败也保留日志和仓库状态：
+
+```powershell
+cargo run --target x86_64-pc-windows-gnu -p xtask -- ai-cycle `
+  --task automation/tasks/ci-quality.json `
+  --output out/ai/local
+```
+
+输出包含 `logs/hd-quality.log`、`hd-gates.json`、`readback.json` 和 `readback.md`。CI 在 `always()` 步骤上传该目录，因此质量门失败时仍能回读原因。
+
+涉及相邻仓库时运行：
+
+```powershell
+.\scripts\integration-quality.ps1 `
+  -Task automation/tasks/workspace-integration.json `
+  -Output out/ai/integration
+```
+
+该脚本不执行测试 harness；crosvm 的 `--tests` 只编译测试目标。`-RunRootBuild` 会额外运行完整 `build_all.bat`，默认联合门仅覆盖 HD、crosvm 和 gfxstream，避免无意重建其他脏模块。
 
 ## 集成编译矩阵
 
@@ -49,6 +73,8 @@ cd hd
 
 - 命令退出码和 warning；
 - `git diff --check`；
+- 任务卷要求的每个 gate 均为 `pass`，不存在 `missing`/`skipped`；
+- 自动生成的 `readback.json` 与 `readback.md`；
 - 各嵌套仓库 `git status --short`，确认没有夹带用户文件；
 - smoke 的运行目录；
 - `manifest.json` 中的命令、环境、构件指纹和 toolchain；

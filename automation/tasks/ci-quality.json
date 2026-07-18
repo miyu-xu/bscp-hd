@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "task_id": "ci-quality",
+  "objective": "在单一 HD checkout 中执行可移植质量门并保留失败或成功回读。",
+  "status": "complete",
+  "scope": {
+    "repositories": ["hd"],
+    "owned_paths": ["AGENTS.md", "automation/", "crates/", "docs/", "scripts/", "xtask/"],
+    "excluded_paths": ["target/", "dist/", "out/"]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "windows_uses_mingw_only",
+    "preserve_user_changes"
+  ],
+  "acceptance": [
+    {
+      "id": "CI-001",
+      "criterion": "流程资产、格式、all-targets 编译、Clippy 和独立 smoke 全部通过。",
+      "evidence": ["gate:hd-quality", "artifact:readback.json", "artifact:logs/hd-quality.log"]
+    }
+  ],
+  "required_gates": ["hd-quality"],
+  "evidence_state": {
+    "code_present": true,
+    "tests_authored": true,
+    "mock_verified": true,
+    "real_guest_verified": false
+  },
+  "direction_decisions": [
+    {
+      "id": "D-TEST-001",
+      "decision": "CI 编译测试目标但不运行 unittest。",
+      "owner": "human",
+      "rationale": "仓库当前明确要求不跑 unittest。"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "B-M3-BOOT",
+      "description": "真实 Android guest 的构件契约、ADB bridge 和 readiness 尚未闭环。",
+      "scope": "future_milestone",
+      "state": "accepted"
+    }
+  ],
+  "human_decisions_needed": [],
+  "next_iteration": "CI 失败时读取 gate log，修复后重新运行同一任务卷。"
+}
