@@ -3,9 +3,8 @@
 ## 进程与依赖
 
 ```text
-hd.exe (Manager) ── launches/focuses ── hd-player.exe (one per instance)
-        │                                  │ NativeDisplayTargetV2 / viewport heartbeat
-        └──────────── HTTP V2 + bearer ────┘
+hd.exe (winit + disjoint Wry/WebView surfaces + NativeDisplayHost)
+        │ HTTP V2 + bearer / viewport heartbeat
                          │
                          ▼
      hd-host.exe ───── redb / leases / uploads / diagnostics / reconciliation
@@ -14,7 +13,7 @@ hd.exe (Manager) ── launches/focuses ── hd-player.exe (one per instance)
         ├──────── hd-worker.exe ── crosvm ── Android Guest
         └──────── ...
                          │
-                         ├─ crosvm HWND becomes a child of Player's private HWND (Windows)
+                         ├─ crosvm HWND becomes a child of hd.exe's private viewport HWND (Windows)
                          ├─ ADB readiness/actions/install/screencap
                          ├─ strict frame broker generation
                          └─ signed device components / Guest bridge
@@ -34,9 +33,9 @@ hd.exe (Manager) ── launches/focuses ── hd-player.exe (one per instance)
 - `hd-peripheral-adapters`：生成 UWB、modem、network、audio、camera 五个独立正式进程；每个进程只获授自己的 Guest control 通道和 bearer。Windows modem adapter 监听 Guest RIL 固定使用的 host-vsock 9697，经 crosvm AVF 命名管道帧桥接并提供确定性 AT baseline；UWB adapter 提供 Android 15 可解析的 FiRa v2 capability、session init/config/start/stop/deinit 状态机与短地址确定性距离报告，但不声明 RF、角度或 CCC 一致性；network/virtio-net 与 audio/virtio-snd 数据面由 crosvm 提供。
 - Windows crosvm 正式运行使用 `warn` 日志级别；逐 MMIO 的 `info` 追踪会在单次启动写入数万至十万行，既不属于默认诊断证据，也会显著拖慢 Guest 启动。需要底层追踪时应在隔离的专项复现中显式提高日志级别。
 - `hd-host`、`hd-worker`：独立可执行进程。
-- `hd.exe`（Manager）、`hd-player.exe` 和 `hdctl`：只通过 `HostClientV2` 操作 Host，不直接持有 VM、磁盘或帧像素。
+- `hd.exe`：单进程 Rust 桌面壳，使用 winit 管理窗口、Wry/WebView2 呈现 React 多实例管理与内联设置，并用 `NativeDisplayHost` 承载 Android；只通过 `HostClientV2` 操作 Host，不持有 VM、磁盘或帧像素。`hdctl` 提供无界面控制。
 
-Windows 的实例画面由 crosvm `gpu_display_win` 持有原生渲染 HWND、WndProc 与输入路径，gfxstream 负责 Guest Vulkan 渲染和 color buffer，同构建启用的 `vulkan_display` 负责导入 image/semaphore 并呈现到该 HWND。crosvm 初始窗口遵守 `hidden=true`，不会先显示独立顶层窗口；Player 创建私有子 HWND，经短期、instance/generation 绑定的 DisplaySessionV2 通过 Worker 将 crosvm HWND 改为 `WS_CHILD`、按物理像素 resize，完成后才显示。Player 不把外部 Vulkan image 经 egui/wgpu/D3D12 再复制进自身窗口。Player 崩溃、心跳过期或 detach 时 Worker 隐藏并停放 crosvm 窗口，VM 与 gfxstream 保持运行，新的 Player 可重新附加。截图从 Guest ADB `screencap` 保存，不读取 Host Vulkan surface。gfxstream 在 GPU completion future 完成后，将同一 color buffer 的 Win32 external-memory handle 交给 `hd-frame-producer` 导入并等待严格 release，再完成 virtio-gpu timeline。这样显示保持同适配器、三缓冲、显式同步及零 CPU readback，软件 blit 只保留为非 Vulkan 兼容回退，不进入正常 Player 显示链路。
+Windows 的实例画面由 crosvm `gpu_display_win` 持有原生渲染 HWND、WndProc 与输入路径，gfxstream 负责 Guest Vulkan 渲染和 color buffer，同构建启用的 `vulkan_display` 负责导入 image/semaphore 并呈现到该 HWND。crosvm 初始窗口遵守 `hidden=true`，不会先显示独立顶层窗口。`hd.exe` 在 winit 顶层窗口中创建三个相互分离的 WebView 子窗口（顶部栏、侧栏、非 Player 内容）以及黑色 `NativeDisplayHost` 子 HWND；Player 页不创建覆盖 Android 区域的 WebView，设置/设备/诊断页则释放显示会话后才显示内容 WebView。短期、instance/generation 绑定的 DisplaySessionV2 通过 Worker 将 crosvm HWND 改为 `WS_CHILD`、按物理像素 resize，完成后才显示。WebView 不接触外部 Vulkan image，显示链不经过纹理复制、CPU readback 或软件 blit；最小化、离开 Player、恢复和 crosvm resume 会释放并重新获取显示会话，避免保留失效的合成 surface。`hd.exe` 崩溃、心跳过期或 detach 时 Worker 隐藏并停放 crosvm 窗口；重新启动 `hd.exe` 可重新附加。截图从 Guest ADB `screencap` 保存到用户图片目录下的 `HD`，不读取 Host Vulkan surface。gfxstream 在 GPU completion future 完成后，将同一 color buffer 的 Win32 external-memory handle 交给 `hd-frame-producer` 导入并等待严格 release，再完成 virtio-gpu timeline。
 - `xtask`：流程验证、质量、黑盒 smoke、证据回读、认证、打包和 PE ABI 审计，不进入运行时。
 
 ## 状态与 operation

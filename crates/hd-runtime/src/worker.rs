@@ -11,8 +11,8 @@ use hd_core::{
     DisplayViewportV2, FRAME_PROTOCOL_VERSION, FormalComponentConfigurationV2,
     FormalComponentLaunchV2, FormalComponentReadyV2, FrameMetricsV2, FrameReadyMarkerV2,
     InstanceActionV2, InstanceSpecV2, LaunchPlanV2, LeaseKindV2, LeaseV2, NativeDisplayTargetV2,
-    ObservedStateV2, RunManifestV2, RunResultV2, ScreenshotRecordV2, StopModeV2,
-    WORKER_PROTOCOL_VERSION, WorkerCommandV2, WorkerDescriptorV2, WorkerIdentityV2,
+    ObservedStateV2, PreparedNativeDisplayV2, RunManifestV2, RunResultV2, ScreenshotRecordV2,
+    StopModeV2, WORKER_PROTOCOL_VERSION, WorkerCommandV2, WorkerDescriptorV2, WorkerIdentityV2,
     WorkerPayloadV2, WorkerRequestV2, WorkerResponseV2, WorkerStatusV2,
     device_component_guest_roles_v2,
 };
@@ -36,6 +36,34 @@ const COMPONENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const ADBD_LOG_READY_TIMEOUT: Duration = Duration::from_mins(3);
 const DEV_BOOT_LOG_READY_TIMEOUT: Duration = Duration::from_secs(150);
 const DEV_BOOT_LOG_SCAN_LIMIT: u64 = 32 * 1024 * 1024;
+// Native gfxstream HWND creation follows SurfaceFlinger rather than crosvm process creation.
+// Keep the VM/control plane usable while that window appears instead of holding Start (and the
+// per-instance operation lock) for the entire Android cold boot.
+const INITIAL_DISPLAY_ATTACH_RETRY_WINDOW: Duration = Duration::from_mins(3);
+const INITIAL_DISPLAY_ATTACH_RETRY_MIN: Duration = Duration::from_millis(100);
+const INITIAL_DISPLAY_ATTACH_RETRY_MAX: Duration = Duration::from_millis(500);
+const CROSVM_DISPLAY_PARENT_HWND_ENV: &str = "CROSVM_DISPLAY_PARENT_HWND";
+const CROSVM_DISPLAY_WIDTH_ENV: &str = "CROSVM_DISPLAY_WIDTH";
+const CROSVM_DISPLAY_HEIGHT_ENV: &str = "CROSVM_DISPLAY_HEIGHT";
+
+fn inject_initial_display_environment(
+    environment: &mut BTreeMap<String, String>,
+    display: &PreparedNativeDisplayV2,
+) {
+    match &display.target {
+        NativeDisplayTargetV2::WindowsHwnd { hwnd, .. } => {
+            environment.insert(CROSVM_DISPLAY_PARENT_HWND_ENV.to_owned(), hwnd.to_string());
+            environment.insert(
+                CROSVM_DISPLAY_WIDTH_ENV.to_owned(),
+                display.viewport.width_px.to_string(),
+            );
+            environment.insert(
+                CROSVM_DISPLAY_HEIGHT_ENV.to_owned(),
+                display.viewport.height_px.to_string(),
+            );
+        }
+    }
+}
 
 #[derive(Debug)]
 struct ManagedComponent {
@@ -72,6 +100,7 @@ struct WorkerMutable {
     backend: Option<CrosvmBackend>,
     launch: Option<LaunchPlanV2>,
     adb: Option<AdbClient>,
+    adb_ready: bool,
     journal: Option<Arc<RunJournalV2>>,
     started_at: Option<OffsetDateTime>,
     display_session: Option<ActiveDisplaySession>,
@@ -84,7 +113,7 @@ struct ActiveDisplaySession {
     id: Uuid,
     generation: u64,
     target: NativeDisplayTargetV2,
-    viewport_revision: u64,
+    viewport: DisplayViewportV2,
 }
 
 pub struct WorkerService {
@@ -191,6 +220,7 @@ impl WorkerService {
                 backend: None,
                 launch: None,
                 adb: None,
+                adb_ready: false,
                 journal: None,
                 started_at: None,
                 display_session: None,
@@ -307,8 +337,15 @@ impl WorkerService {
                 run_id,
                 leases,
                 capabilities_fingerprint,
+                initial_display,
             } => self
-                .start(*spec, run_id, leases, &capabilities_fingerprint)
+                .start(
+                    *spec,
+                    run_id,
+                    leases,
+                    &capabilities_fingerprint,
+                    initial_display,
+                )
                 .await
                 .map(|()| WorkerPayloadV2::Empty),
             WorkerCommandV2::Stop {
@@ -389,6 +426,7 @@ impl WorkerService {
         run_id: Uuid,
         leases: Vec<LeaseV2>,
         expected_capabilities: &str,
+        initial_display: Option<PreparedNativeDisplayV2>,
     ) -> Result<(), WorkerError> {
         let _operation = self.operation.lock().await;
         spec.validate()?;
@@ -397,6 +435,18 @@ impl WorkerService {
         }
         let frame_generation =
             validate_start_leases(&leases, &self.identity, &spec, &self.paths, &self.endpoint)?;
+        if let Some(display) = &initial_display {
+            if !display.viewport.is_valid() {
+                return Err(WorkerError::DisplaySession(
+                    "initial display viewport is outside supported bounds".to_owned(),
+                ));
+            }
+            if !process_identity_is_alive(display.target.owner()) {
+                return Err(WorkerError::DisplaySession(
+                    "initial display owner is not alive".to_owned(),
+                ));
+            }
+        }
         {
             let mutable = self.mutable.lock().await;
             if mutable.process.is_some() || mutable.status.observed.is_active() {
@@ -435,6 +485,15 @@ impl WorkerService {
             mutable.active_spec = Some(spec.clone());
             mutable.journal = Some(Arc::clone(&journal));
             mutable.started_at = Some(started_at);
+            mutable.display_session =
+                initial_display
+                    .as_ref()
+                    .map(|display| ActiveDisplaySession {
+                        id: display.session_id,
+                        generation: frame_generation,
+                        target: display.target.clone(),
+                        viewport: display.viewport.clone(),
+                    });
         }
         self.transition(ObservedStateV2::Preparing, None).await?;
         let start_result: Result<(), WorkerError> = async {
@@ -467,7 +526,8 @@ impl WorkerService {
                 WorkerError::CapabilityBlocked(vec!["artifact.bundles".to_owned()])
             })?;
             let dev_display_copy_fallback = crate::dev::allow_display_copy_fallback_enabled();
-            let frame_tool = if dev_display_copy_fallback {
+            let native_display_direct = crate::dev::native_display_direct_enabled();
+            let frame_tool = if dev_display_copy_fallback || native_display_direct {
                 None
             } else {
                 Some(discovery.frame_tool.ok_or_else(|| {
@@ -566,11 +626,15 @@ impl WorkerService {
             }
             self.transition(ObservedStateV2::LaunchingGuest, None)
                 .await?;
+            let mut process_environment = launch.environment.clone();
+            if let Some(display) = &initial_display {
+                inject_initial_display_environment(&mut process_environment, display);
+            }
             let process = TokioProcessSupervisor
                 .spawn(&ProcessSpec {
                     executable: launch.executable.clone(),
                     arguments: launch.arguments.clone(),
-                    environment: launch.environment.clone(),
+                    environment: process_environment,
                     working_directory: launch.working_directory.clone(),
                     stdout_path: run_dir.join("crosvm.stdout.log"),
                     stderr_path: run_dir.join("crosvm.stderr.log"),
@@ -599,8 +663,18 @@ impl WorkerService {
 
             self.transition(ObservedStateV2::NegotiatingDisplay, None)
                 .await?;
-            if dev_display_copy_fallback {
-                self.wait_display_copy_fallback_ready().await?;
+            // gfxstream creates its Vulkan render HWND only after SurfaceFlinger starts. Start all
+            // Guest-facing device backends first; KeyMint, Gatekeeper and networking are part of
+            // Android userspace boot and waiting before them creates a startup deadlock.
+            if let Some(display) = initial_display.clone() {
+                self.spawn_deferred_initial_display(
+                    display,
+                    run_id,
+                    frame_generation,
+                );
+            }
+            if dev_display_copy_fallback || native_display_direct {
+                self.wait_native_display_ready().await?;
             } else {
                 self.wait_frame_ready(&run_dir, run_id, frame_generation)
                     .await?;
@@ -634,7 +708,21 @@ impl WorkerService {
                 let adb = AdbClient::new(discovery.adb, None)
                     .with_aapt2(host_tools.get("aapt2").cloned())
                     .with_sensor_injector(Some(sensor_injector));
-                if crate::dev::allow_adb_offline_boot_ready_enabled() {
+                if native_display_direct {
+                    // Native display attachment must not depend on adbd. Direct-linux images can
+                    // create and present the gfxstream surface before their ADB transport is
+                    // configured (and some development images intentionally leave adbd offline).
+                    // Publish Ready now so HD can keep retrying the native HWND attach while the
+                    // guest finishes booting. ADB-backed actions retain their normal per-command
+                    // errors until the transport becomes available.
+                    tracing::warn!(
+                        event = "worker.adb.readiness.deferred_for_native_display",
+                        instance_id = %self.instance_id,
+                        run_id = %run_id,
+                        %serial,
+                        "native display startup is not blocked on ADB readiness"
+                    );
+                } else if crate::dev::allow_adb_offline_boot_ready_enabled() {
                     tracing::warn!(
                         event = "worker.adb.readiness.dev_fallback",
                         instance_id = %self.instance_id,
@@ -648,15 +736,29 @@ impl WorkerService {
                     adb.connect(serial).await.map_err(WorkerError::Adb)?;
                     adb.wait_ready(serial).await.map_err(WorkerError::Adb)?;
                 }
-                adb.set_orientation(serial, spec.display.orientation)
-                    .await
-                    .map_err(WorkerError::Adb)?;
+                if !native_display_direct {
+                    adb.set_orientation(serial, spec.display.orientation)
+                        .await
+                        .map_err(WorkerError::Adb)?;
+                }
                 self.ensure_components_alive().await?;
-                self.mutable.lock().await.adb = Some(adb);
+                let mut mutable = self.mutable.lock().await;
+                mutable.adb = Some(adb);
+                mutable.adb_ready = !native_display_direct;
             } else {
                 return Err(WorkerError::ReadinessUnavailable);
             }
             self.transition(ObservedStateV2::Ready, None).await?;
+            if native_display_direct {
+                self.spawn_deferred_adb_readiness(
+                    run_id,
+                    launch
+                        .adb_serial
+                        .clone()
+                        .ok_or(WorkerError::ReadinessUnavailable)?,
+                    spec.display.orientation,
+                );
+            }
             self.spawn_exit_monitor();
             Ok(())
         }
@@ -1042,7 +1144,7 @@ impl WorkerService {
         }
     }
 
-    async fn wait_display_copy_fallback_ready(&self) -> Result<(), WorkerError> {
+    async fn wait_native_display_ready(&self) -> Result<(), WorkerError> {
         let started = Instant::now();
         let minimum_alive = Duration::from_secs(3);
         loop {
@@ -1119,14 +1221,132 @@ impl WorkerService {
             ));
         }
         let child_pid = status.child_pid.ok_or(WorkerError::NotRunning)?;
+        let debug_toplevel = hd_platform::native_display_toplevel_debug_enabled();
+        tracing::info!(
+            event = "worker.display.attach.started",
+            instance_id = %self.instance_id,
+            session_id = %session_id,
+            generation,
+            child_pid,
+            debug_toplevel,
+            viewport_width = viewport.width_px,
+            viewport_height = viewport.height_px,
+            "attaching crosvm native display"
+        );
         hd_platform::attach_native_display(child_pid, &target, &viewport)?;
         self.mutable.lock().await.display_session = Some(ActiveDisplaySession {
             id: session_id,
             generation,
             target,
-            viewport_revision: viewport.revision,
+            viewport,
         });
+        tracing::info!(
+            event = "worker.display.attach.succeeded",
+            instance_id = %self.instance_id,
+            session_id = %session_id,
+            generation,
+            child_pid,
+            debug_toplevel,
+            "crosvm native display attached"
+        );
         Ok(())
+    }
+
+    fn spawn_deferred_initial_display(
+        self: &Arc<Self>,
+        prepared: PreparedNativeDisplayV2,
+        run_id: Uuid,
+        generation: u64,
+    ) {
+        let worker = Arc::clone(self);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let mut retry_delay = INITIAL_DISPLAY_ATTACH_RETRY_MIN;
+            let mut next_progress_log = Duration::from_secs(15);
+            loop {
+                let status = worker.status().await;
+                let session_is_current = worker
+                    .mutable
+                    .lock()
+                    .await
+                    .display_session
+                    .as_ref()
+                    .is_some_and(|session| {
+                        session.id == prepared.session_id && session.generation == generation
+                    });
+                if status.run_id != Some(run_id)
+                    || status.frame_generation != generation
+                    || status.child_pid.is_none()
+                    || !status.observed.is_active()
+                    || !session_is_current
+                    || !process_identity_is_alive(prepared.target.owner())
+                {
+                    tracing::debug!(
+                        event = "worker.display.initial_attach.cancelled",
+                        instance_id = %worker.instance_id,
+                        session_id = %prepared.session_id,
+                        run_id = %run_id,
+                        generation,
+                        "deferred native display attach no longer belongs to the active runtime"
+                    );
+                    return;
+                }
+                let child_pid = status.child_pid.expect("checked above");
+                match hd_platform::attach_native_display(
+                    child_pid,
+                    &prepared.target,
+                    &prepared.viewport,
+                ) {
+                    Ok(()) => {
+                        tracing::info!(
+                            event = "worker.display.initial_attach.succeeded",
+                            instance_id = %worker.instance_id,
+                            session_id = %prepared.session_id,
+                            child_pid,
+                            elapsed_ms = elapsed_ms(started),
+                            viewport_width = prepared.viewport.width_px,
+                            viewport_height = prepared.viewport.height_px,
+                            "gfxstream display was attached without blocking VM startup"
+                        );
+                        return;
+                    }
+                    Err(error) if started.elapsed() < INITIAL_DISPLAY_ATTACH_RETRY_WINDOW => {
+                        if started.elapsed() >= next_progress_log {
+                            tracing::info!(
+                                event = "worker.display.initial_attach.pending",
+                                instance_id = %worker.instance_id,
+                                session_id = %prepared.session_id,
+                                child_pid,
+                                elapsed_ms = elapsed_ms(started),
+                                %error,
+                                "Android is still booting; waiting for the gfxstream render HWND"
+                            );
+                            next_progress_log =
+                                next_progress_log.saturating_add(Duration::from_secs(15));
+                        }
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = retry_delay
+                            .saturating_mul(2)
+                            .min(INITIAL_DISPLAY_ATTACH_RETRY_MAX);
+                    }
+                    Err(error) => {
+                        // Display availability is recoverable independently from the VM. The UI
+                        // can acquire a fresh session later, so never turn a healthy Android
+                        // runtime into a terminal start failure here.
+                        tracing::warn!(
+                            event = "worker.display.initial_attach.deferred_timeout",
+                            instance_id = %worker.instance_id,
+                            session_id = %prepared.session_id,
+                            child_pid,
+                            elapsed_ms = elapsed_ms(started),
+                            %error,
+                            "native display is still unavailable; VM remains running for reattach"
+                        );
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     async fn resize_display(
@@ -1154,11 +1374,18 @@ impl WorkerService {
                 "display session identity or generation mismatch".to_owned(),
             ));
         }
-        if viewport.revision <= session.viewport_revision {
+        if viewport.revision <= session.viewport.revision {
             return Ok(());
         }
-        hd_platform::resize_native_display(child_pid, &session.target, &viewport)?;
-        session.viewport_revision = viewport.revision;
+        let geometry_changed = viewport.width_px != session.viewport.width_px
+            || viewport.height_px != session.viewport.height_px
+            || viewport.dpi != session.viewport.dpi;
+        if geometry_changed {
+            hd_platform::resize_native_display(child_pid, &session.target, &viewport)?;
+        } else if viewport.visible != session.viewport.visible {
+            hd_platform::set_native_display_visibility(child_pid, viewport.visible)?;
+        }
+        session.viewport = viewport;
         Ok(())
     }
 
@@ -1185,7 +1412,7 @@ impl WorkerService {
         &self,
         output_path: &Path,
     ) -> Result<ScreenshotRecordV2, WorkerError> {
-        let screenshot_dir = self.paths.root.join("screenshots");
+        let screenshot_dir = self.paths.screenshot_directory();
         if output_path.parent() != Some(screenshot_dir.as_path()) {
             return Err(WorkerError::DisplaySession(
                 "screenshot path is outside the managed screenshot directory".to_owned(),
@@ -1194,6 +1421,9 @@ impl WorkerService {
         hd_platform::ensure_owner_only_directory(&screenshot_dir)?;
         let (adb, serial) = {
             let mutable = self.mutable.lock().await;
+            if !mutable.adb_ready {
+                return Err(WorkerError::AdbNotReady);
+            }
             (
                 mutable.adb.clone().ok_or(WorkerError::NotReady)?,
                 mutable
@@ -1383,6 +1613,7 @@ impl WorkerService {
         mutable.backend = None;
         mutable.launch = None;
         mutable.adb = None;
+        mutable.adb_ready = false;
         mutable.display_session = None;
         mutable.components.clear();
         mutable.device_control_tokens.clear();
@@ -1399,7 +1630,15 @@ impl WorkerService {
         }
         self.transition(ObservedStateV2::Pausing, None).await?;
         let (backend, endpoint) = self.backend_control().await?;
-        backend.pause(&endpoint).await?;
+        if let Err(error) = backend
+            .pause(&endpoint)
+            .await
+            .map_err(WorkerError::Platform)
+        {
+            self.transition(ObservedStateV2::Ready, Some(&error))
+                .await?;
+            return Err(error);
+        }
         self.transition(ObservedStateV2::Paused, None).await
     }
 
@@ -1410,7 +1649,15 @@ impl WorkerService {
         }
         self.transition(ObservedStateV2::Resuming, None).await?;
         let (backend, endpoint) = self.backend_control().await?;
-        backend.resume(&endpoint).await?;
+        if let Err(error) = backend
+            .resume(&endpoint)
+            .await
+            .map_err(WorkerError::Platform)
+        {
+            self.transition(ObservedStateV2::Paused, Some(&error))
+                .await?;
+            return Err(error);
+        }
         self.transition(ObservedStateV2::Ready, None).await
     }
 
@@ -1424,7 +1671,7 @@ impl WorkerService {
             let mutable = self.mutable.lock().await;
             (
                 mutable.active_spec.clone().ok_or(WorkerError::NotRunning)?,
-                mutable.adb.clone(),
+                mutable.adb_ready.then(|| mutable.adb.clone()).flatten(),
                 mutable.status.adb_serial.clone(),
             )
         };
@@ -1458,6 +1705,9 @@ impl WorkerService {
             InstanceActionV2::Key { key } => {
                 let (adb, serial) = {
                     let mutable = self.mutable.lock().await;
+                    if !mutable.adb_ready {
+                        return Err(WorkerError::AdbNotReady);
+                    }
                     (
                         mutable
                             .adb
@@ -1475,6 +1725,9 @@ impl WorkerService {
             InstanceActionV2::Rotate { orientation } => {
                 let (adb, serial) = {
                     let mutable = self.mutable.lock().await;
+                    if !mutable.adb_ready {
+                        return Err(WorkerError::AdbNotReady);
+                    }
                     (
                         mutable
                             .adb
@@ -1518,6 +1771,9 @@ impl WorkerService {
                 .await?;
                 let (adb, serial) = {
                     let mutable = self.mutable.lock().await;
+                    if !mutable.adb_ready {
+                        return Err(WorkerError::AdbNotReady);
+                    }
                     (
                         mutable
                             .adb
@@ -1544,6 +1800,9 @@ impl WorkerService {
                 .await?;
                 let (adb, serial) = {
                     let mutable = self.mutable.lock().await;
+                    if !mutable.adb_ready {
+                        return Err(WorkerError::AdbNotReady);
+                    }
                     (
                         mutable
                             .adb
@@ -1570,6 +1829,9 @@ impl WorkerService {
                 .await?;
                 let (adb, serial) = {
                     let mutable = self.mutable.lock().await;
+                    if !mutable.adb_ready {
+                        return Err(WorkerError::AdbNotReady);
+                    }
                     (
                         mutable
                             .adb
@@ -1619,6 +1881,9 @@ impl WorkerService {
         }
         let (adb, serial) = {
             let mutable = self.mutable.lock().await;
+            if !mutable.adb_ready {
+                return Err(WorkerError::AdbNotReady);
+            }
             (
                 mutable.adb.clone().ok_or(WorkerError::NotRunning)?,
                 mutable
@@ -1638,6 +1903,9 @@ impl WorkerService {
         }
         let (adb, serial, journal) = {
             let mutable = self.mutable.lock().await;
+            if !mutable.adb_ready {
+                return Err(WorkerError::AdbNotReady);
+            }
             (
                 mutable.adb.clone().ok_or(WorkerError::NotRunning)?,
                 mutable
@@ -1727,6 +1995,102 @@ impl WorkerService {
                         break;
                     }
                 }
+            }
+        });
+    }
+
+    fn spawn_deferred_adb_readiness(
+        self: &Arc<Self>,
+        run_id: Uuid,
+        serial: String,
+        orientation: hd_core::OrientationV2,
+    ) {
+        let worker = Arc::clone(self);
+        tokio::spawn(async move {
+            let adb = {
+                let mutable = worker.mutable.lock().await;
+                if mutable.status.run_id != Some(run_id) {
+                    return;
+                }
+                let Some(adb) = mutable.adb.clone() else {
+                    return;
+                };
+                adb
+            };
+
+            let connect = adb.connect(&serial);
+            tokio::pin!(connect);
+            let connect_result = loop {
+                tokio::select! {
+                    result = &mut connect => break result,
+                    () = tokio::time::sleep(Duration::from_millis(500)) => {
+                        if worker.status().await.run_id != Some(run_id) {
+                            return;
+                        }
+                    }
+                }
+            };
+            if let Err(error) = connect_result {
+                tracing::warn!(
+                    event = "worker.adb.deferred_connect.failed",
+                    instance_id = %worker.instance_id,
+                    %run_id,
+                    %serial,
+                    %error,
+                    "deferred ADB connection failed; native display remains available"
+                );
+                return;
+            }
+
+            let readiness = adb.wait_ready(&serial);
+            tokio::pin!(readiness);
+            let readiness_result = loop {
+                tokio::select! {
+                    result = &mut readiness => break result,
+                    () = tokio::time::sleep(Duration::from_millis(500)) => {
+                        if worker.status().await.run_id != Some(run_id) {
+                            return;
+                        }
+                    }
+                }
+            };
+            if let Err(error) = readiness_result {
+                tracing::warn!(
+                    event = "worker.adb.deferred_readiness.failed",
+                    instance_id = %worker.instance_id,
+                    %run_id,
+                    %serial,
+                    %error,
+                    "deferred Android readiness failed; native display remains available"
+                );
+                return;
+            }
+            if let Err(error) = adb.set_orientation(&serial, orientation).await {
+                tracing::warn!(
+                    event = "worker.adb.deferred_orientation.failed",
+                    instance_id = %worker.instance_id,
+                    %run_id,
+                    %serial,
+                    %error,
+                    "initial Android orientation could not be applied"
+                );
+            }
+
+            let mut mutable = worker.mutable.lock().await;
+            if mutable.status.run_id == Some(run_id)
+                && matches!(
+                    mutable.status.observed,
+                    ObservedStateV2::Ready | ObservedStateV2::Paused
+                )
+            {
+                mutable.adb_ready = true;
+                tracing::info!(
+                    event = "worker.adb.deferred_readiness.succeeded",
+                    instance_id = %worker.instance_id,
+                    %run_id,
+                    %serial,
+                    "ADB-backed HD actions are ready"
+                );
             }
         });
     }
@@ -1874,6 +2238,7 @@ impl WorkerService {
             }
             mutable.status.adb_serial = None;
             mutable.adb = None;
+            mutable.adb_ready = false;
             if cleanup_error.is_none() {
                 mutable.backend = None;
                 mutable.launch = None;
@@ -2437,6 +2802,8 @@ pub enum WorkerError {
     RestartRequired,
     #[error("ADB-disabled instances have no authenticated readiness probe")]
     ReadinessUnavailable,
+    #[error("ADB transport has not reached authenticated Android readiness yet")]
+    AdbNotReady,
     #[error(
         "host capabilities changed between reservation and worker launch: {expected} != {actual}"
     )]
@@ -2532,6 +2899,7 @@ impl WorkerError {
             Self::NotReady => "worker_not_ready",
             Self::RestartRequired => "restart_required",
             Self::ReadinessUnavailable => "readiness_unavailable",
+            Self::AdbNotReady => "adb_not_ready",
             Self::CapabilityChanged { .. } => "capability_changed",
             Self::CapabilityBlocked(_) => "capability_blocked",
             Self::LeaseMissing(_) => "lease_missing",
@@ -2566,7 +2934,7 @@ impl WorkerError {
     pub fn api_error(&self) -> ApiErrorV2 {
         ApiErrorV2::new(self.code(), self.to_string()).retryable(matches!(
             self,
-            Self::Busy(_) | Self::CapabilityChanged { .. } | Self::DeviceIpc(_)
+            Self::Busy(_) | Self::AdbNotReady | Self::CapabilityChanged { .. } | Self::DeviceIpc(_)
         ))
     }
 }

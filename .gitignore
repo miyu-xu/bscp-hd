@@ -3,6 +3,9 @@
 /.artifacts/
 /dist/
 /out/
+/web/node_modules/
+/web/dist/
+/web/tsconfig.tsbuildinfo
 *.log
 *.jsonl
 *.tmp

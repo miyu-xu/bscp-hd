@@ -34,9 +34,6 @@ bytes = "1.11.1"
 clap = { version = "4.5.60", features = ["derive"] }
 dirs = "6.0.0"
 ed25519-dalek = "2.2.0"
-eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
-egui = "0.35.0"
-egui_extras = { version = "0.35.0", features = ["svg"] }
 fs2 = "0.4.3"
 futures = "0.3.32"
 getrandom = "0.4.2"
@@ -44,6 +41,8 @@ hex = "0.4.3"
 libc = "0.2.186"
 parking_lot = "0.12.5"
 raw-window-handle = "0.6.2"
+winit = { version = "0.30.12", features = ["rwh_06"] }
+wry = { version = "0.55.1", default-features = false, features = ["protocol"] }
 redb = "2.6.3"
 reflink-copy = "0.1.30"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "multipart", "stream"] }

@@ -1,6 +1,6 @@
 # HD Android Desktop
 
-HD 是 `bscp` 内的独立 Rust 子仓库，为固定 Android 15/cuttlefish 风格 Guest 提供跨平台桌面管理、多实例和自动化控制。Windows 全链只使用 `x86_64-pc-windows-gnu` 与 MinGW-w64；Linux x86_64、macOS arm64 通过同一数据契约和窄平台适配层实现。
+HD 是 `bscp` 内的独立 Rust 子仓库，为 Cuttlefish 风格 Guest 提供跨平台桌面管理、多实例和自动化控制。Windows 全链只使用 `x86_64-pc-windows-gnu` 与 MinGW-w64；React UI 与 Host 协议跨平台复用，Linux/macOS 原生显示目标通过窄平台适配层实现。
 
 ## 当前实现
 
@@ -30,7 +30,7 @@ cd hd
 build.bat
 ```
 
-项目统一构建会发布十五个 HD Windows 运行时：多实例 Manager（`hd.exe`）、每实例 Player（`hd-player.exe`）、CLI/Host/Worker、设备模拟器、ADB bridge、RootCanal/Casimir、frame producer，以及 UWB、modem、network、audio、camera 五个正式 peripheral adapter。
+项目统一构建会发布十四个 HD Windows 运行时：合并多实例管理与 Player 的 `hd.exe`、CLI/Host/Worker、设备模拟器、ADB bridge、RootCanal/Casimir、frame producer，以及 UWB、modem、network、audio、camera 五个正式 peripheral adapter。`hd.exe` 使用 `winit + Wry/WebView2` 呈现 React UI，并通过独立 `NativeDisplayHost` 子 HWND 承载 gfxstream 原生画面。顶部栏、侧栏、设置内容与 Android 区域是互不覆盖的子窗口；发布包包含 `bin/ui`，需要系统安装 Evergreen WebView2 Runtime，但不需要旁置 `WebView2Loader.dll`。
 
 ```bat
 build_all.bat
@@ -60,7 +60,6 @@ latest 构建也可使用 OTA metadata，并从 vendor_boot 提取 fstab。导�
 
 ```powershell
 hd.exe --data-root D:\hd-v2-data
-hd-player.exe --instance-id <INSTANCE_UUID> --data-root D:\hd-v2-data
 hdctl --data-root D:\hd-v2-data health
 hdctl --data-root D:\hd-v2-data create --name Android-1
 hdctl --data-root D:\hd-v2-data list
@@ -71,6 +70,8 @@ hdctl stop <INSTANCE_UUID>
 ```
 
 未配置认证 bundle 时，`start` 返回能力阻塞是正确且可诊断的行为。
+
+开发机优先使用 `C:\workspace\bscp\bscp-vm-artifacts-20260721-aosp-all-targets`，不存在时兼容旧 D 盘路径。`hd.exe` 默认为新启动的 Host 设置 `HD_DEV_FAST_ARTIFACTS=1`，并用其 `vsoc_x86_64/direct-linux` 覆盖 Guest 文件；其中优先采用唯一的 `aggregate_android.sparse.img`，首次启动按需展开为实例私有的可写文件系统 sparse overlay。该包的实际 fingerprint 是 `VanillaIceCream/AP4A.250205.002`、`os_version=15`，不能标记为 Android 17；正式发布仍必须使用签名 bundle 与完整认证。
 
 ## 数据与安全边界
 
@@ -94,7 +95,7 @@ certifications/*.json
 logs/*-v2.jsonl.*
 ```
 
-Host 数据根由 `host.lock` 单写者保护；UI 退出不会停止 Host 或活动 Worker。`hdctl shutdown` 只退出 Host，`hdctl shutdown --stop-all` 才先停止实例。删除实例会删除该实例配置、磁盘、Worker 元数据和运行目录，是不可恢复操作。
+Host 数据根由 `host.lock` 单写者保护；正常关闭 `hd.exe` 会释放显示会话并正常停止当前实例，进程崩溃则由 Worker 保持实例运行。`hdctl shutdown` 只退出 Host，`hdctl shutdown --stop-all` 才先停止实例。删除实例会删除该实例配置、磁盘、Worker 元数据和运行目录，是不可恢复操作。
 
 ## 关键约束
 

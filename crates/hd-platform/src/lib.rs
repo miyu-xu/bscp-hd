@@ -14,12 +14,38 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod native_display_host;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
 
+pub use native_display_host::{NativeDisplayBounds, NativeDisplayHost, create_native_display_host};
+
 pub const HD_DATA_DIR_ENV: &str = "HD_DATA_DIR";
+
+pub fn native_display_toplevel_debug_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        windows::native_display_toplevel_debug_enabled()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub fn mark_file_sparse(file: &std::fs::File, path: &Path) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        windows::mark_file_sparse(file, path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (file, path);
+        Ok(())
+    }
+}
 
 pub fn attach_native_display(
     child_pid: u32,
@@ -39,6 +65,27 @@ pub fn attach_native_display(
     }
 }
 
+/// Completes startup only after gfxstream has created its Vulkan render HWND directly below the
+/// requested native viewport. Unlike `attach_native_display`, this never reparents crosvm's input
+/// window across process boundaries.
+pub fn prepare_native_display(
+    child_pid: u32,
+    target: &NativeDisplayTargetV2,
+    viewport: &DisplayViewportV2,
+) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        windows::prepare_native_display(child_pid, target, viewport)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child_pid, target, viewport);
+        Err(PlatformError::Unsupported(
+            "native display preparation is currently implemented only on Windows",
+        ))
+    }
+}
+
 pub fn resize_native_display(
     child_pid: u32,
     target: &NativeDisplayTargetV2,
@@ -51,6 +98,20 @@ pub fn resize_native_display(
     #[cfg(not(windows))]
     {
         let _ = (child_pid, target, viewport);
+        Err(PlatformError::Unsupported(
+            "native display embedding is currently implemented only on Windows",
+        ))
+    }
+}
+
+pub fn set_native_display_visibility(child_pid: u32, visible: bool) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        windows::set_native_display_visibility(child_pid, visible)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child_pid, visible);
         Err(PlatformError::Unsupported(
             "native display embedding is currently implemented only on Windows",
         ))
@@ -358,6 +419,7 @@ pub trait ProcessSupervisor: Send + Sync {
 pub enum DiskProvisionMethodV2 {
     BlockClone,
     FullCopy,
+    AndroidSparseExpanded,
     ExistingVerified,
 }
 
@@ -665,6 +727,23 @@ pub fn configure_managed_command(command: &mut Command) -> Result<(), PlatformEr
     #[cfg(windows)]
     {
         windows::configure_managed(command);
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        unix::configure_managed(command)
+    }
+}
+
+/// Configures a bounded, short-lived helper process without suspending its initial thread.
+///
+/// Managed long-running processes are created suspended on Windows so they can be assigned to a
+/// kill-on-close Job before execution. Callers of this function await and kill their own helper;
+/// suspending it would deadlock because there is intentionally no containment/resume handshake.
+pub fn configure_transient_command(command: &mut Command) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        windows::configure_transient(command);
         Ok(())
     }
     #[cfg(unix)]

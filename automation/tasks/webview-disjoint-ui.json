@@ -1,0 +1,65 @@
+{
+  "schema_version": 2,
+  "task_id": "webview-disjoint-ui",
+  "objective": "使用互不覆盖的 Wry/WebView2 UI 子窗口和 NativeDisplayHost，保留 gfxstream 原生零复制显示并消除合成层黑屏。",
+  "status": "in_progress",
+  "scope": {
+    "repositories": ["hd", "root-build"],
+    "owned_paths": [
+      "hd/Cargo.toml",
+      "hd/Cargo.lock",
+      "hd/crates/hd-ui/",
+      "hd/crates/hd-platform/",
+      "hd/web/",
+      "hd/build.bat",
+      "hd/scripts/dev-fast.ps1",
+      "hd/xtask/src/main.rs",
+      "hd/README.md",
+      "hd/docs/",
+      "build_all.bat"
+    ],
+    "excluded_paths": ["out/", "target/", "hd/web/node_modules/"]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "windows_uses_mingw_only",
+    "preserve_user_changes",
+    "do_not_push",
+    "do_not_copy_or_readback_android_frame_pixels"
+  ],
+  "acceptance": [
+    {
+      "id": "WEBVIEW-UI-001",
+      "criterion": "Player 页所有可见 WebView HWND 与 NativeDisplayHost HWND 没有矩形交集，隐藏 WebView 停放为 1x1。",
+      "evidence": ["artifact:hd-webview-window-smoke.json"]
+    },
+    {
+      "id": "WEBVIEW-UI-002",
+      "criterion": "真实 Android 在启动、页面切换、折叠、最大化、最小化恢复和显示会话重附加后持续可见。",
+      "evidence": ["gate:windows-real-guest"]
+    },
+    {
+      "id": "WEBVIEW-UI-003",
+      "criterion": "发布目录包含 bin/ui，Host 不接触帧像素且 copy/readback/software-blit 计数保持零。",
+      "evidence": ["gate:hd-quality", "gate:zero-copy"]
+    }
+  ],
+  "required_gates": ["hd-quality", "windows-real-guest", "zero-copy"],
+  "evidence_state": {
+    "code_present": true,
+    "tests_authored": true,
+    "contract_smoke_verified": false,
+    "real_guest_verified": true
+  },
+  "direction_decisions": [
+    {
+      "id": "D-WEBVIEW-UI-001",
+      "decision": "保留 WebView UI，但把顶部、侧栏、内容和 Android 原生区域拆成物理不重叠的子窗口；不引入 Qt，也不复制帧像素。",
+      "owner": "human",
+      "rationale": "保留跨平台 React UI 和现有设置能力，同时绕开 WebView 合成层覆盖原生 Vulkan 子窗口造成的黑屏与闪烁。"
+    }
+  ],
+  "blockers": [],
+  "human_decisions_needed": [],
+  "next_iteration": "完成 Windows 功能矩阵、发布打包、PE audit 与最终真实 Guest 门禁。"
+}

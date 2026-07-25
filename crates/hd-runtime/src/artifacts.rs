@@ -6,12 +6,15 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hd_core::{
-    ARTIFACT_INDEX_VERSION, ArtifactBundleKindV2, ArtifactBundleV2, ArtifactReadyMarkerV2,
-    ArtifactSelectionV2, DiagnosticCheckV2, DiagnosticStatusV2, ResolvedGuestArtifactsV2,
+    ARTIFACT_INDEX_VERSION, ArtifactBundleKindV2, ArtifactBundleV2, ArtifactFileV2,
+    ArtifactReadyMarkerV2, ArtifactSelectionV2, DiagnosticCheckV2, DiagnosticStatusV2,
+    ResolvedGuestArtifactsV2,
 };
+use hd_platform::DataPaths;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use time::OffsetDateTime;
 
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MANIFEST_FILE: &str = "manifest-v2.json";
@@ -100,6 +103,317 @@ pub struct ResolvedBundleSetV2 {
     pub guest_manifest: ArtifactBundleV2,
     pub host_manifest: ArtifactBundleV2,
     pub artifacts: ResolvedGuestArtifactsV2,
+}
+
+/// Creates manifest-only bundle records for an explicitly enabled local direct-image workflow.
+/// The normal resolver never calls this path and continues to require signed bundles.
+#[allow(clippy::too_many_lines)]
+pub fn prepare_direct_dev_artifact_store(
+    paths: &DataPaths,
+) -> Result<ArtifactSelectionV2, ArtifactError> {
+    if !crate::dev::fast_artifacts_enabled() {
+        return Err(ArtifactError::Manifest(
+            "direct development artifacts require HD_DEV_FAST_ARTIFACTS=1".to_owned(),
+        ));
+    }
+    let guest_root = required_env_path("HD_DEV_GUEST_BUNDLE_ROOT")?;
+    let host_root = required_env_path("HD_DEV_HOST_TOOLS_ROOT")?;
+    let rootfs = std::env::var_os("HD_DEV_GUEST_ROOTFS")
+        .map_or_else(|| guest_root.join("aggregate_android.img"), PathBuf::from);
+    let sensor = std::env::var_os("HD_DEV_SENSOR_INJECTOR")
+        .map_or_else(|| host_root.join("hd-sensor-injector"), PathBuf::from);
+    let adb = required_env_path("HD_DEV_ADB")?;
+    let aapt2 = required_env_path("HD_DEV_AAPT2")?;
+    let adb_root = adb.parent().ok_or_else(|| {
+        ArtifactError::Manifest(format!("ADB path has no parent: {}", adb.display()))
+    })?;
+
+    let guest_specs = [
+        (
+            "kernel",
+            PathBuf::from("kernel"),
+            guest_root.join("kernel"),
+            true,
+        ),
+        (
+            "initrd",
+            PathBuf::from("initrd_android.img"),
+            guest_root.join("initrd_android.img"),
+            false,
+        ),
+        (
+            "rootfs",
+            PathBuf::from("aggregate_android.img"),
+            rootfs,
+            false,
+        ),
+        (
+            "android_fstab",
+            PathBuf::from("android_fstab.dt"),
+            guest_root.join("android_fstab.dt"),
+            false,
+        ),
+        (
+            "sensor-injector",
+            PathBuf::from("hd-sensor-injector"),
+            sensor,
+            true,
+        ),
+    ];
+    let host_specs = [
+        ("crosvm", "crosvm.exe", host_root.join("crosvm.exe"), true),
+        ("adb", "adb.exe", adb.clone(), true),
+        ("aapt2", "aapt2.exe", aapt2, true),
+        (
+            "hd-device-sim",
+            "hd-device-sim.exe",
+            host_root.join("hd-device-sim.exe"),
+            true,
+        ),
+        (
+            "frame-producer",
+            "hd-frame-producer.exe",
+            host_root.join("hd-frame-producer.exe"),
+            true,
+        ),
+        (
+            "adb-bridge",
+            "hd-adb-bridge.exe",
+            host_root.join("hd-adb-bridge.exe"),
+            true,
+        ),
+        (
+            "rootcanal-adapter",
+            "hd-rootcanal-adapter.exe",
+            host_root.join("hd-rootcanal-adapter.exe"),
+            true,
+        ),
+        (
+            "casimir-adapter",
+            "hd-casimir-adapter.exe",
+            host_root.join("hd-casimir-adapter.exe"),
+            true,
+        ),
+        (
+            "modem-adapter",
+            "hd-modem-adapter.exe",
+            host_root.join("hd-modem-adapter.exe"),
+            true,
+        ),
+        (
+            "uwb-adapter",
+            "hd-uwb-adapter.exe",
+            host_root.join("hd-uwb-adapter.exe"),
+            true,
+        ),
+        (
+            "gfxstream-backend",
+            "libgfxstream_backend.dll",
+            host_root.join("libgfxstream_backend.dll"),
+            false,
+        ),
+        (
+            "angle-egl",
+            "libEGL.dll",
+            host_root.join("libEGL.dll"),
+            false,
+        ),
+        (
+            "angle-glesv2",
+            "libGLESv2.dll",
+            host_root.join("libGLESv2.dll"),
+            false,
+        ),
+        (
+            "angle-vulkan-loader",
+            "vulkan-1.dll",
+            host_root.join("vulkan-1.dll"),
+            false,
+        ),
+        (
+            "crosvm-runtime-slirp",
+            "libslirp-0.dll",
+            host_root.join("libslirp-0.dll"),
+            false,
+        ),
+        (
+            "crosvm-runtime-audio",
+            "r8Brain.dll",
+            host_root.join("r8Brain.dll"),
+            false,
+        ),
+        (
+            "gnu-runtime-stdcpp",
+            "libstdc++-6.dll",
+            host_root.join("libstdc++-6.dll"),
+            false,
+        ),
+        (
+            "gnu-runtime-gcc",
+            "libgcc_s_seh-1.dll",
+            host_root.join("libgcc_s_seh-1.dll"),
+            false,
+        ),
+        (
+            "gnu-runtime-winpthread",
+            "libwinpthread-1.dll",
+            host_root.join("libwinpthread-1.dll"),
+            false,
+        ),
+        (
+            "adb-winapi",
+            "AdbWinApi.dll",
+            adb_root.join("AdbWinApi.dll"),
+            false,
+        ),
+        (
+            "adb-winusb",
+            "AdbWinUsbApi.dll",
+            adb_root.join("AdbWinUsbApi.dll"),
+            false,
+        ),
+    ];
+    let guest_files = guest_specs
+        .into_iter()
+        .map(|(role, relative, actual, executable)| {
+            dev_artifact_file(role, relative, &actual, executable)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let host_files = host_specs
+        .into_iter()
+        .map(|(role, relative, actual, executable)| {
+            dev_artifact_file(role, PathBuf::from(relative), &actual, executable)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let guest = finish_dev_manifest(ArtifactBundleV2 {
+        schema_version: ARTIFACT_INDEX_VERSION,
+        digest: String::new(),
+        kind: ArtifactBundleKindV2::Guest,
+        platform: "android".to_owned(),
+        architecture: if cfg!(target_os = "macos") {
+            "arm64"
+        } else {
+            "x86_64"
+        }
+        .to_owned(),
+        source_manifest_digest: hex::encode(Sha256::digest(b"hd-direct-dev-guest-v2")),
+        files: guest_files,
+        capabilities: vec![
+            "android-15.0.0_r14".to_owned(),
+            "hd-guest-profile-v2".to_owned(),
+            "hd-device-bridge-v2".to_owned(),
+        ],
+        signer_key_id: "dev-fast-unsigned".to_owned(),
+        signature_ed25519: String::new(),
+    })?;
+    let frame_capability = match hd_platform::platform_name() {
+        "windows" => "frame-vulkan-win32-v2",
+        "linux" => "frame-vulkan-dmabuf-v2",
+        "macos" => "frame-metal-iosurface-v2",
+        _ => return Err(ArtifactError::UnsupportedHost),
+    };
+    let host = finish_dev_manifest(ArtifactBundleV2 {
+        schema_version: ARTIFACT_INDEX_VERSION,
+        digest: String::new(),
+        kind: ArtifactBundleKindV2::HostTools,
+        platform: hd_platform::platform_name().to_owned(),
+        architecture: hd_platform::architecture_name().to_owned(),
+        source_manifest_digest: hex::encode(Sha256::digest(b"hd-direct-dev-host-v2")),
+        files: host_files,
+        capabilities: vec![
+            "hd-host-tools-v2".to_owned(),
+            "input-external-v2".to_owned(),
+            "device-profile-cf-phone-v2".to_owned(),
+            frame_capability.to_owned(),
+            "adb-loopback-vsock-v2".to_owned(),
+        ],
+        signer_key_id: "dev-fast-unsigned".to_owned(),
+        signature_ed25519: String::new(),
+    })?;
+    let store_root = paths.cache.join("direct-dev-artifacts-v2");
+    write_dev_bundle(&store_root, &guest)?;
+    write_dev_bundle(&store_root, &host)?;
+    let trust_path = paths.root.join("trusted-keys-v2.json");
+    if !trust_path.exists() {
+        // A valid deterministic public key lets the trust document parse. Fast development bundle
+        // resolution intentionally does not verify the unsigned manifest; production resolution does.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]).verifying_key();
+        let trust = serde_json::json!({
+            "schema_version": ARTIFACT_INDEX_VERSION,
+            "keys": { "dev-fast-unsigned": BASE64.encode(key.as_bytes()) }
+        });
+        hd_platform::write_owner_only(
+            &trust_path,
+            &serde_json::to_vec_pretty(&trust).map_err(ArtifactError::Encode)?,
+        )?;
+    }
+    Ok(ArtifactSelectionV2 {
+        store_root,
+        guest_bundle_digest: guest.digest,
+        host_bundle_digest: host.digest,
+    })
+}
+
+fn required_env_path(name: &'static str) -> Result<PathBuf, ArtifactError> {
+    std::env::var_os(name).map(PathBuf::from).ok_or_else(|| {
+        ArtifactError::Manifest(format!(
+            "{name} is required for direct development artifacts"
+        ))
+    })
+}
+
+fn dev_artifact_file(
+    role: &str,
+    relative_path: PathBuf,
+    actual_path: &Path,
+    executable: bool,
+) -> Result<ArtifactFileV2, ArtifactError> {
+    let metadata = regular_dev_file_metadata(actual_path, role)?;
+    Ok(ArtifactFileV2 {
+        role: role.to_owned(),
+        relative_path,
+        sha256: "00".repeat(32),
+        size_bytes: metadata.len(),
+        executable,
+    })
+}
+
+fn regular_dev_file_metadata(path: &Path, role: &str) -> Result<std::fs::Metadata, ArtifactError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| ArtifactError::Io {
+        operation: "inspect direct development artifact",
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(ArtifactError::Manifest(format!(
+            "direct development role {role} is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(metadata)
+}
+
+fn finish_dev_manifest(mut manifest: ArtifactBundleV2) -> Result<ArtifactBundleV2, ArtifactError> {
+    manifest.digest = hex::encode(Sha256::digest(canonical_payload(&manifest)?));
+    Ok(manifest)
+}
+
+fn write_dev_bundle(store_root: &Path, manifest: &ArtifactBundleV2) -> Result<(), ArtifactError> {
+    let root = store_root.join("bundles").join(&manifest.digest);
+    hd_platform::ensure_owner_only_directory(&root)?;
+    let manifest_bytes = serde_json::to_vec_pretty(manifest).map_err(ArtifactError::Encode)?;
+    hd_platform::write_owner_only(&root.join(MANIFEST_FILE), &manifest_bytes)?;
+    let ready = ArtifactReadyMarkerV2 {
+        schema_version: ARTIFACT_INDEX_VERSION,
+        bundle_digest: manifest.digest.clone(),
+        manifest_sha256: hex::encode(Sha256::digest(&manifest_bytes)),
+        published_at: OffsetDateTime::now_utc(),
+    };
+    hd_platform::write_owner_only(
+        &root.join(READY_FILE),
+        &serde_json::to_vec_pretty(&ready).map_err(ArtifactError::Encode)?,
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -238,10 +552,24 @@ impl ArtifactResolver {
         let host_file_root = std::env::var_os("HD_DEV_HOST_TOOLS_ROOT")
             .map_or_else(|| host_root.clone(), PathBuf::from);
         let mut guest_files = role_map(&guest_file_root, &guest)?;
+        if let Some(path) = std::env::var_os("HD_DEV_GUEST_ROOTFS") {
+            guest_files.insert("rootfs".to_owned(), PathBuf::from(path));
+        }
         if let Some(path) = std::env::var_os("HD_DEV_SENSOR_INJECTOR") {
             guest_files.insert("sensor-injector".to_owned(), PathBuf::from(path));
         }
-        let host_tools = role_map(&host_file_root, &host)?;
+        let mut host_tools = role_map(&host_file_root, &host)?;
+        if let Some(path) = std::env::var_os("HD_DEV_ADB") {
+            let path = PathBuf::from(path);
+            if let Some(parent) = path.parent() {
+                host_tools.insert("adb-winapi".to_owned(), parent.join("AdbWinApi.dll"));
+                host_tools.insert("adb-winusb".to_owned(), parent.join("AdbWinUsbApi.dll"));
+            }
+            host_tools.insert("adb".to_owned(), path);
+        }
+        if let Some(path) = std::env::var_os("HD_DEV_AAPT2") {
+            host_tools.insert("aapt2".to_owned(), PathBuf::from(path));
+        }
         require_dev_files(&guest_files, "guest")?;
         require_dev_files(&host_tools, "host tool")?;
         for role in [

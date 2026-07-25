@@ -51,7 +51,7 @@ Windows release：
 build.bat
 ```
 
-它构建整个 workspace，并用 MinGW `objdump -p` 审计所有 exe；任何 `VCRUNTIME`、`MSVCP`、`CONCRT` 或 `MFC` import 都阻断。根 `build_all.bat` 还编译 bscp/crosvm/可选 gfxstream，并验证发布目录包含十五个 HD 运行时 exe。
+它先构建 React/Vite bundle，再构建整个 Rust workspace，并用 MinGW `objdump -p` 审计所有 exe；任何 `VCRUNTIME`、`MSVCP`、`CONCRT` 或 `MFC` import 都阻断。根 `build_all.bat` 还验证发布目录包含十四个 HD 运行时 exe 与 `bin/ui/index.html`。Wry 静态链接 WebView2 loader，不需要旁置 `WebView2Loader.dll`，运行机需要 Evergreen WebView2 Runtime。
 
 portable Rust 编译：
 

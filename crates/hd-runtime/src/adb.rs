@@ -610,6 +610,12 @@ async fn run_capped(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    hd_platform::configure_transient_command(command.as_std_mut()).map_err(|source| {
+        AdbError::Spawn {
+            executable: executable.to_owned(),
+            source: std::io::Error::other(source),
+        }
+    })?;
     let mut child = command.spawn().map_err(|source| AdbError::Spawn {
         executable: executable.to_owned(),
         source,

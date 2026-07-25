@@ -2,7 +2,7 @@
 
 ## 启动与连接
 
-发布目录中的十五个 HD exe 必须保持同目录。`hd.exe` 是多实例 Manager，双击实例或使用“打开 Player”会启动 `hd-player.exe --instance-id <UUID>`；重复打开会激活已有 Player。二者与不带 `--no-start-host` 的 `hdctl` 都会先验证现有 `host-runtime-v2.json` 和进程身份；没有有效 Host 时拉起同目录 `hd-host.exe`。Host 在实例 start 时拉起同目录 `hd-worker.exe`。签名 Host bundle 必须登记 ADB、Casimir、RootCanal、frame producer 以及 UWB/modem/network/audio/camera 的对应正式角色。
+发布目录中的十四个 HD exe 与 `ui/` 必须保持同目录。`hd.exe` 合并多实例 Manager 和 Player：选择实例即启动并在同一窗口附加原生 Android 显示，关闭 `hd.exe` 会先释放显示会话，再正常关闭当前实例。`hd.exe` 与不带 `--no-start-host` 的 `hdctl` 都会先验证现有 `host-runtime-v2.json` 和进程身份；没有有效 Host 时拉起同目录 `hd-host.exe`。Host 在实例 start 时拉起同目录 `hd-worker.exe`。
 
 ```powershell
 hdctl health
@@ -21,7 +21,7 @@ hdctl diagnostics --instance-id <UUID>
 hdctl stop <UUID>
 ```
 
-`hd.exe --data-root <PATH>`、`hd-player.exe --instance-id <UUID> --data-root <PATH>` 与 `hdctl --data-root <PATH>` 选择同一个隔离数据根；不传时都使用 `%LOCALAPPDATA%\bscp\hd`。打开 Player 会自动提交实例启动；关闭 Player 会先释放显示会话，再对该实例执行正常关机，实例停止后窗口才退出。需要无界面后台实例时使用 `hdctl` 启动，不通过关闭 Player 隐藏。`--no-start-host` 要求 CLI 只连接而不拉起 Host。没有活动实例时 `hdctl shutdown` 可退出 Host；存在活动实例时它会拒绝，必须显式使用 `hdctl shutdown --stop-all`。
+`hd.exe --data-root <PATH>` 与 `hdctl --data-root <PATH>` 选择同一个隔离数据根；不传时使用 `%LOCALAPPDATA%\bscp\hd`。需要无界面后台实例时使用 `hdctl` 启动。`--no-start-host` 要求 CLI 只连接而不拉起 Host。没有活动实例时 `hdctl shutdown` 可退出 Host；存在活动实例时它会拒绝，必须显式使用 `hdctl shutdown --stop-all`。
 
 ## 创建可启动实例
 
@@ -219,7 +219,7 @@ runner 依次终止 frame producer、crosvm、Worker 和 Host，验证新 run/fr
 
 ### Windows ABI/缺 DLL
 
-目标必须为 `x86_64-pc-windows-gnu`，十五个 HD exe、crosvm 和依赖 DLL 必须来自同一 MinGW 发布链。运行 `build.bat` 或根 `build_all.bat`；不要用 MSVC DLL 补齐。保留 `objdump -p` PE audit 输出。
+目标必须为 `x86_64-pc-windows-gnu`，十四个 HD exe、原生 UI 图形依赖、crosvm 和依赖 DLL 必须来自同一发布链。运行 `build.bat` 或根 `build_all.bat`；不要用 MSVC DLL 补齐。保留 `objdump -p` PE audit 输出。
 
 ## 日志与诊断
 

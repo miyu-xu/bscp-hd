@@ -88,9 +88,11 @@ impl ObservedStateV2 {
                     )
                     | (AdbConnecting, Ready | Stopping | Blocked | Failed)
                     | (Ready, Pausing | Stopping | Recovering | Failed | Blocked)
-                    | (Pausing, Paused | Stopping | Recovering | Failed)
+                    | (
+                        Pausing | Resuming,
+                        Ready | Paused | Stopping | Recovering | Failed
+                    )
                     | (Paused, Resuming | Stopping | Recovering | Failed)
-                    | (Resuming, Ready | Stopping | Recovering | Failed)
                     | (Stopping, Stopped | Failed)
                     | (
                         Recovering,

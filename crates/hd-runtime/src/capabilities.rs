@@ -79,6 +79,7 @@ impl CapabilityDiscovery {
         let fast_artifacts = crate::dev::fast_artifacts_enabled();
         let fast_capabilities = crate::dev::fast_capabilities_enabled();
         let dev_display_copy_fallback = crate::dev::allow_display_copy_fallback_enabled();
+        let native_display_direct = crate::dev::native_display_direct_enabled();
         let mut probes = Vec::new();
         probes.push(platform_baseline_probe());
         probes.push(hypervisor_probe());
@@ -164,7 +165,17 @@ impl CapabilityDiscovery {
                                     ),
                                 ]),
                             ));
-                            if dev_display_copy_fallback {
+                            if native_display_direct {
+                                probes.push(supported_probe(
+                                    "display.zero_copy",
+                                    true,
+                                    "Windows native child HWND is rendered directly by crosvm/gfxstream",
+                                    BTreeMap::from([(
+                                        "mode".to_owned(),
+                                        "native_child_hwnd".to_owned(),
+                                    )]),
+                                ));
+                            } else if dev_display_copy_fallback {
                                 probes.push(supported_probe(
                                     "display.zero_copy",
                                     true,

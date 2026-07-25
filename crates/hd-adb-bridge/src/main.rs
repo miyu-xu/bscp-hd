@@ -15,7 +15,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 
 const LAUNCH_LIMIT: u64 = 64 * 1024;
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+// The first invocation of the large Windows crosvm binary can spend more than ten seconds in
+// loader/AV scanning before it reaches the already-running VM control pipe.  Keep this aligned
+// with the runtime control timeout so a cold helper launch does not leave ADB permanently offline.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -209,23 +212,23 @@ async fn bridge_connection(mut tcp: TcpStream, context: &BridgeContext) -> Resul
         vm_control_endpoint = %context.vm_control_endpoint,
         "requesting crosvm connect_vsock"
     );
-    let status = tokio::time::timeout(
-        CONTROL_TIMEOUT,
-        Command::new(&context.crosvm_executable)
-            .args([
-                "connect_vsock",
-                &context.guest_port.to_string(),
-                &context.vm_control_endpoint,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .status(),
-    )
-    .await
-    .context("crosvm connect_vsock timed out")?
-    .context("start crosvm connect_vsock")?;
+    let mut command = Command::new(&context.crosvm_executable);
+    command
+        .args([
+            "connect_vsock",
+            &context.guest_port.to_string(),
+            &context.vm_control_endpoint,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    hd_platform::configure_transient_command(command.as_std_mut())
+        .context("configure hidden crosvm connect_vsock process")?;
+    let status = tokio::time::timeout(CONTROL_TIMEOUT, command.status())
+        .await
+        .context("crosvm connect_vsock timed out")?
+        .context("start crosvm connect_vsock")?;
     if status.success() {
         tracing::info!(
             event = "adb.bridge.connect_vsock.succeeded",

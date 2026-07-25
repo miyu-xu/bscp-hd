@@ -3126,7 +3126,6 @@ fn package(root: &Path, target_dir: &Path, output: &Path) -> Result<()> {
         .with_context(|| format!("create package directory {}", output.display()))?;
     for name in [
         "hd.exe",
-        "hd-player.exe",
         "hdctl.exe",
         "hd-host.exe",
         "hd-worker.exe",
@@ -3149,12 +3148,16 @@ fn package(root: &Path, target_dir: &Path, output: &Path) -> Result<()> {
     for name in ["README.md", "LICENSE", "AGENTS.md"] {
         std::fs::copy(root.join(name), output.join(name))?;
     }
+    let web_dist = root.join("web").join("dist");
+    if !web_dist.join("index.html").is_file() {
+        bail!(
+            "HD WebView assets are missing at {}; run npm run build in web first",
+            web_dist.display()
+        );
+    }
+    copy_tree(&web_dist, &output.join("ui"))?;
     let notices = output.join("THIRD_PARTY_NOTICES");
     std::fs::create_dir_all(&notices)?;
-    std::fs::copy(
-        root.join("crates/hd-ui/assets/icons/PHOSPHOR-LICENSE.txt"),
-        notices.join("PHOSPHOR-ICONS-LICENSE.txt"),
-    )?;
     copy_tree(&root.join("automation"), &output.join("automation"))?;
     copy_tree(&root.join("docs"), &output.join("docs"))
 }

@@ -1,0 +1,1540 @@
+#![allow(unsafe_code)]
+
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context as _, Result};
+use clap::Parser;
+use hd_core::{
+    ArtifactSelectionV2, CreateInstanceRequestV2, DiagnosticRequestV2, DisplaySessionV2,
+    DisplayViewportV2, InstanceActionV2, InstanceRecordV2, InstanceSpecV2, InstanceSummaryV2,
+    KeyActionV2, NativeDisplayTargetV2, OperationKindV2, OrientationV2, StopModeV2,
+    UpdateInstanceRequestV2,
+};
+use hd_platform::{
+    DataPaths, NativeDisplayBounds, NativeDisplayHost, create_native_display_host,
+    current_process_identity,
+};
+use hd_runtime::HostClientV2;
+use raw_window_handle::HasWindowHandle as _;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::runtime::Runtime;
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
+use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::event::{Event, WindowEvent};
+use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
+use winit::window::{Fullscreen, Window};
+use wry::dpi::{PhysicalPosition as WebPosition, PhysicalSize as WebSize};
+use wry::http::{Request, Response, header::CONTENT_TYPE};
+use wry::{Rect, WebView, WebViewBuilder};
+
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DISPLAY_RETRY: Duration = Duration::from_millis(500);
+const DISPLAY_HEARTBEAT: Duration = Duration::from_secs(5);
+const TOP_BAR_LOGICAL: f64 = 48.0;
+const SIDEBAR_LOGICAL: f64 = 260.0;
+const SURFACE_GAP_PX: u32 = 0;
+const DEFAULT_DEV_ARTIFACTS: &str =
+    r"C:\workspace\bscp\bscp-vm-artifacts-20260721-aosp-all-targets";
+const FALLBACK_DEV_ARTIFACTS: &str =
+    r"D:\bscp-vm-artifacts\bscp-vm-artifacts-20260721-aosp-all-targets";
+const DEFAULT_ARTIFACT_STORE: &str = r"D:\hd-v2-artifact-store";
+const DEFAULT_GUEST_DIGEST: &str =
+    "22281c84556c6e865e4f94498968efc2f651ef4c37bd3e871d930414609b2986";
+const DEFAULT_HOST_DIGEST: &str =
+    "5187de8d05cf29fdbed127c72ab0a96b50fa37f800137079488237208ae1aa7e";
+static DIRECT_DEV_SELECTION: OnceLock<ArtifactSelectionV2> = OnceLock::new();
+
+#[derive(Debug, Parser)]
+#[allow(clippy::struct_field_names)]
+#[command(name = "hd", version, about = "HD Android WebView desktop shell")]
+struct Cli {
+    #[arg(long)]
+    data_root: Option<PathBuf>,
+    #[arg(long)]
+    web_root: Option<PathBuf>,
+    #[arg(long)]
+    dev_artifacts_root: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+enum UserEvent {
+    Ipc(String),
+    Refreshed(Result<(Vec<InstanceSummaryV2>, Option<InstanceRecordV2>), String>),
+    Created(Result<InstanceRecordV2, String>),
+    Saved(Result<InstanceRecordV2, String>),
+    CommandFinished(Result<String, String>),
+    DisplayFinished {
+        instance_id: Uuid,
+        viewport: DisplayViewportV2,
+        result: Result<DisplaySessionV2, String>,
+    },
+    ShutdownFinished(Result<(), String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Page {
+    Player,
+    Settings,
+    Devices,
+    Diagnostics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurfaceLayout {
+    width: u32,
+    height: u32,
+    top_height: u32,
+    sidebar_width: u32,
+    page: Page,
+    sidebar_collapsed: bool,
+}
+
+impl SurfaceLayout {
+    fn from_window(size: PhysicalSize<u32>, scale: f64, page: Page, collapsed: bool) -> Self {
+        let top_height = logical_to_physical(TOP_BAR_LOGICAL, scale).min(size.height);
+        let sidebar_width = if collapsed {
+            0
+        } else {
+            logical_to_physical(SIDEBAR_LOGICAL, scale).min(size.width)
+        };
+        Self {
+            width: size.width,
+            height: size.height,
+            top_height,
+            sidebar_width,
+            page,
+            sidebar_collapsed: collapsed,
+        }
+    }
+
+    fn body_y(self) -> u32 {
+        self.top_height
+            .saturating_add(SURFACE_GAP_PX)
+            .min(self.height)
+    }
+
+    fn content_x(self) -> u32 {
+        self.sidebar_width
+            .saturating_add(SURFACE_GAP_PX)
+            .min(self.width)
+    }
+
+    fn body_height(self) -> u32 {
+        self.height.saturating_sub(self.body_y())
+    }
+
+    fn content_width(self) -> u32 {
+        self.width.saturating_sub(self.content_x())
+    }
+}
+
+struct WebSurfaces {
+    top: WebView,
+    sidebar: WebView,
+    content: WebView,
+    last_layout: Option<SurfaceLayout>,
+}
+
+impl WebSurfaces {
+    fn new(window: &Window, web_root: &Path, proxy: &EventLoopProxy<UserEvent>) -> Result<Self> {
+        let tiny = web_rect(0, 0, 1, 1);
+        Ok(Self {
+            top: build_webview(window, web_root, "top", tiny, proxy)?,
+            sidebar: build_webview(window, web_root, "sidebar", tiny, proxy)?,
+            content: build_webview(window, web_root, "content", tiny, proxy)?,
+            last_layout: None,
+        })
+    }
+
+    fn apply_layout(&mut self, layout: SurfaceLayout) -> Result<()> {
+        if self.last_layout == Some(layout) {
+            return Ok(());
+        }
+        self.top.set_bounds(web_rect(
+            0,
+            0,
+            layout.width.max(1),
+            layout.top_height.max(1),
+        ))?;
+        self.top
+            .set_visible(layout.width > 0 && layout.top_height > 0)?;
+
+        let sidebar_visible =
+            !layout.sidebar_collapsed && layout.sidebar_width > 0 && layout.body_height() > 0;
+        self.sidebar.set_bounds(if sidebar_visible {
+            web_rect(
+                0,
+                layout.body_y(),
+                layout.sidebar_width,
+                layout.body_height(),
+            )
+        } else {
+            web_rect(0, 0, 1, 1)
+        })?;
+        self.sidebar.set_visible(sidebar_visible)?;
+
+        let content_visible =
+            layout.page != Page::Player && layout.content_width() > 0 && layout.body_height() > 0;
+        self.content.set_bounds(if content_visible {
+            web_rect(
+                layout.content_x(),
+                layout.body_y(),
+                layout.content_width(),
+                layout.body_height(),
+            )
+        } else {
+            web_rect(0, 0, 1, 1)
+        })?;
+        self.content.set_visible(content_visible)?;
+        self.last_layout = Some(layout);
+        Ok(())
+    }
+
+    fn broadcast(&self, message: &Value) {
+        let script = format!("window.__hdReceive?.({message});");
+        for surface in [&self.top, &self.sidebar, &self.content] {
+            if let Err(error) = surface.evaluate_script(&script) {
+                warn!(%error, "send state to HD WebView surface failed");
+            }
+        }
+    }
+}
+
+struct ShellState {
+    runtime: Runtime,
+    client: HostClientV2,
+    proxy: EventLoopProxy<UserEvent>,
+    native_display: Box<dyn NativeDisplayHost>,
+    display_target: NativeDisplayTargetV2,
+    summaries: Vec<InstanceSummaryV2>,
+    selected_id: Option<Uuid>,
+    selected: Option<InstanceRecordV2>,
+    status: String,
+    artifact_hint: Option<String>,
+    viewport: Option<DisplayViewportV2>,
+    session: Option<DisplaySessionV2>,
+    last_session_viewport: Option<DisplayViewportV2>,
+    viewport_revision: u64,
+    last_refresh: Instant,
+    last_display_attempt: Instant,
+    last_session_touch: Instant,
+    refresh_in_flight: bool,
+    command_in_flight: bool,
+    display_in_flight: bool,
+    reset_display_after_command: bool,
+    root_was_minimized: bool,
+    auto_start_selected: bool,
+    closing: bool,
+    fullscreen: bool,
+    sidebar_collapsed: bool,
+    page: Page,
+    apk_path: Option<PathBuf>,
+    include_guest_logs: bool,
+    ui_dirty: bool,
+    ready_surfaces: BTreeSet<String>,
+}
+
+#[allow(deprecated, clippy::too_many_lines)]
+pub(crate) fn run() -> Result<()> {
+    let cli = Cli::parse();
+    let dev_artifacts = cli.dev_artifacts_root.unwrap_or_else(|| {
+        [DEFAULT_DEV_ARTIFACTS, FALLBACK_DEV_ARTIFACTS]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_dir())
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DEV_ARTIFACTS))
+    });
+    let artifact_hint = configure_fast_dev_artifacts(&dev_artifacts);
+    let paths = cli
+        .data_root
+        .map_or_else(DataPaths::discover, |root| Ok(DataPaths::from_root(root)))
+        .context("discover HD data directory")?;
+    paths.ensure().context("create HD data directories")?;
+    if artifact_hint.is_some() {
+        let selection = hd_runtime::prepare_direct_dev_artifact_store(&paths)
+            .context("prepare direct Android development artifacts")?;
+        let _ = DIRECT_DEV_SELECTION.set(selection);
+    }
+    let web_root = resolve_web_root(cli.web_root).context("locate HD WebView assets")?;
+    let _log_guard = init_logging(&paths)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("hd-web-ui-runtime")
+        .build()
+        .context("create HD UI runtime")?;
+    let client = runtime
+        .block_on(HostClientV2::connect_or_start(paths))
+        .context("connect to HD Host")?;
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("create HD event loop")?;
+    let proxy = event_loop.create_proxy();
+    let window = Arc::new(
+        event_loop
+            .create_window(
+                Window::default_attributes()
+                    .with_title("HD Android")
+                    .with_decorations(false)
+                    .with_visible(false)
+                    .with_inner_size(LogicalSize::new(1360.0, 860.0))
+                    .with_min_inner_size(LogicalSize::new(920.0, 620.0)),
+            )
+            .context("create HD root window")?,
+    );
+    let raw_parent = window
+        .window_handle()
+        .context("read HD root window handle")?
+        .as_raw();
+    let native_display =
+        create_native_display_host(raw_parent).context("create HD NativeDisplayHost")?;
+    let identity = current_process_identity(Uuid::new_v4())
+        .map_err(|error| anyhow::anyhow!("identify HD UI process: {error}"))?;
+    let display_target = native_display_target(native_display.handle(), identity);
+    let mut webviews = WebSurfaces::new(window.as_ref(), &web_root, &proxy)?;
+
+    let now = Instant::now();
+    let mut shell = ShellState {
+        runtime,
+        client,
+        proxy,
+        native_display,
+        display_target,
+        summaries: Vec::new(),
+        selected_id: None,
+        selected: None,
+        status: "正在连接 HD Host…".to_owned(),
+        artifact_hint,
+        viewport: None,
+        session: None,
+        last_session_viewport: None,
+        viewport_revision: 0,
+        last_refresh: now.checked_sub(POLL_INTERVAL).unwrap_or(now),
+        last_display_attempt: now.checked_sub(DISPLAY_RETRY).unwrap_or(now),
+        last_session_touch: now,
+        refresh_in_flight: false,
+        command_in_flight: false,
+        display_in_flight: false,
+        reset_display_after_command: false,
+        root_was_minimized: false,
+        auto_start_selected: true,
+        closing: false,
+        fullscreen: false,
+        sidebar_collapsed: false,
+        page: Page::Player,
+        apk_path: None,
+        include_guest_logs: true,
+        ui_dirty: true,
+        ready_surfaces: BTreeSet::new(),
+    };
+    shell.request_refresh();
+    apply_window_layout(&window, &mut webviews, &mut shell);
+
+    event_loop.run(move |event, active| {
+        active.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(100),
+        ));
+        match event {
+            Event::WindowEvent { window_id, event } if window_id == window.id() => match event {
+                WindowEvent::CloseRequested => shell.begin_close(),
+                WindowEvent::DroppedFile(path) => {
+                    if path.extension().is_some_and(|extension| {
+                        extension.to_string_lossy().eq_ignore_ascii_case("apk")
+                    }) {
+                        shell.apk_path = Some(path.clone());
+                        shell.notice(format!("已选择 APK：{}", path.display()));
+                    }
+                }
+                WindowEvent::Resized(size) => {
+                    if size.width == 0 || size.height == 0 {
+                        shell.suspend_display_for_minimize();
+                    } else {
+                        shell.root_was_minimized = false;
+                        apply_window_layout(&window, &mut webviews, &mut shell);
+                    }
+                }
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    apply_window_layout(&window, &mut webviews, &mut shell);
+                }
+                _ => {}
+            },
+            Event::UserEvent(UserEvent::Ipc(message)) => {
+                handle_ipc(&message, &window, &mut shell);
+                apply_window_layout(&window, &mut webviews, &mut shell);
+            }
+            Event::UserEvent(event) => {
+                match event {
+                    UserEvent::Refreshed(result) => shell.on_refresh(result),
+                    UserEvent::Created(result) => shell.on_created(result),
+                    UserEvent::Saved(result) => shell.on_saved(result),
+                    UserEvent::CommandFinished(result) => shell.on_command_finished(result),
+                    UserEvent::DisplayFinished {
+                        instance_id,
+                        viewport,
+                        result,
+                    } => shell.on_display_finished(instance_id, viewport, result),
+                    UserEvent::ShutdownFinished(Ok(())) => active.exit(),
+                    UserEvent::ShutdownFinished(Err(error)) => {
+                        shell.closing = false;
+                        shell.command_in_flight = false;
+                        shell.notice(format!("关闭 Android 失败：{error}"));
+                    }
+                    UserEvent::Ipc(_) => unreachable!(),
+                }
+                apply_window_layout(&window, &mut webviews, &mut shell);
+            }
+            Event::AboutToWait => {
+                shell.poll();
+                apply_window_layout(&window, &mut webviews, &mut shell);
+                shell.flush_web_state(&webviews);
+            }
+            _ => {}
+        }
+    })?;
+    Ok(())
+}
+
+fn build_webview(
+    window: &Window,
+    web_root: &Path,
+    surface: &str,
+    bounds: Rect,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> Result<WebView> {
+    let url = format!("hd-ui://localhost/index.html?surface={surface}");
+    let proxy = proxy.clone();
+    let assets = web_root.to_owned();
+    WebViewBuilder::new()
+        .with_custom_protocol("hd-ui".to_owned(), move |_id, request| {
+            web_asset_response(&assets, &request)
+        })
+        .with_url(url)
+        .with_bounds(bounds)
+        .with_focused(false)
+        .with_ipc_handler(move |request| {
+            let _ = proxy.send_event(UserEvent::Ipc(request.body().clone()));
+        })
+        .build_as_child(window)
+        .with_context(|| format!("create {surface} HD WebView surface"))
+}
+
+fn web_asset_response(root: &Path, request: &Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
+    let relative = request.uri().path().trim_start_matches('/');
+    let relative = if relative.is_empty() {
+        Path::new("index.html")
+    } else {
+        Path::new(relative)
+    };
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return web_error_response(403, "invalid asset path");
+    }
+    let path = root.join(relative);
+    match std::fs::read(&path) {
+        Ok(bytes) => Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, asset_mime(&path))
+            .header("Cache-Control", "no-store")
+            .body(Cow::Owned(bytes))
+            .unwrap_or_else(|error| web_error_response(500, &error.to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            web_error_response(404, "asset not found")
+        }
+        Err(error) => web_error_response(500, &error.to_string()),
+    }
+}
+
+fn web_error_response(status: u16, message: &str) -> Response<Cow<'static, [u8]>> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Cow::Owned(message.as_bytes().to_vec()))
+        .unwrap_or_else(|_| Response::new(Cow::Owned(b"WebView asset error".to_vec())))
+}
+
+fn asset_mime(path: &Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+fn apply_window_layout(window: &Window, webviews: &mut WebSurfaces, shell: &mut ShellState) {
+    let size = window.inner_size();
+    let layout = SurfaceLayout::from_window(
+        size,
+        window.scale_factor(),
+        shell.page,
+        shell.sidebar_collapsed,
+    );
+    if let Err(error) = webviews.apply_layout(layout) {
+        shell.notice(format!("WebView 布局失败：{error}"));
+    }
+    shell.update_display_layout(layout, window.scale_factor());
+}
+
+fn web_rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
+    Rect {
+        position: WebPosition::new(
+            i32::try_from(x).unwrap_or(i32::MAX),
+            i32::try_from(y).unwrap_or(i32::MAX),
+        )
+        .into(),
+        size: WebSize::new(width.max(1), height.max(1)).into(),
+    }
+}
+
+fn logical_to_physical(value: f64, scale: f64) -> u32 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        (value * scale).round().clamp(1.0, f64::from(u32::MAX)) as u32
+    }
+}
+
+#[cfg(windows)]
+fn native_display_target(handle: u64, owner: hd_core::WorkerIdentityV2) -> NativeDisplayTargetV2 {
+    NativeDisplayTargetV2::WindowsHwnd {
+        hwnd: handle,
+        owner,
+    }
+}
+
+#[cfg(not(windows))]
+fn native_display_target(_handle: u64, _owner: hd_core::WorkerIdentityV2) -> NativeDisplayTargetV2 {
+    unimplemented!("NativeDisplayTarget is not implemented for this platform")
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_ipc(message: &str, window: &Window, shell: &mut ShellState) {
+    let value: Value = match serde_json::from_str(message) {
+        Ok(value) => value,
+        Err(error) => {
+            shell.notice(format!("WebView 命令格式无效：{error}"));
+            return;
+        }
+    };
+    let Some(command) = value.get("command").and_then(Value::as_str) else {
+        shell.notice("WebView 命令缺少 command".to_owned());
+        return;
+    };
+    match command {
+        "ready" => {
+            if let Some(surface) = value
+                .get("surface")
+                .and_then(Value::as_str)
+                .filter(|surface| matches!(*surface, "top" | "sidebar" | "content"))
+            {
+                shell.ready_surfaces.insert(surface.to_owned());
+            }
+            shell.ui_dirty = true;
+            if shell.ready_surfaces.contains("top") && shell.ready_surfaces.contains("sidebar") {
+                // Keep the root hidden until both surfaces visible on the initial Player page have
+                // painted their first document. The content WebView is parked and hidden on this
+                // page; WebView2 is allowed to defer its navigation while hidden, so it must not
+                // block the shell from appearing.
+                window.set_visible(true);
+                window.request_redraw();
+            }
+        }
+        "toggle_sidebar" => {
+            shell.sidebar_collapsed = !shell.sidebar_collapsed;
+            shell.ui_dirty = true;
+        }
+        "page" => {
+            let page = value
+                .get("page")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            if let Some(page) = page {
+                shell.navigate(page);
+            }
+        }
+        "select" => {
+            if let Some(id) = value
+                .get("instance_id")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+            {
+                shell.select(id);
+            }
+        }
+        "create" => {
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("Android")
+                .to_owned();
+            shell.create(name);
+        }
+        "save_spec" => match value
+            .get("spec")
+            .cloned()
+            .ok_or_else(|| "设置命令缺少 spec".to_owned())
+            .and_then(|spec| serde_json::from_value(spec).map_err(|error| error.to_string()))
+        {
+            Ok(spec) => shell.save_spec(spec),
+            Err(error) => shell.notice(format!("设置格式无效：{error}")),
+        },
+        "operation" => {
+            if let Some(kind) = value.get("kind").and_then(Value::as_str) {
+                shell.operation(kind);
+            }
+        }
+        "key" => {
+            if let Some(key) = value.get("key").and_then(Value::as_str) {
+                shell.key(key);
+            }
+        }
+        "rotate" => shell.rotate(),
+        "screenshot" => shell.screenshot(),
+        "install_apk" => {
+            if let Some(path) = value
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty())
+            {
+                shell.apk_path = Some(PathBuf::from(path));
+            }
+            shell.install_selected_apk();
+        }
+        "set_apk_path" => {
+            shell.apk_path = value
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from);
+            shell.ui_dirty = true;
+        }
+        "focus_display" => {
+            let _ = shell.native_display.focus_guest();
+        }
+        "diagnostics" => {
+            shell.include_guest_logs = value
+                .get("include_guest_logs")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            shell.collect_diagnostics();
+        }
+        "action" => match value
+            .get("action")
+            .cloned()
+            .ok_or_else(|| "设备命令缺少 action".to_owned())
+            .and_then(|action| serde_json::from_value(action).map_err(|error| error.to_string()))
+        {
+            Ok(action) => shell.action(action, "设备命令已发送"),
+            Err(error) => shell.notice(format!("设备命令格式无效：{error}")),
+        },
+        "window" => match value.get("action").and_then(Value::as_str) {
+            Some("drag") => {
+                if let Err(error) = window.drag_window() {
+                    shell.notice(format!("移动窗口失败：{error}"));
+                }
+            }
+            Some("minimize") => window.set_minimized(true),
+            Some("maximize") => window.set_maximized(!window.is_maximized()),
+            Some("fullscreen") => {
+                shell.fullscreen = !shell.fullscreen;
+                window.set_fullscreen(shell.fullscreen.then_some(Fullscreen::Borderless(None)));
+            }
+            Some("close") => shell.begin_close(),
+            Some(action) => shell.notice(format!("未知窗口操作：{action}")),
+            None => shell.notice("窗口命令缺少 action".to_owned()),
+        },
+        other => shell.notice(format!("未知 WebView 命令：{other}")),
+    }
+}
+
+impl ShellState {
+    fn navigate(&mut self, page: Page) {
+        if self.page == page {
+            return;
+        }
+        if self.page == Page::Player || page == Page::Player {
+            self.release_display();
+            self.last_session_viewport = None;
+        }
+        self.page = page;
+        self.ui_dirty = true;
+    }
+
+    fn update_display_layout(&mut self, layout: SurfaceLayout, scale: f64) {
+        if self.page != Page::Player
+            || layout.content_width() < 64
+            || layout.body_height() < 64
+            || self.native_display.root_is_minimized()
+        {
+            self.set_viewport_hidden();
+            self.sync_display();
+            return;
+        }
+        let (guest_width, guest_height) =
+            self.selected
+                .as_ref()
+                .map_or((1080_u32, 1920_u32), |record| {
+                    let display = &record.spec.display;
+                    match display.orientation {
+                        OrientationV2::Portrait | OrientationV2::ReversePortrait => (
+                            display.width.min(display.height),
+                            display.width.max(display.height),
+                        ),
+                        OrientationV2::Landscape | OrientationV2::ReverseLandscape => (
+                            display.width.max(display.height),
+                            display.width.min(display.height),
+                        ),
+                    }
+                });
+        let available_width = layout.content_width();
+        let available_height = layout.body_height();
+        let fit = (f64::from(available_width) / f64::from(guest_width))
+            .min(f64::from(available_height) / f64::from(guest_height));
+        let width = physical_dimension(f64::from(guest_width) * fit, available_width);
+        let height = physical_dimension(f64::from(guest_height) * fit, available_height);
+        let x = layout
+            .content_x()
+            .saturating_add(available_width.saturating_sub(width) / 2);
+        let y = layout
+            .body_y()
+            .saturating_add(available_height.saturating_sub(height) / 2);
+        let bounds = NativeDisplayBounds {
+            x_px: i32::try_from(x).unwrap_or(i32::MAX),
+            y_px: i32::try_from(y).unwrap_or(i32::MAX),
+            width_px: width,
+            height_px: height,
+            visible: true,
+        };
+        if let Err(error) = self.native_display.set_bounds(bounds) {
+            self.notice(format!("原生显示区域定位失败：{error}"));
+            return;
+        }
+        let dpi = physical_dimension(96.0 * scale, 960).clamp(72, 960);
+        let changed = self.viewport.as_ref().is_none_or(|viewport| {
+            viewport.width_px != width
+                || viewport.height_px != height
+                || viewport.dpi != dpi
+                || !viewport.visible
+        });
+        if changed {
+            self.viewport_revision = self.viewport_revision.saturating_add(1);
+            self.viewport = Some(DisplayViewportV2 {
+                width_px: width,
+                height_px: height,
+                dpi,
+                visible: true,
+                revision: self.viewport_revision,
+            });
+        }
+        self.sync_display();
+    }
+
+    fn flush_web_state(&mut self, webviews: &WebSurfaces) {
+        if !self.ui_dirty {
+            return;
+        }
+        let snapshot = json!({
+            "type": "snapshot",
+            "payload": {
+                "summaries": self.summaries,
+                "selected": self.selected,
+                "status": self.status,
+                "artifact_hint": self.artifact_hint,
+            }
+        });
+        webviews.broadcast(&snapshot);
+        webviews.broadcast(&json!({
+            "type": "layout",
+            "payload": {
+                "page": self.page,
+                "sidebar_collapsed": self.sidebar_collapsed,
+                "apk_path": self.apk_path.as_ref().map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+            }
+        }));
+        webviews.broadcast(&json!({ "type": "busy", "payload": self.command_in_flight }));
+        webviews.broadcast(&json!({ "type": "notice", "payload": self.status }));
+        self.ui_dirty = false;
+    }
+
+    fn poll(&mut self) {
+        if !self.closing && self.last_refresh.elapsed() >= POLL_INTERVAL {
+            self.request_refresh();
+        }
+        let minimized = self.native_display.root_is_minimized();
+        if minimized && !self.root_was_minimized {
+            self.root_was_minimized = true;
+            self.suspend_display_for_minimize();
+        } else if !minimized && self.root_was_minimized {
+            self.root_was_minimized = false;
+            self.last_session_viewport = None;
+        }
+        self.sync_display();
+    }
+
+    fn request_refresh(&mut self) {
+        if self.refresh_in_flight || self.closing {
+            return;
+        }
+        self.refresh_in_flight = true;
+        self.last_refresh = Instant::now();
+        let client = self.client.clone();
+        let selected_id = self.selected_id;
+        let proxy = self.proxy.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let summaries = client.list_instances().await.map_err(|e| e.to_string())?;
+                let id = selected_id
+                    .filter(|id| summaries.iter().any(|item| item.id == *id))
+                    .or_else(|| summaries.first().map(|item| item.id));
+                let selected = match id {
+                    Some(id) => Some(client.get_instance(id).await.map_err(|e| e.to_string())?),
+                    None => None,
+                };
+                Ok((summaries, selected))
+            }
+            .await;
+            let _ = proxy.send_event(UserEvent::Refreshed(result));
+        });
+    }
+
+    fn on_refresh(
+        &mut self,
+        result: Result<(Vec<InstanceSummaryV2>, Option<InstanceRecordV2>), String>,
+    ) {
+        self.refresh_in_flight = false;
+        match result {
+            Ok((summaries, selected)) => {
+                let state_changed = self.summaries != summaries || self.selected != selected;
+                self.summaries = summaries;
+                self.selected_id = selected.as_ref().map(|record| record.spec.id);
+                self.selected = selected;
+                if self.status == "正在连接 HD Host…" {
+                    "HD Host 已同步".clone_into(&mut self.status);
+                    self.ui_dirty = true;
+                } else if state_changed {
+                    // Host polling runs four times per second. Re-evaluating the same React state
+                    // in three independent WebView2 composition trees creates needless DComp
+                    // commits next to the Vulkan child and can visibly flash on Intel drivers.
+                    self.ui_dirty = true;
+                }
+                if self.auto_start_selected {
+                    let inactive = self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|record| !record.status.observed.is_active());
+                    if !inactive {
+                        self.auto_start_selected = false;
+                    } else if self.session.is_some() {
+                        self.auto_start_selected = false;
+                        self.operation("start");
+                    }
+                }
+            }
+            Err(error) => self.notice(error),
+        }
+    }
+
+    fn select(&mut self, instance_id: Uuid) {
+        if self.selected_id == Some(instance_id) {
+            self.page = Page::Player;
+            self.operation("start");
+            return;
+        }
+        self.release_display();
+        self.selected_id = Some(instance_id);
+        self.selected = None;
+        self.auto_start_selected = true;
+        self.page = Page::Player;
+        self.last_refresh = Instant::now()
+            .checked_sub(POLL_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        self.ui_dirty = true;
+        self.request_refresh();
+    }
+
+    fn create(&mut self, name: String) {
+        if self.command_in_flight {
+            return;
+        }
+        let spec = InstanceSpecV2 {
+            name,
+            artifacts: default_artifact_selection(),
+            ..InstanceSpecV2::default()
+        };
+        if let Err(error) = spec.validate() {
+            self.notice(error.to_string());
+            return;
+        }
+        self.command_in_flight = true;
+        self.ui_dirty = true;
+        let client = self.client.clone();
+        let proxy = self.proxy.clone();
+        self.runtime.spawn(async move {
+            let result = client
+                .create_instance(&CreateInstanceRequestV2 { spec })
+                .await
+                .map_err(|error| error.to_string());
+            let _ = proxy.send_event(UserEvent::Created(result));
+        });
+    }
+
+    fn on_created(&mut self, result: Result<InstanceRecordV2, String>) {
+        self.command_in_flight = false;
+        match result {
+            Ok(record) => {
+                self.selected_id = Some(record.spec.id);
+                self.selected = Some(record);
+                self.auto_start_selected = true;
+                self.page = Page::Player;
+                self.notice("实例已创建，正在启动".to_owned());
+                self.request_refresh();
+            }
+            Err(error) => self.notice(error),
+        }
+    }
+
+    fn save_spec(&mut self, spec: InstanceSpecV2) {
+        if self.command_in_flight {
+            return;
+        }
+        let Some(record) = &self.selected else { return };
+        if spec.id != record.spec.id {
+            self.notice("设置实例与当前实例不一致".to_owned());
+            return;
+        }
+        if let Err(error) = spec.validate() {
+            self.notice(error.to_string());
+            return;
+        }
+        let request = UpdateInstanceRequestV2 {
+            expected_revision: record.status.revision,
+            spec,
+        };
+        let id = record.spec.id;
+        self.command_in_flight = true;
+        self.ui_dirty = true;
+        let client = self.client.clone();
+        let proxy = self.proxy.clone();
+        self.runtime.spawn(async move {
+            let result = client
+                .update_instance(id, &request)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = proxy.send_event(UserEvent::Saved(result));
+        });
+    }
+
+    fn on_saved(&mut self, result: Result<InstanceRecordV2, String>) {
+        self.command_in_flight = false;
+        match result {
+            Ok(record) => {
+                self.selected = Some(record);
+                self.notice("设置已保存".to_owned());
+            }
+            Err(error) => self.notice(error),
+        }
+    }
+
+    fn operation(&mut self, kind: &str) {
+        if self.command_in_flight {
+            return;
+        }
+        if kind == "start" && self.session.is_none() {
+            self.auto_start_selected = true;
+            self.notice("正在准备 Android 原生显示区…".to_owned());
+            self.sync_display();
+            return;
+        }
+        let Some(id) = self.selected_id else { return };
+        let (operation, timeout, label) = match kind {
+            "start" => (
+                OperationKindV2::Start,
+                Duration::from_mins(3),
+                "Android 已启动",
+            ),
+            "pause" => (
+                OperationKindV2::Pause,
+                Duration::from_secs(30),
+                "Android 已暂停",
+            ),
+            "resume" => (
+                OperationKindV2::Resume,
+                Duration::from_secs(30),
+                "Android 已恢复",
+            ),
+            "restart" => (
+                OperationKindV2::Restart,
+                Duration::from_mins(3),
+                "Android 已重启",
+            ),
+            "stop" => (
+                OperationKindV2::Stop {
+                    mode: StopModeV2::Graceful,
+                    graceful_timeout_ms: 20_000,
+                },
+                Duration::from_secs(90),
+                "Android 已关闭",
+            ),
+            "delete" => (
+                OperationKindV2::Delete,
+                Duration::from_secs(90),
+                "实例已删除",
+            ),
+            _ => {
+                self.notice(format!("未知实例操作：{kind}"));
+                return;
+            }
+        };
+        if matches!(
+            operation,
+            OperationKindV2::Stop { .. } | OperationKindV2::Delete
+        ) {
+            self.release_display();
+        }
+        let artifact_update =
+            matches!(operation, OperationKindV2::Start | OperationKindV2::Restart)
+                .then(|| self.selected.as_ref())
+                .flatten()
+                .filter(|record| record.spec.artifacts.is_none())
+                .and_then(|record| {
+                    let mut spec = record.spec.clone();
+                    spec.artifacts = default_artifact_selection();
+                    spec.artifacts.as_ref()?;
+                    Some(UpdateInstanceRequestV2 {
+                        expected_revision: record.status.revision,
+                        spec,
+                    })
+                });
+        self.command_in_flight = true;
+        self.reset_display_after_command = matches!(
+            &operation,
+            OperationKindV2::Resume | OperationKindV2::Restart
+        );
+        self.ui_dirty = true;
+        let client = self.client.clone();
+        let proxy = self.proxy.clone();
+        let key = format!("hd-web-ui-{}", Uuid::new_v4());
+        self.runtime.spawn(async move {
+            let result = async {
+                if let Some(request) = artifact_update {
+                    client
+                        .update_instance(id, &request)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                let operation = client
+                    .create_operation(id, operation, &key)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                client
+                    .wait_operation(operation.id, timeout)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(label.to_owned())
+            }
+            .await;
+            let _ = proxy.send_event(UserEvent::CommandFinished(result));
+        });
+    }
+
+    fn on_command_finished(&mut self, result: Result<String, String>) {
+        self.command_in_flight = false;
+        let reset_display = std::mem::take(&mut self.reset_display_after_command);
+        if reset_display && result.is_ok() {
+            self.release_display();
+            self.last_session_viewport = None;
+        }
+        match result {
+            Ok(message) => self.notice(message),
+            Err(error) => self.notice(error),
+        }
+        self.last_refresh = Instant::now()
+            .checked_sub(POLL_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        self.request_refresh();
+    }
+
+    fn key(&mut self, key: &str) {
+        let key = match key {
+            "home" => KeyActionV2::Home,
+            "recent" => KeyActionV2::Recent,
+            "back" => KeyActionV2::Back,
+            "power" => KeyActionV2::Power,
+            "volume_up" => KeyActionV2::VolumeUp,
+            "volume_down" => KeyActionV2::VolumeDown,
+            _ => {
+                self.notice(format!("未知 Android 按键：{key}"));
+                return;
+            }
+        };
+        self.action(InstanceActionV2::Key { key }, "按键已发送");
+    }
+
+    fn rotate(&mut self) {
+        let orientation = self
+            .selected
+            .as_ref()
+            .map_or(OrientationV2::Landscape, |record| {
+                match record.spec.display.orientation {
+                    OrientationV2::Portrait => OrientationV2::Landscape,
+                    OrientationV2::Landscape => OrientationV2::Portrait,
+                    OrientationV2::ReversePortrait => OrientationV2::ReverseLandscape,
+                    OrientationV2::ReverseLandscape => OrientationV2::ReversePortrait,
+                }
+            });
+        self.action(InstanceActionV2::Rotate { orientation }, "旋转命令已发送");
+    }
+
+    fn action(&mut self, action: InstanceActionV2, label: &'static str) {
+        if self.command_in_flight {
+            return;
+        }
+        if let Err(error) = action.validate() {
+            self.notice(error.to_string());
+            return;
+        }
+        let Some(id) = self.selected_id else { return };
+        let _ = self.native_display.focus_guest();
+        self.command_in_flight = true;
+        self.ui_dirty = true;
+        let client = self.client.clone();
+        let proxy = self.proxy.clone();
+        self.runtime.spawn(async move {
+            let result = client
+                .action(id, action)
+                .await
+                .map(|_| label.to_owned())
+                .map_err(|error| error.to_string());
+            let _ = proxy.send_event(UserEvent::CommandFinished(result));
+        });
+    }
+
+    fn screenshot(&mut self) {
+        if self.command_in_flight {
+            return;
+        }
+        let Some(id) = self.selected_id else { return };
+        self.command_in_flight = true;
+        self.ui_dirty = true;
+        let client = self.client.clone();
+        let proxy = self.proxy.clone();
+        self.runtime.spawn(async move {
+            let result = client
+                .capture_screenshot(id)
+                .await
+                .map(|record| format!("截图已保存：{}", record.path.display()))
+                .map_err(|error| error.to_string());
+            let _ = proxy.send_event(UserEvent::CommandFinished(result));
+        });
+    }
+
+    fn install_selected_apk(&mut self) {
+        let Some(path) = self.apk_path.clone() else {
+            self.notice("请在设置页选择 APK，或将 APK 文件拖入 HD 窗口".to_owned());
+            return;
+        };
+        self.install_apk(path);
+    }
+
+    fn install_apk(&mut self, path: PathBuf) {
+        if self.command_in_flight {
+            return;
+        }
+        if !path.is_file() {
+            self.notice(format!("APK 文件不存在：{}", path.display()));
+            return;
+        }
+        let Some(id) = self.selected_id else { return };
+        self.command_in_flight = true;
+        self.ui_dirty = true;
+        let client = self.client.clone();
+        let proxy = self.proxy.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let upload = client.upload_apk(&path).await.map_err(|e| e.to_string())?;
+                let operation = client
+                    .create_operation(
+                        id,
+                        OperationKindV2::InstallApk {
+                            upload_id: upload.id,
+                            sha256: upload.sha256,
+                        },
+                        &format!("hd-web-ui-apk-{}", Uuid::new_v4()),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                client
+                    .wait_operation(operation.id, Duration::from_mins(10))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok("APK 已安装".to_owned())
+            }
+            .await;
+            let _ = proxy.send_event(UserEvent::CommandFinished(result));
+        });
+    }
+
+    fn collect_diagnostics(&mut self) {
+        if self.command_in_flight {
+            return;
+        }
+        self.command_in_flight = true;
+        self.ui_dirty = true;
+        let client = self.client.clone();
+        let proxy = self.proxy.clone();
+        let request = DiagnosticRequestV2 {
+            instance_id: self.selected_id,
+            include_guest_logs: self.include_guest_logs,
+        };
+        self.runtime.spawn(async move {
+            let result = client
+                .collect_diagnostics(&request)
+                .await
+                .map(|bundle| format!("诊断包已保存：{}", bundle.path.display()))
+                .map_err(|error| error.to_string());
+            let _ = proxy.send_event(UserEvent::CommandFinished(result));
+        });
+    }
+
+    fn set_viewport_hidden(&mut self) {
+        let _ = self.native_display.hide();
+        if let Some(viewport) = self.viewport.as_mut()
+            && viewport.visible
+        {
+            self.viewport_revision = self.viewport_revision.saturating_add(1);
+            viewport.visible = false;
+            viewport.revision = self.viewport_revision;
+        }
+    }
+
+    fn suspend_display_for_minimize(&mut self) {
+        self.set_viewport_hidden();
+        self.release_display();
+        self.last_session_viewport = None;
+    }
+
+    fn sync_display(&mut self) {
+        if self.closing || self.display_in_flight {
+            return;
+        }
+        let Some(id) = self.selected_id else { return };
+        let Some(viewport) = self.viewport.clone() else {
+            return;
+        };
+        if !viewport.visible && self.session.is_none() {
+            return;
+        }
+        let client = self.client.clone();
+        let proxy = self.proxy.clone();
+        if let Some(session) = self.session.clone() {
+            if session.instance_id != id {
+                self.release_display();
+                return;
+            }
+            if self.last_session_viewport.as_ref() == Some(&viewport)
+                && self.last_session_touch.elapsed() < DISPLAY_HEARTBEAT
+            {
+                return;
+            }
+            self.display_in_flight = true;
+            let completed_viewport = viewport.clone();
+            self.runtime.spawn(async move {
+                let result = client
+                    .update_display_session(id, session.session_token, viewport)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = proxy.send_event(UserEvent::DisplayFinished {
+                    instance_id: id,
+                    viewport: completed_viewport,
+                    result,
+                });
+            });
+        } else if viewport.visible && self.last_display_attempt.elapsed() >= DISPLAY_RETRY {
+            self.last_display_attempt = Instant::now();
+            self.display_in_flight = true;
+            self.notice("正在附加 Android 原生画面…".to_owned());
+            let target = self.display_target.clone();
+            let completed_viewport = viewport.clone();
+            self.runtime.spawn(async move {
+                let result = client
+                    .acquire_display_session(id, target, viewport)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = proxy.send_event(UserEvent::DisplayFinished {
+                    instance_id: id,
+                    viewport: completed_viewport,
+                    result,
+                });
+            });
+        }
+    }
+
+    fn on_display_finished(
+        &mut self,
+        instance_id: Uuid,
+        completed_viewport: DisplayViewportV2,
+        result: Result<DisplaySessionV2, String>,
+    ) {
+        self.display_in_flight = false;
+        if self.selected_id != Some(instance_id) {
+            if let Ok(session) = result {
+                let client = self.client.clone();
+                self.runtime.spawn(async move {
+                    let _ = client
+                        .release_display_session(instance_id, session.session_token)
+                        .await;
+                });
+            }
+            return;
+        }
+        match result {
+            Ok(session) => {
+                self.session = Some(session);
+                let visible = completed_viewport.visible;
+                self.last_session_viewport = Some(completed_viewport);
+                self.last_session_touch = Instant::now();
+                if visible {
+                    self.notice("Android 原生画面已附加".to_owned());
+                }
+                let inactive = self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|record| !record.status.observed.is_active());
+                if self.auto_start_selected && inactive {
+                    self.auto_start_selected = false;
+                    self.operation("start");
+                }
+            }
+            Err(error) => {
+                self.session = None;
+                self.last_session_viewport = None;
+                self.notice(format!("显示附加失败，正在重试：{error}"));
+            }
+        }
+    }
+
+    fn release_display(&mut self) {
+        self.display_in_flight = false;
+        self.last_session_viewport = None;
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let client = self.client.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = client
+                .release_display_session(session.instance_id, session.session_token)
+                .await
+            {
+                warn!(%error, "release HD display session failed");
+            }
+        });
+    }
+
+    fn begin_close(&mut self) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        self.command_in_flight = true;
+        let _ = self.native_display.hide();
+        self.notice("正在关闭当前 Android 实例…".to_owned());
+        let session = self.session.take();
+        let selected = self.selected.clone();
+        let client = self.client.clone();
+        let proxy = self.proxy.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                if let Some(session) = session {
+                    let _ = client
+                        .release_display_session(session.instance_id, session.session_token)
+                        .await;
+                }
+                if let Some(record) = selected
+                    && record.status.observed.is_active()
+                {
+                    let operation = client
+                        .create_operation(
+                            record.spec.id,
+                            OperationKindV2::Stop {
+                                mode: StopModeV2::Graceful,
+                                graceful_timeout_ms: 20_000,
+                            },
+                            &format!("hd-web-ui-close-{}", Uuid::new_v4()),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    client
+                        .wait_operation(operation.id, Duration::from_secs(90))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }
+            .await;
+            let _ = proxy.send_event(UserEvent::ShutdownFinished(result));
+        });
+    }
+
+    fn notice(&mut self, message: String) {
+        self.status = message;
+        self.ui_dirty = true;
+    }
+}
+
+fn physical_dimension(value: f64, maximum: u32) -> u32 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        value.round().clamp(1.0, f64::from(maximum.max(1))) as u32
+    }
+}
+
+fn resolve_web_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    explicit
+        .filter(|path| path.join("index.html").is_file())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_owned))
+                .map(|path| path.join("ui"))
+                .filter(|path| path.join("index.html").is_file())
+        })
+        .or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .map(|root| root.join("web/dist"))
+                .filter(|path| path.join("index.html").is_file())
+        })
+}
+
+fn configure_fast_dev_artifacts(root: &Path) -> Option<String> {
+    let direct = root.join("products/android/vsoc_x86_64/direct-linux");
+    let sparse_rootfs = direct.join("aggregate_android.sparse.img");
+    let raw_rootfs = direct.join("aggregate_android.img");
+    let rootfs = if sparse_rootfs.is_file() {
+        sparse_rootfs
+    } else {
+        raw_rootfs
+    };
+    if !direct.join("kernel").is_file()
+        || !direct.join("initrd_android.img").is_file()
+        || !rootfs.is_file()
+        || !direct.join("android_fstab.dt").is_file()
+    {
+        return None;
+    }
+    let host_root = direct_host_tools_root()?;
+    let sensor = host_root.join("hd-sensor-injector");
+    let adb = std::env::var_os("HD_DEV_ADB")
+        .map(PathBuf::from)
+        .or_else(default_adb_path)?;
+    let aapt2 = std::env::var_os("HD_DEV_AAPT2")
+        .map(PathBuf::from)
+        .or_else(default_aapt2_path)?;
+    // SAFETY: initialization runs before Tokio, Host, Worker, or any other process is started.
+    unsafe {
+        if std::env::var_os("HD_DEV_FAST_ARTIFACTS").is_none() {
+            std::env::set_var("HD_DEV_FAST_ARTIFACTS", "1");
+        }
+        if std::env::var_os("HD_DEV_GUEST_BUNDLE_ROOT").is_none() {
+            std::env::set_var("HD_DEV_GUEST_BUNDLE_ROOT", &direct);
+        }
+        if std::env::var_os("HD_DEV_GUEST_ROOTFS").is_none() {
+            std::env::set_var("HD_DEV_GUEST_ROOTFS", &rootfs);
+        }
+        if std::env::var_os("HD_DEV_HOST_TOOLS_ROOT").is_none() {
+            std::env::set_var("HD_DEV_HOST_TOOLS_ROOT", &host_root);
+        }
+        if sensor.is_file() && std::env::var_os("HD_DEV_SENSOR_INJECTOR").is_none() {
+            std::env::set_var("HD_DEV_SENSOR_INJECTOR", &sensor);
+        }
+        if std::env::var_os("HD_DEV_ADB").is_none() {
+            std::env::set_var("HD_DEV_ADB", &adb);
+        }
+        if std::env::var_os("HD_DEV_AAPT2").is_none() {
+            std::env::set_var("HD_DEV_AAPT2", &aapt2);
+        }
+    }
+    info!(path = %direct.display(), rootfs = %rootfs.display(), "configured Android development artifacts");
+    Some(format!("快速开发镜像：{}", rootfs.display()))
+}
+
+fn default_artifact_selection() -> Option<ArtifactSelectionV2> {
+    if let Some(selection) = DIRECT_DEV_SELECTION.get() {
+        return Some(selection.clone());
+    }
+    let store_root = PathBuf::from(DEFAULT_ARTIFACT_STORE);
+    let bundles = store_root.join("bundles");
+    (bundles.join(DEFAULT_GUEST_DIGEST).is_dir() && bundles.join(DEFAULT_HOST_DIGEST).is_dir())
+        .then(|| ArtifactSelectionV2 {
+            store_root,
+            guest_bundle_digest: DEFAULT_GUEST_DIGEST.to_owned(),
+            host_bundle_digest: DEFAULT_HOST_DIGEST.to_owned(),
+        })
+}
+
+fn direct_host_tools_root() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_owned))
+        .filter(|path| path.join("crosvm.exe").is_file())
+        .or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(3)
+                .map(|root| root.join("out/dist/windows/bin"))
+                .filter(|path| path.join("crosvm.exe").is_file())
+        })
+}
+
+fn default_adb_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|root| root.join("Android/Sdk/platform-tools/adb.exe"))
+        .filter(|path| path.is_file())
+}
+
+fn default_aapt2_path() -> Option<PathBuf> {
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)?
+        .join("Android/Sdk/build-tools");
+    let mut versions = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .collect::<Vec<_>>();
+    versions.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+    versions
+        .into_iter()
+        .map(|entry| entry.path().join("aapt2.exe"))
+        .find(|path| path.is_file())
+}
+
+fn init_logging(paths: &DataPaths) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    let appender = tracing_appender::rolling::daily(&paths.logs, "ui-web.jsonl");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(writer)
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("initialize HD WebView UI logging: {error}"))?;
+    Ok(guard)
+}

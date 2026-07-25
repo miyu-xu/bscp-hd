@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use hd_core::{DeviceSerialEndpointV2, DisplayConfigV2, KeyActionV2, LaunchPlanV2, VsyncModeV2};
+use hd_core::{
+    DeviceSerialEndpointV2, DisplayConfigV2, InstanceSpecV2, KeyActionV2, LaunchPlanV2, VsyncModeV2,
+};
 use hd_platform::{PlatformError, VmBackend, VmLaunchContextV2};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
@@ -15,6 +17,33 @@ use tokio::sync::Mutex;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_OUTPUT_LIMIT: u64 = 64 * 1024;
+
+fn guest_kernel_arguments(spec: &InstanceSpecV2) -> Vec<String> {
+    let mut arguments = vec![
+        "console=hvc0,ttyS0".to_owned(),
+        "init=/init".to_owned(),
+        format!("androidboot.lcd_density={}", spec.display.dpi),
+    ];
+    #[cfg(windows)]
+    arguments.extend([
+        // Windows HD requires Guest ANGLE over ranchu/gfxstream. Explicitly disable the CPU
+        // Vulkan fallback so an artifact bootconfig cannot silently select Guest SwiftShader.
+        "androidboot.cpuvulkan.version=0".to_owned(),
+        "androidboot.hardware.gralloc=minigbm".to_owned(),
+        "androidboot.hardware.hwcomposer=ranchu".to_owned(),
+        "androidboot.hardware.hwcomposer.display_finder_mode=drm".to_owned(),
+        "androidboot.hardware.hwcomposer.display_framebuffer_format=rgba".to_owned(),
+        "androidboot.hardware.egl=angle".to_owned(),
+        "androidboot.hardware.vulkan=ranchu".to_owned(),
+        "androidboot.hardware.gltransport=virtio-gpu-asg".to_owned(),
+        "androidboot.opengles.version=196609".to_owned(),
+    ]);
+    if spec.devices.uwb {
+        arguments.push("androidboot.uwbcountrycode=US".to_owned());
+    }
+    arguments.extend(spec.boot.kernel_arguments());
+    arguments
+}
 
 #[cfg(unix)]
 #[derive(Debug)]
@@ -87,11 +116,23 @@ impl CrosvmBackend {
 
     fn gpu_argument(display: &DisplayConfigV2) -> String {
         let (width, height) = display.oriented_size();
-        format!(
-            "backend=gfxstream,max-num-displays=1,audio-device-mode=one-global,displays=[[mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh},hidden=true]],context-types=gfxstream-vulkan:gfxstream-composer,angle=true,gles=false,vulkan=true,wsi=vk,external-blob=true,udmabuf=false,renderer-features=VulkanAllocateHostMemory:enabled",
+        let base = format!(
+            "backend=gfxstream,max-num-displays=1,audio-device-mode=one-global,displays=[[mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh},hidden=true]],context-types=gfxstream-vulkan:gfxstream-composer,angle=true,gles=false,vulkan=true,wsi=vk",
             dpi = display.dpi,
             refresh = display.refresh_rate_hz,
-        )
+        );
+        if crate::dev::native_display_direct_enabled() {
+            // The native HWND path presents through gfxstream's own Vulkan swapchain. External
+            // blobs and VulkanAllocateHostMemory belong to the frame-export broker path and route
+            // guest allocations through a separate, experimental Win32 external-memory flow.
+            // Enabling them without a broker can leave the native subwindow at its clear color
+            // even though SurfaceFlinger is actively composing.
+            base
+        } else {
+            format!(
+                "{base},external-blob=true,udmabuf=false,renderer-features=VulkanAllocateHostMemory:enabled"
+            )
+        }
     }
 
     fn display_argument(display: &DisplayConfigV2) -> String {
@@ -138,6 +179,7 @@ impl CrosvmBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        hd_platform::configure_transient_command(command.as_std_mut())?;
         let mut child = command
             .spawn()
             .map_err(|error| PlatformError::Vm(format!("spawn crosvm control command: {error}")))?;
@@ -314,16 +356,14 @@ impl VmBackend for CrosvmBackend {
             ]);
         }
 
-        let mut kernel_arguments = vec!["console=hvc0,ttyS0".to_owned(), "init=/init".to_owned()];
+        // On Windows HD owns the direct-render graphics contract: Guest ANGLE uses the ranchu
+        // Vulkan ICD and gfxstream forwards work to the selected host GPU. Other platforms retain
+        // the imported image bootconfig until their native direct-render paths are implemented.
         // The virtio-gpu EDID carries the configured DPI, but Android's SurfaceFlinger does not
         // derive its logical/physical density from that EDID on this guest profile.  Android's
         // emulator boot contract consumes androidboot.lcd_density, so keep the guest UI density
         // in the same cold-start transaction as the crosvm display parameters.
-        kernel_arguments.push(format!("androidboot.lcd_density={}", spec.display.dpi));
-        if spec.devices.uwb {
-            kernel_arguments.push("androidboot.uwbcountrycode=US".to_owned());
-        }
-        kernel_arguments.extend(spec.boot.kernel_arguments());
+        let kernel_arguments = guest_kernel_arguments(spec);
         arguments.extend([
             "--android-fstab".to_owned(),
             context
@@ -339,10 +379,12 @@ impl VmBackend for CrosvmBackend {
         ]);
 
         let dev_display_copy_fallback = crate::dev::allow_display_copy_fallback_enabled();
+        let native_display_direct = crate::dev::native_display_direct_enabled();
+        let strict_frame_broker = !dev_display_copy_fallback && !native_display_direct;
         let mut environment = BTreeMap::from([
             (
                 "HD_FRAME_REQUIRED".to_owned(),
-                if dev_display_copy_fallback { "0" } else { "1" }.to_owned(),
+                if strict_frame_broker { "1" } else { "0" }.to_owned(),
             ),
             ("HD_FRAME_PROTOCOL".to_owned(), "2".to_owned()),
             ("HD_FRAME_INSTANCE".to_owned(), spec.id.to_string()),
@@ -355,7 +397,7 @@ impl VmBackend for CrosvmBackend {
                 .to_owned(),
             ),
         ]);
-        if !dev_display_copy_fallback {
+        if strict_frame_broker {
             environment.insert(
                 "HD_FRAME_BROKER_V2".to_owned(),
                 context.frame_endpoint.clone(),
@@ -416,6 +458,9 @@ impl VmBackend for CrosvmBackend {
                 "GFXSTREAM_ANGLE_ROOT".to_owned(),
                 angle_dir.to_string_lossy().into_owned(),
             );
+            // Keep Intel validation deterministic on hybrid-GPU laptops. This deliberately avoids
+            // gfxstream's default preference for a discrete adapter and never selects SwiftShader.
+            environment.insert("ANDROID_EMU_VK_SELECT_GPU".to_owned(), "intel".to_owned());
             let inherited_path = std::env::var_os("PATH").unwrap_or_default();
             let mut search_dirs = vec![
                 crosvm_dir.to_owned(),
@@ -622,5 +667,29 @@ mod tests {
     #[test]
     fn unsafe_key_value_path_is_rejected() {
         assert!(safe_key_value_path("c:/guest,image.img").is_err());
+    }
+
+    #[test]
+    fn windows_guest_graphics_contract_requires_hardware_angle() {
+        let mut spec = InstanceSpecV2::default();
+        spec.display.dpi = 420;
+
+        let arguments = guest_kernel_arguments(&spec);
+
+        assert!(arguments.contains(&"androidboot.lcd_density=420".to_owned()));
+        for required in [
+            "androidboot.cpuvulkan.version=0",
+            "androidboot.hardware.egl=angle",
+            "androidboot.hardware.gltransport=virtio-gpu-asg",
+            "androidboot.hardware.gralloc=minigbm",
+            "androidboot.hardware.hwcomposer=ranchu",
+            "androidboot.hardware.vulkan=ranchu",
+            "androidboot.opengles.version=196609",
+        ] {
+            assert!(
+                arguments.iter().any(|argument| argument == required),
+                "Windows HD must require the hardware Guest ANGLE contract: {required}"
+            );
+        }
     }
 }

@@ -997,6 +997,8 @@ pub enum WorkerCommandV2 {
         run_id: Uuid,
         leases: Vec<LeaseV2>,
         capabilities_fingerprint: String,
+        #[serde(default)]
+        initial_display: Option<PreparedNativeDisplayV2>,
     },
     Stop {
         mode: StopModeV2,
@@ -1150,6 +1152,25 @@ pub struct DisplayViewportV2 {
     pub dpi: u32,
     pub visible: bool,
     pub revision: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedNativeDisplayV2 {
+    pub session_id: Uuid,
+    pub target: NativeDisplayTargetV2,
+    pub viewport: DisplayViewportV2,
+}
+
+impl std::fmt::Debug for PreparedNativeDisplayV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedNativeDisplayV2")
+            .field("session_id", &self.session_id)
+            .field("target", &"[NON_PERSISTENT_NATIVE_HANDLE]")
+            .field("viewport", &self.viewport)
+            .finish()
+    }
 }
 
 impl DisplayViewportV2 {

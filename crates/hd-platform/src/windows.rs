@@ -1,10 +1,10 @@
 #![allow(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
+use std::ffi::{OsStr, c_void};
 use std::io::Write as _;
 use std::os::windows::ffi::OsStrExt as _;
-use std::os::windows::io::FromRawHandle as _;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,7 +12,10 @@ use std::process::Command;
 use hd_core::{DisplayViewportV2, NativeDisplayTargetV2, WorkerIdentityV2};
 use windows_sys::Win32::Foundation::{
     CloseHandle, FILETIME, GENERIC_READ, GENERIC_WRITE, GetLastError, HWND, INVALID_HANDLE_VALUE,
-    LocalFree, STILL_ACTIVE, SetLastError,
+    LocalFree, RECT, STILL_ACTIVE, SetLastError,
+};
+use windows_sys::Win32::Graphics::Gdi::{
+    RDW_ALLCHILDREN, RDW_INTERNALPAINT, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -30,6 +33,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
     TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
@@ -39,10 +44,11 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GWL_STYLE, GetClassNameW, GetWindowLongPtrW,
-    GetWindowThreadProcessId, IsWindow, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOOWNERZORDER, SWP_NOZORDER, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WS_CHILD, WS_CLIPCHILDREN, WS_POPUP,
+    EnumChildWindows, EnumWindows, GWL_STYLE, GetClassNameW, GetClientRect, GetParent,
+    GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, PostMessageW, SW_HIDE,
+    SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER,
+    SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_PAINT, WM_USER, WS_CHILD,
+    WS_CLIPCHILDREN, WS_POPUP,
 };
 
 use crate::{NativeCapabilityProbe, PlatformError};
@@ -50,10 +56,56 @@ use crate::{NativeCapabilityProbe, PlatformError};
 const DEVICE_PATH_PREFIX: [u16; 4] = [92, 92, 63, 92];
 const UNC_PATH_PREFIX: [u16; 8] = [92, 92, 63, 92, 85, 78, 67, 92];
 const UNC_PATH_START: [u16; 2] = [92, 92];
+// crosvm's Windows gpu_display WndProc uses this private message to resize gfxstream's `subWin`,
+// rebuild its Vulkan display surface, and update the host-to-guest pointer projection. A regular
+// SetWindowPos only resizes the outer CROSVM HWND and leaves all three of those states stale.
+const WM_USER_HOST_VIEWPORT_CHANGE_INTERNAL: u32 = WM_USER + 1;
+const NATIVE_DISPLAY_TOPLEVEL_ENV: &str = "HD_DEV_NATIVE_DISPLAY_TOPLEVEL";
+const CROSVM_DISPLAY_PARKING_TITLE: &str = "crosvm-display-parking";
+const NATIVE_DISPLAY_TOPLEVEL_X: i32 = 280;
+const NATIVE_DISPLAY_TOPLEVEL_Y: i32 = 64;
+
+fn native_display_toplevel_value_enabled(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| {
+        !value.is_empty() && value != "0" && !value.to_string_lossy().eq_ignore_ascii_case("false")
+    })
+}
+
+pub(crate) fn native_display_toplevel_debug_enabled() -> bool {
+    native_display_toplevel_value_enabled(std::env::var_os(NATIVE_DISPLAY_TOPLEVEL_ENV).as_deref())
+}
+
+pub fn mark_file_sparse(file: &std::fs::File, path: &Path) -> Result<(), PlatformError> {
+    let mut returned = 0_u32;
+    // SAFETY: the handle remains owned by `file` for this synchronous call. FSCTL_SET_SPARSE
+    // accepts no input or output buffer, and the return value is checked.
+    let result = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(PlatformError::Io {
+            operation: "mark expanded overlay as filesystem sparse",
+            path: path.to_owned(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    Ok(())
+}
 
 struct CrosvmWindowSearch {
     pids: HashSet<u32>,
     hwnd: HWND,
+    client_area: u64,
+    exact_primary: bool,
 }
 
 unsafe fn window_matches_crosvm(hwnd: HWND, search: &CrosvmWindowSearch) -> bool {
@@ -72,15 +124,52 @@ unsafe fn window_matches_crosvm(hwnd: HWND, search: &CrosvmWindowSearch) -> bool
     let Ok(length) = usize::try_from(length) else {
         return false;
     };
-    length > 0 && String::from_utf16_lossy(&class_name[..length]).starts_with("CROSVM")
+    if length == 0 || !String::from_utf16_lossy(&class_name[..length]).starts_with("CROSVM") {
+        return false;
+    }
+    // The parking window deliberately uses the same crosvm WndProc class, but it is not a guest
+    // scanout and must never be selected for attach/resize commands.
+    unsafe { window_title(hwnd) != CROSVM_DISPLAY_PARKING_TITLE }
+}
+
+unsafe fn window_title(hwnd: HWND) -> String {
+    let mut title = [0_u16; 128];
+    let Ok(capacity) = i32::try_from(title.len()) else {
+        return String::new();
+    };
+    // SAFETY: hwnd is supplied by Win32 enumeration and title is a writable UTF-16 buffer.
+    let length = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), capacity) };
+    let Ok(length) = usize::try_from(length) else {
+        return String::new();
+    };
+    String::from_utf16_lossy(&title[..length])
 }
 
 unsafe extern "system" fn find_crosvm_child_callback(hwnd: HWND, lparam: isize) -> i32 {
     // SAFETY: EnumWindows synchronously invokes this callback with the pointer supplied below.
     let search = unsafe { &mut *(lparam as *mut CrosvmWindowSearch) };
     if unsafe { window_matches_crosvm(hwnd, search) } {
-        search.hwnd = hwnd;
-        return 0;
+        let exact_primary = unsafe { window_title(hwnd).ends_with("-scanout-0") };
+        let mut rect = RECT::default();
+        // SAFETY: hwnd came from Win32 enumeration and rect is writable for this synchronous call.
+        let area = if unsafe { GetClientRect(hwnd, &raw mut rect) } != 0 {
+            u64::try_from(rect.right.saturating_sub(rect.left))
+                .unwrap_or_default()
+                .saturating_mul(
+                    u64::try_from(rect.bottom.saturating_sub(rect.top)).unwrap_or_default(),
+                )
+        } else {
+            0
+        };
+        // crosvm pre-creates one 1x1 CROSVM window for every possible scanout. The active guest
+        // scanout is the only large window. If surface creation has not resized it yet, keep the
+        // last equal-sized candidate: EnumWindows visits the newest scanouts first, while scanout
+        // zero (the primary display) was created first and is therefore visited last.
+        if exact_primary || (!search.exact_primary && area >= search.client_area) {
+            search.hwnd = hwnd;
+            search.client_area = area;
+            search.exact_primary = exact_primary;
+        }
     }
     1
 }
@@ -90,16 +179,14 @@ unsafe extern "system" fn find_crosvm_root_callback(hwnd: HWND, lparam: isize) -
     {
         let search = unsafe { &mut *(lparam as *mut CrosvmWindowSearch) };
         if unsafe { window_matches_crosvm(hwnd, search) } {
-            search.hwnd = hwnd;
-            return 0;
+            // Reuse the same ranking logic for top-level and already attached child windows.
+            unsafe { find_crosvm_child_callback(hwnd, lparam) };
         }
     }
     // Once attached, the CROSVM window is no longer returned by EnumWindows. Search every root's
     // descendant tree so resize and detach continue to address the same HWND after SetParent.
     unsafe { EnumChildWindows(hwnd, Some(find_crosvm_child_callback), lparam) };
-    // SAFETY: the child enumeration has returned, so no callback holds another reference.
-    let search = unsafe { &*(lparam as *const CrosvmWindowSearch) };
-    i32::from(search.hwnd.is_null())
+    1
 }
 
 fn crosvm_window(pid: u32) -> Result<HWND, PlatformError> {
@@ -107,6 +194,8 @@ fn crosvm_window(pid: u32) -> Result<HWND, PlatformError> {
     let mut search = CrosvmWindowSearch {
         pids,
         hwnd: std::ptr::null_mut(),
+        client_area: 0,
+        exact_primary: false,
     };
     // SAFETY: the pointer remains valid for the synchronous enumeration.
     unsafe {
@@ -115,6 +204,133 @@ fn crosvm_window(pid: u32) -> Result<HWND, PlatformError> {
     if search.hwnd.is_null() {
         Err(PlatformError::Process(format!(
             "crosvm GUI window was not found for process {pid}"
+        )))
+    } else {
+        Ok(search.hwnd)
+    }
+}
+
+struct CrosvmParkingSearch {
+    pids: HashSet<u32>,
+    hwnd: HWND,
+}
+
+struct GfxstreamWindowSearch {
+    pids: HashSet<u32>,
+    hwnd: HWND,
+}
+
+unsafe extern "system" fn find_gfxstream_window_callback(hwnd: HWND, lparam: isize) -> i32 {
+    // SAFETY: EnumChildWindows synchronously invokes this callback with the pointer supplied by
+    // gfxstream_window below.
+    let search = unsafe { &mut *(lparam as *mut GfxstreamWindowSearch) };
+    let mut pid = 0_u32;
+    // SAFETY: hwnd is supplied by Win32 and pid points to writable storage.
+    unsafe { GetWindowThreadProcessId(hwnd, &raw mut pid) };
+    if !search.pids.contains(&pid) {
+        return 1;
+    }
+    let mut class_name = [0_u16; 64];
+    let length = unsafe {
+        GetClassNameW(
+            hwnd,
+            class_name.as_mut_ptr(),
+            i32::try_from(class_name.len()).unwrap_or(64),
+        )
+    };
+    let Ok(length) = usize::try_from(length) else {
+        return 1;
+    };
+    let class_name = String::from_utf16_lossy(&class_name[..length]);
+    if class_name == "subWin" || class_name == "vulkan-subWin" {
+        search.hwnd = hwnd;
+        return 0;
+    }
+    1
+}
+
+unsafe extern "system" fn find_gfxstream_root_callback(hwnd: HWND, lparam: isize) -> i32 {
+    // Check both a top-level window and all of its descendants. gfxstream is normally a child,
+    // but detach must not depend on the external viewport still being valid.
+    if unsafe { find_gfxstream_window_callback(hwnd, lparam) } == 0 {
+        return 0;
+    }
+    unsafe { EnumChildWindows(hwnd, Some(find_gfxstream_window_callback), lparam) };
+    1
+}
+
+fn gfxstream_window(child_pid: u32, parent: HWND) -> Result<HWND, PlatformError> {
+    let mut search = GfxstreamWindowSearch {
+        pids: process_tree(child_pid)?,
+        hwnd: std::ptr::null_mut(),
+    };
+    // SAFETY: parent is a validated HD viewport and the pointer remains live for synchronous
+    // descendant enumeration.
+    unsafe {
+        EnumChildWindows(
+            parent,
+            Some(find_gfxstream_window_callback),
+            (&raw mut search) as isize,
+        );
+    }
+    if search.hwnd.is_null() {
+        Err(PlatformError::Process(
+            "gfxstream native render surface is not ready".to_owned(),
+        ))
+    } else {
+        Ok(search.hwnd)
+    }
+}
+
+fn gfxstream_window_anywhere(child_pid: u32) -> Result<HWND, PlatformError> {
+    let mut search = GfxstreamWindowSearch {
+        pids: process_tree(child_pid)?,
+        hwnd: std::ptr::null_mut(),
+    };
+    // SAFETY: the pointer remains live for synchronous desktop window enumeration.
+    unsafe {
+        EnumWindows(
+            Some(find_gfxstream_root_callback),
+            (&raw mut search) as isize,
+        );
+    }
+    if search.hwnd.is_null() {
+        Err(PlatformError::Process(
+            "gfxstream native render surface is not ready".to_owned(),
+        ))
+    } else {
+        Ok(search.hwnd)
+    }
+}
+
+unsafe extern "system" fn find_crosvm_parking_callback(hwnd: HWND, lparam: isize) -> i32 {
+    // SAFETY: EnumWindows synchronously invokes this callback with the pointer supplied below.
+    let search = unsafe { &mut *(lparam as *mut CrosvmParkingSearch) };
+    let mut pid = 0_u32;
+    // SAFETY: hwnd is supplied by Win32 and pid points to writable storage.
+    unsafe { GetWindowThreadProcessId(hwnd, &raw mut pid) };
+    if search.pids.contains(&pid) && unsafe { window_title(hwnd) == CROSVM_DISPLAY_PARKING_TITLE } {
+        search.hwnd = hwnd;
+        return 0;
+    }
+    1
+}
+
+fn crosvm_parking_window(pid: u32) -> Result<HWND, PlatformError> {
+    let mut search = CrosvmParkingSearch {
+        pids: process_tree(pid)?,
+        hwnd: std::ptr::null_mut(),
+    };
+    // SAFETY: the pointer remains valid for the synchronous top-level enumeration.
+    unsafe {
+        EnumWindows(
+            Some(find_crosvm_parking_callback),
+            (&raw mut search) as isize,
+        );
+    }
+    if search.hwnd.is_null() {
+        Err(PlatformError::Process(format!(
+            "crosvm display parking window was not found for process {pid}"
         )))
     } else {
         Ok(search.hwnd)
@@ -222,6 +438,168 @@ fn viewport_dimensions(viewport: &DisplayViewportV2) -> Result<(i32, i32), Platf
     Ok((width, height))
 }
 
+fn notify_crosvm_viewport(child: HWND, width: i32, height: i32) -> Result<(), PlatformError> {
+    let width = u16::try_from(width).map_err(|_| {
+        PlatformError::Process("native display width exceeds crosvm message bounds".to_owned())
+    })?;
+    let height = u16::try_from(height).map_err(|_| {
+        PlatformError::Process("native display height exceeds crosvm message bounds".to_owned())
+    })?;
+    let packed = (u32::from(height) << 16) | u32::from(width);
+    let lparam = isize::try_from(packed)
+        .map_err(|_| PlatformError::Process("native display viewport packing failed".to_owned()))?;
+    // SAFETY: child is the validated crosvm HWND. The message is asynchronous and carries only
+    // two packed u16 dimensions, matching gpu_display's LOWORD/HIWORD decoder.
+    if unsafe { PostMessageW(child, WM_USER_HOST_VIEWPORT_CHANGE_INTERNAL, 0, lparam) } == 0 {
+        return Err(last_identity_error("PostMessageW(crosvm viewport)"));
+    }
+    Ok(())
+}
+
+fn request_native_display_repaint(render: HWND) -> Result<(), PlatformError> {
+    // Intel's Vulkan WSI can preserve a valid swapchain while DWM discards the last composed child
+    // image during root-window minimization. gfxstream's subWin WndProc maps WM_PAINT to its
+    // zero-copy repaint callback, so invalidate and synchronously drain that paint before the
+    // display attach/visibility operation completes. The posted paint is a fallback for drivers
+    // that consume the invalid region during ShowWindow without invoking the callback.
+    unsafe {
+        RedrawWindow(
+            render,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            RDW_INVALIDATE | RDW_INTERNALPAINT | RDW_UPDATENOW | RDW_ALLCHILDREN,
+        );
+        if PostMessageW(render, WM_PAINT, 0, 0) == 0 {
+            return Err(last_identity_error("PostMessageW(gfxstream repaint)"));
+        }
+    }
+    Ok(())
+}
+
+fn show_native_display_toplevel(
+    child: HWND,
+    width: i32,
+    height: i32,
+    move_to_debug_origin: bool,
+) -> Result<(), PlatformError> {
+    // SAFETY: child is the validated crosvm HWND. This development-only path changes the same
+    // parent/style fields as the production attach/detach path, but leaves the render HWND visible
+    // as a top-level popup so HD embedding can be isolated from gfxstream presentation.
+    unsafe {
+        ShowWindow(child, SW_HIDE);
+        SetLastError(0);
+        if SetParent(child, std::ptr::null_mut()).is_null() && GetLastError() != 0 {
+            return Err(last_identity_error("SetParent(debug top-level display)"));
+        }
+        if !GetParent(child).is_null() {
+            return Err(PlatformError::Process(
+                "crosvm debug display parent did not clear".to_owned(),
+            ));
+        }
+        let style = GetWindowLongPtrW(child, GWL_STYLE);
+        SetWindowLongPtrW(
+            child,
+            GWL_STYLE,
+            (style & !win32_style(WS_CHILD)) | win32_style(WS_POPUP) | win32_style(WS_CLIPCHILDREN),
+        );
+        let (x, y, position_flags) = if move_to_debug_origin {
+            (NATIVE_DISPLAY_TOPLEVEL_X, NATIVE_DISPLAY_TOPLEVEL_Y, 0)
+        } else {
+            (0, 0, SWP_NOMOVE | SWP_NOZORDER)
+        };
+        if SetWindowPos(
+            child,
+            std::ptr::null_mut(),
+            x,
+            y,
+            width,
+            height,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER | position_flags,
+        ) == 0
+        {
+            return Err(last_identity_error("SetWindowPos(debug top-level display)"));
+        }
+        ShowWindow(child, SW_SHOW);
+    }
+    notify_crosvm_viewport(child, width, height)
+}
+
+pub(crate) fn prepare_native_display(
+    child_pid: u32,
+    target: &NativeDisplayTargetV2,
+    viewport: &DisplayViewportV2,
+) -> Result<(), PlatformError> {
+    if !viewport.is_valid() {
+        return Err(PlatformError::Process(
+            "native display viewport is outside supported bounds".to_owned(),
+        ));
+    }
+    let (parent, _) = windows_target(target)?;
+    let input = crosvm_window(child_pid)?;
+    let (width, height) = viewport_dimensions(viewport)?;
+    if !viewport.visible {
+        // A minimized native root has no valid client extent. Hide both native surfaces without
+        // moving them or notifying gfxstream; rebuilding Intel's swapchain while the root is
+        // iconic can return an invalid Win32 surface extent.
+        unsafe {
+            ShowWindow(input, SW_HIDE);
+            if let Ok(render) = gfxstream_window_anywhere(child_pid) {
+                ShowWindow(render, SW_HIDE);
+            }
+        }
+        return Ok(());
+    }
+    // VulkanDisplay's `vulkan-subWin` is a child of crosvm's scanout window. Reparent the scanout
+    // first so the complete render subtree moves below HD, then discover the Vulkan child in that
+    // descendant tree. Looking for a direct child before SetParent makes every late attach and
+    // native display attachment fail even though the valid render HWND already exists.
+    unsafe {
+        let style = GetWindowLongPtrW(input, GWL_STYLE);
+        SetWindowLongPtrW(
+            input,
+            GWL_STYLE,
+            (style & !win32_style(WS_POPUP)) | win32_style(WS_CHILD) | win32_style(WS_CLIPCHILDREN),
+        );
+        SetLastError(0);
+        if SetParent(input, parent).is_null() && GetLastError() != 0 {
+            return Err(last_identity_error("SetParent(crosvm input surface)"));
+        }
+        if SetWindowPos(
+            input,
+            std::ptr::null_mut(),
+            0,
+            0,
+            width,
+            height,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        ) == 0
+        {
+            return Err(last_identity_error("SetWindowPos(crosvm input surface)"));
+        }
+    }
+    let render = gfxstream_window(child_pid, parent)?;
+    unsafe {
+        if SetWindowPos(
+            render,
+            std::ptr::null_mut(),
+            0,
+            0,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        ) == 0
+        {
+            return Err(last_identity_error(
+                "SetWindowPos(gfxstream render surface)",
+            ));
+        }
+        ShowWindow(render, SW_SHOW);
+        ShowWindow(input, SW_SHOW);
+    }
+    notify_crosvm_viewport(input, width, height)?;
+    request_native_display_repaint(render)
+}
+
 pub(crate) fn attach_native_display(
     child_pid: u32,
     target: &NativeDisplayTargetV2,
@@ -233,35 +611,13 @@ pub(crate) fn attach_native_display(
         ));
     }
     let (parent, _) = windows_target(target)?;
-    let child = crosvm_window(child_pid)?;
     let (width, height) = viewport_dimensions(viewport)?;
-    // SAFETY: both HWNDs were validated above; style and parent changes are synchronous.
-    unsafe {
-        let style = GetWindowLongPtrW(child, GWL_STYLE);
-        SetWindowLongPtrW(
-            child,
-            GWL_STYLE,
-            (style & !win32_style(WS_POPUP)) | win32_style(WS_CHILD) | win32_style(WS_CLIPCHILDREN),
-        );
-        SetLastError(0);
-        if SetParent(child, parent).is_null() && GetLastError() != 0 {
-            return Err(last_identity_error("SetParent(attach display)"));
-        }
-        if SetWindowPos(
-            child,
-            std::ptr::null_mut(),
-            0,
-            0,
-            width,
-            height,
-            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER,
-        ) == 0
-        {
-            return Err(last_identity_error("SetWindowPos(attach display)"));
-        }
-        ShowWindow(child, if viewport.visible { SW_SHOW } else { SW_HIDE });
+    if native_display_toplevel_debug_enabled() {
+        let child = crosvm_window(child_pid)?;
+        return show_native_display_toplevel(child, width, height, true);
     }
-    Ok(())
+    let _ = parent;
+    prepare_native_display(child_pid, target, viewport)
 }
 
 pub(crate) fn resize_native_display(
@@ -270,44 +626,63 @@ pub(crate) fn resize_native_display(
     viewport: &DisplayViewportV2,
 ) -> Result<(), PlatformError> {
     let (parent, _) = windows_target(target)?;
-    let child = crosvm_window(child_pid)?;
     let (width, height) = viewport_dimensions(viewport)?;
-    // SAFETY: handles and dimensions are validated before the synchronous calls.
+    if native_display_toplevel_debug_enabled() {
+        let child = crosvm_window(child_pid)?;
+        return show_native_display_toplevel(child, width, height, false);
+    }
+    let _ = parent;
+    prepare_native_display(child_pid, target, viewport)
+}
+
+pub(crate) fn set_native_display_visibility(
+    child_pid: u32,
+    visible: bool,
+) -> Result<(), PlatformError> {
+    let render = gfxstream_window_anywhere(child_pid)?;
+    let input = crosvm_window(child_pid)?;
     unsafe {
-        SetLastError(0);
-        if SetParent(child, parent).is_null() && GetLastError() != 0 {
-            return Err(last_identity_error("SetParent(resize display)"));
+        if visible {
+            // Preserve the established geometry and z-order. A visibility-only restore must not
+            // notify gfxstream or recreate Intel's swapchain after a minimized root window.
+            ShowWindow(input, SW_SHOW);
+            ShowWindow(render, SW_SHOW);
+            request_native_display_repaint(render)?;
+        } else {
+            ShowWindow(render, SW_HIDE);
+            ShowWindow(input, SW_HIDE);
         }
-        if SetWindowPos(
-            child,
-            std::ptr::null_mut(),
-            0,
-            0,
-            width,
-            height,
-            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER,
-        ) == 0
-        {
-            return Err(last_identity_error("SetWindowPos(resize display)"));
-        }
-        ShowWindow(child, if viewport.visible { SW_SHOW } else { SW_HIDE });
     }
     Ok(())
 }
 
 pub(crate) fn detach_native_display(child_pid: u32) -> Result<(), PlatformError> {
+    if let Ok(render) = gfxstream_window_anywhere(child_pid) {
+        // SAFETY: the render HWND belongs to the validated crosvm process tree.
+        unsafe { ShowWindow(render, SW_HIDE) };
+    }
     let child = crosvm_window(child_pid)?;
-    // SAFETY: child is a live crosvm window and is detached before the Player parent is destroyed.
+    let parking = crosvm_parking_window(child_pid)?;
+    // SAFETY: both windows belong to crosvm. Return the input/projection window to its hidden
+    // parking parent without destroying the Guest or gfxstream render surface.
     unsafe {
         ShowWindow(child, SW_HIDE);
-        SetParent(child, std::ptr::null_mut());
         let style = GetWindowLongPtrW(child, GWL_STYLE);
         SetWindowLongPtrW(
             child,
             GWL_STYLE,
-            (style & !win32_style(WS_CHILD)) | win32_style(WS_POPUP) | win32_style(WS_CLIPCHILDREN),
+            (style & !win32_style(WS_POPUP)) | win32_style(WS_CHILD) | win32_style(WS_CLIPCHILDREN),
         );
-        SetWindowPos(
+        SetLastError(0);
+        if SetParent(child, parking).is_null() && GetLastError() != 0 {
+            return Err(last_identity_error("SetParent(park display)"));
+        }
+        if GetParent(child) != parking {
+            return Err(PlatformError::Process(
+                "crosvm display did not return to its parking window".to_owned(),
+            ));
+        }
+        if SetWindowPos(
             child,
             std::ptr::null_mut(),
             0,
@@ -315,7 +690,10 @@ pub(crate) fn detach_native_display(child_pid: u32) -> Result<(), PlatformError>
             1,
             1,
             SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER,
-        );
+        ) == 0
+        {
+            return Err(last_identity_error("SetWindowPos(park display)"));
+        }
     }
     Ok(())
 }
@@ -985,6 +1363,10 @@ pub(crate) fn configure_managed(command: &mut Command) {
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_SUSPENDED);
 }
 
+pub(crate) fn configure_transient(command: &mut Command) {
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
 pub(crate) fn resume_managed_process(pid: u32) -> Result<(), PlatformError> {
     // SAFETY: the snapshot handle is owned by this function and closed on every path below.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
@@ -1194,4 +1576,27 @@ fn windows_version() -> Option<(u32, u32, u32)> {
     };
     // SAFETY: info is correctly sized and writable for the synchronous OS call.
     (unsafe { RtlGetVersion(&raw mut info) } >= 0).then_some((info.major, info.minor, info.build))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::native_display_toplevel_value_enabled;
+
+    #[test]
+    fn native_display_toplevel_debug_flag_requires_truthy_value() {
+        assert!(!native_display_toplevel_value_enabled(None));
+        assert!(!native_display_toplevel_value_enabled(Some(OsStr::new(""))));
+        assert!(!native_display_toplevel_value_enabled(Some(OsStr::new(
+            "0"
+        ))));
+        assert!(!native_display_toplevel_value_enabled(Some(OsStr::new(
+            "FALSE"
+        ))));
+        assert!(native_display_toplevel_value_enabled(Some(OsStr::new("1"))));
+        assert!(native_display_toplevel_value_enabled(Some(OsStr::new(
+            "true"
+        ))));
+    }
 }

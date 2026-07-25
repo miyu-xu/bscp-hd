@@ -19,3 +19,7 @@ pub(crate) fn allow_display_copy_fallback_enabled() -> bool {
 pub(crate) fn allow_adb_offline_boot_ready_enabled() -> bool {
     env_flag_enabled("HD_DEV_ALLOW_ADB_OFFLINE_BOOT_READY")
 }
+
+pub(crate) const fn native_display_direct_enabled() -> bool {
+    cfg!(windows)
+}

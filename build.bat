@@ -37,7 +37,29 @@ set "AR=%MINGW_PATH%\bin\ar.exe"
 set "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=%MINGW_PATH%\bin\gcc.exe"
 set "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_AR=%MINGW_PATH%\bin\ar.exe"
 
-echo Building HD with %CC% for %RUST_TARGET%
+where npm.cmd >nul 2>&1
+if errorlevel 1 (
+    echo Error: npm.cmd was not found. Node.js is required to build the HD WebView UI. 1>&2
+    exit /b 2
+)
+
+pushd "%HD_ROOT%web"
+if not exist "node_modules\.package-lock.json" (
+    call npm.cmd ci
+    if errorlevel 1 (
+        popd
+        exit /b 1
+    )
+)
+call npm.cmd run build
+if errorlevel 1 (
+    popd
+    exit /b 1
+)
+popd
+
+echo Building HD WebView shell and runtime with %CC% for %RUST_TARGET%
+
 cargo run --manifest-path "%HD_ROOT%Cargo.toml" --target "%RUST_TARGET%" -p xtask -- process-check
 if errorlevel 1 exit /b 1
 

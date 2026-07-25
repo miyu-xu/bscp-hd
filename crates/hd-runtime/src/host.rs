@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 use fs2::FileExt as _;
 use hd_core::{
     AcquireDisplaySessionRequestV2, ActionRequestV2, ApiErrorV2, CreateInstanceRequestV2,
-    DesiredStateV2, DisplaySessionV2, FrameReadyMarkerV2, HostCapabilitiesV2, HostEventKindV2,
-    HostEventV2, InstanceRecordV2, InstanceSummaryV2, NativeDisplayTargetV2, ObservedStateV2,
-    OperationKindV2, OperationRecordV2, OperationStateV2, ReconcileReportV2,
-    ReleaseDisplaySessionRequestV2, RestartPolicyV2, ScreenshotRecordV2, StopModeV2,
-    UpdateDisplaySessionRequestV2, UpdateInstanceRequestV2, WORKER_PROTOCOL_VERSION,
-    WorkerCommandV2, WorkerDescriptorV2, WorkerIdentityV2, WorkerPayloadV2, WorkerRequestV2,
-    WorkerResponseV2, WorkerStatusV2,
+    DesiredStateV2, DisplaySessionV2, DisplayViewportV2, FrameReadyMarkerV2, HostCapabilitiesV2,
+    HostEventKindV2, HostEventV2, InstanceActionV2, InstanceRecordV2, InstanceSummaryV2,
+    NativeDisplayTargetV2, ObservedStateV2, OperationKindV2, OperationRecordV2, OperationStateV2,
+    PreparedNativeDisplayV2, ReconcileReportV2, ReleaseDisplaySessionRequestV2, RestartPolicyV2,
+    ScreenshotRecordV2, StopModeV2, UpdateDisplaySessionRequestV2, UpdateInstanceRequestV2,
+    WORKER_PROTOCOL_VERSION, WorkerCommandV2, WorkerDescriptorV2, WorkerIdentityV2,
+    WorkerPayloadV2, WorkerRequestV2, WorkerResponseV2, WorkerStatusV2,
 };
 use hd_platform::{DataPaths, executable_name, process_identity_is_alive};
 use parking_lot::Mutex as ParkingMutex;
@@ -41,7 +41,7 @@ struct RuntimeRestartState {
 struct ActiveHostDisplaySession {
     session: DisplaySessionV2,
     target: NativeDisplayTargetV2,
-    viewport_revision: u64,
+    viewport: DisplayViewportV2,
 }
 
 #[derive(Debug)]
@@ -270,6 +270,10 @@ impl HostService {
         request: ActionRequestV2,
     ) -> Result<WorkerStatusV2, HostError> {
         request.action.validate()?;
+        let rotated_orientation = match &request.action {
+            InstanceActionV2::Rotate { orientation } => Some(*orientation),
+            _ => None,
+        };
         let operation_lock = {
             let mut locks = self.instance_operations.lock().await;
             Arc::clone(
@@ -292,7 +296,17 @@ impl HostService {
             )
             .await?;
         ensure_worker_success(response)?;
-        self.refresh_from_worker(instance_id).await
+        let status = self.refresh_from_worker(instance_id).await?;
+        if let Some(orientation) = rotated_orientation {
+            let mut record = self.get_instance(instance_id)?;
+            if record.spec.display.orientation != orientation {
+                record.spec.display.orientation = orientation;
+                record.status.revision = record.status.revision.saturating_add(1);
+                record.status.updated_at = OffsetDateTime::now_utc();
+                self.persist_instance(&record)?;
+            }
+        }
+        Ok(status)
     }
 
     pub async fn acquire_display_session(
@@ -312,11 +326,9 @@ impl HostService {
         }
         let record = self.get_instance(instance_id)?;
         let generation = record.frame_generation;
-        if record.status.observed == ObservedStateV2::Stopped || record.worker.is_none() {
-            return Err(HostError::Busy("display attach requires a running worker"));
-        }
+        let worker_active = record.status.observed.is_active() && record.worker.is_some();
         let previous = self.display_sessions.lock().await.remove(&instance_id);
-        if let Some(previous) = previous {
+        if worker_active && let Some(previous) = previous {
             // A Worker accepts a single target. Detach the old target before assigning the new
             // Player so a stale hidden Player cannot retain the crosvm child window.
             let _ = self
@@ -329,25 +341,26 @@ impl HostService {
                 )
                 .await;
         }
-        let descriptor = self.read_worker_descriptor(instance_id)?;
         let session_id = Uuid::new_v4();
         let token = random_session_token()?;
-        let response = self
-            .call_worker(
-                instance_id,
-                WorkerCommandV2::AttachDisplay {
-                    session_id,
-                    generation,
-                    target: request.target.clone(),
-                    viewport: request.viewport.clone(),
-                },
-            )
-            .await?;
-        ensure_worker_success(response)?;
+        if worker_active {
+            let response = self
+                .call_worker(
+                    instance_id,
+                    WorkerCommandV2::AttachDisplay {
+                        session_id,
+                        generation,
+                        target: request.target.clone(),
+                        viewport: request.viewport.clone(),
+                    },
+                )
+                .await?;
+            ensure_worker_success(response)?;
+        }
         let session = DisplaySessionV2 {
             id: session_id,
             instance_id,
-            worker_endpoint: descriptor.endpoint,
+            worker_endpoint: worker_endpoint(instance_id)?,
             session_token: token,
             generation,
             expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(15),
@@ -357,7 +370,7 @@ impl HostService {
             ActiveHostDisplaySession {
                 session: session.clone(),
                 target: request.target,
-                viewport_revision: request.viewport.revision,
+                viewport: request.viewport,
             },
         );
         Ok(session)
@@ -373,6 +386,8 @@ impl HostService {
                 "viewport is outside supported bounds".to_owned(),
             ));
         }
+        let record = self.get_instance(instance_id)?;
+        let worker_active = record.status.observed.is_active() && record.worker.is_some();
         let mut sessions = self.display_sessions.lock().await;
         let active = sessions
             .get_mut(&instance_id)
@@ -387,7 +402,12 @@ impl HostService {
                 "Player process identity is no longer alive".to_owned(),
             ));
         }
-        if request.viewport.revision > active.viewport_revision {
+        if request.viewport.revision > active.viewport.revision {
+            if !worker_active {
+                active.viewport = request.viewport;
+                active.session.expires_at = OffsetDateTime::now_utc() + time::Duration::seconds(15);
+                return Ok(active.session.clone());
+            }
             let response = self
                 .call_worker(
                     instance_id,
@@ -399,7 +419,7 @@ impl HostService {
                 )
                 .await?;
             ensure_worker_success(response)?;
-            active.viewport_revision = request.viewport.revision;
+            active.viewport = request.viewport;
         }
         active.session.expires_at = OffsetDateTime::now_utc() + time::Duration::seconds(15);
         Ok(active.session.clone())
@@ -423,6 +443,10 @@ impl HostService {
             .remove(&instance_id)
             .expect("session checked above");
         drop(sessions);
+        let record = self.get_instance(instance_id)?;
+        if !record.status.observed.is_active() || record.worker.is_none() {
+            return Ok(());
+        }
         let response = self
             .call_worker(
                 instance_id,
@@ -942,6 +966,30 @@ impl HostService {
             let mut run_id = Uuid::new_v4();
             record.active_run_id = Some(run_id);
             self.persist_instance(&record)?;
+            let initial_display = {
+                let mut sessions = self.display_sessions.lock().await;
+                let prepared = sessions.get_mut(&id).and_then(|active| {
+                    if !process_identity_is_alive(active.target.owner()) {
+                        return None;
+                    }
+                    active.session.generation = frame_generation;
+                    active.session.expires_at =
+                        OffsetDateTime::now_utc() + time::Duration::seconds(15);
+                    Some(PreparedNativeDisplayV2 {
+                        session_id: active.session.id,
+                        target: active.target.clone(),
+                        viewport: active.viewport.clone(),
+                    })
+                });
+                if prepared.is_none()
+                    && sessions
+                        .get(&id)
+                        .is_some_and(|active| !process_identity_is_alive(active.target.owner()))
+                {
+                    sessions.remove(&id);
+                }
+                prepared
+            };
             let mut response = self
                 .call_worker(
                     id,
@@ -950,6 +998,7 @@ impl HostService {
                         run_id,
                         leases: if bound.is_empty() { reserved } else { bound },
                         capabilities_fingerprint: discovery.capabilities.fingerprint.clone(),
+                        initial_display: initial_display.clone(),
                     },
                 )
                 .await?;
@@ -983,6 +1032,7 @@ impl HostService {
                             run_id,
                             leases: rebound,
                             capabilities_fingerprint: discovery.capabilities.fingerprint,
+                            initial_display,
                         },
                     )
                     .await?;
@@ -1227,9 +1277,9 @@ impl HostService {
         command: WorkerCommandV2,
     ) -> Result<(), HostError> {
         let response = self.call_worker(id, command).await?;
-        ensure_worker_success(response)?;
-        self.refresh_from_worker(id).await?;
-        Ok(())
+        let operation_result = ensure_worker_success(response).map(|_| ());
+        let refresh_result = self.refresh_from_worker(id).await.map(|_| ());
+        operation_result.and(refresh_result)
     }
 
     async fn reconfigure_instance(
