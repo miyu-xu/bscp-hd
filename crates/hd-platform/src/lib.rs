@@ -6,8 +6,9 @@ use std::process::{Command, Stdio};
 
 use async_trait::async_trait;
 use hd_core::{
-    DeviceSerialEndpointV2, DisplayConfigV2, FrameTransportKindV2, InstanceSpecV2, KeyActionV2,
-    LaunchPlanV2, ResolvedGuestArtifactsV2, WorkerIdentityV2,
+    DeviceSerialEndpointV2, DisplayConfigV2, DisplayViewportV2, FrameTransportKindV2,
+    InstanceSpecV2, KeyActionV2, LaunchPlanV2, NativeDisplayTargetV2, ResolvedGuestArtifactsV2,
+    WorkerIdentityV2,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,6 +20,56 @@ mod unix;
 mod windows;
 
 pub const HD_DATA_DIR_ENV: &str = "HD_DATA_DIR";
+
+pub fn attach_native_display(
+    child_pid: u32,
+    target: &NativeDisplayTargetV2,
+    viewport: &DisplayViewportV2,
+) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        windows::attach_native_display(child_pid, target, viewport)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child_pid, target, viewport);
+        Err(PlatformError::Unsupported(
+            "native display embedding is currently implemented only on Windows",
+        ))
+    }
+}
+
+pub fn resize_native_display(
+    child_pid: u32,
+    target: &NativeDisplayTargetV2,
+    viewport: &DisplayViewportV2,
+) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        windows::resize_native_display(child_pid, target, viewport)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (child_pid, target, viewport);
+        Err(PlatformError::Unsupported(
+            "native display embedding is currently implemented only on Windows",
+        ))
+    }
+}
+
+pub fn detach_native_display(child_pid: u32) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        windows::detach_native_display(child_pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child_pid;
+        Err(PlatformError::Unsupported(
+            "native display embedding is currently implemented only on Windows",
+        ))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataPaths {
@@ -35,6 +86,15 @@ pub struct DataPaths {
 }
 
 impl DataPaths {
+    /// User-visible screenshots intentionally live outside the private runtime data root.
+    /// If the platform does not expose a Pictures directory, retain the previous private-root
+    /// fallback so screenshot capture remains available in minimal Windows profiles.
+    pub fn screenshot_directory(&self) -> PathBuf {
+        dirs::picture_dir()
+            .unwrap_or_else(|| self.root.join("screenshots"))
+            .join("HD")
+    }
+
     pub fn discover() -> Result<Self, PlatformError> {
         let root = match std::env::var_os(HD_DATA_DIR_ENV) {
             Some(path) if !path.is_empty() => PathBuf::from(path),
@@ -329,6 +389,7 @@ pub struct VmLaunchContextV2 {
     pub frame_endpoint: String,
     pub keyboard_endpoint: String,
     pub device_endpoints: BTreeMap<String, DeviceSerialEndpointV2>,
+    pub device_control_endpoints: BTreeMap<String, String>,
     pub adb_host_port: Option<u16>,
 }
 
@@ -622,6 +683,18 @@ pub fn contain_process(pid: u32) -> Result<ProcessContainment, PlatformError> {
         Ok(ProcessContainment {
             inner: unix::contain_process(pid),
         })
+    }
+}
+
+pub fn resume_managed_process(pid: u32) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        windows::resume_managed_process(pid)
+    }
+    #[cfg(unix)]
+    {
+        let _ = pid;
+        Ok(())
     }
 }
 

@@ -132,21 +132,26 @@ impl ArtifactResolver {
         validate_guest_architecture(&guest)?;
         let guest_files = role_map(&guest_root, &guest)?;
         let host_tools = role_map(&host_root, &host)?;
-        for role in ["kernel", "initrd", "rootfs", "android_fstab"] {
+        for role in [
+            "kernel",
+            "initrd",
+            "rootfs",
+            "android_fstab",
+            "sensor-injector",
+        ] {
             require_role(&guest_files, role)?;
         }
+        require_executable_roles(&guest, &["sensor-injector"])?;
         for role in ["crosvm", "adb", "aapt2", "hd-device-sim", "frame-producer"] {
             require_role(&host_tools, role)?;
         }
+        require_windows_runtime_roles(&host_tools)?;
         for role in [
             "adb-bridge",
             "rootcanal-adapter",
             "casimir-adapter",
             "modem-adapter",
             "uwb-adapter",
-            "network-adapter",
-            "audio-adapter",
-            "camera-adapter",
         ] {
             require_role(&host_tools, role)?;
         }
@@ -163,9 +168,6 @@ impl ArtifactResolver {
                 "casimir-adapter",
                 "modem-adapter",
                 "uwb-adapter",
-                "network-adapter",
-                "audio-adapter",
-                "camera-adapter",
             ],
         )?;
         require_capabilities(
@@ -202,6 +204,118 @@ impl ArtifactResolver {
                 initrd: guest_files["initrd"].clone(),
                 rootfs: guest_files["rootfs"].clone(),
                 android_fstab: guest_files["android_fstab"].clone(),
+                sensor_injector: guest_files["sensor-injector"].clone(),
+                system_image: guest_files.get("system_image").cloned(),
+                vendor_image: guest_files.get("vendor_image").cloned(),
+                host_tools,
+            },
+            guest_manifest: guest,
+            host_manifest: host,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn resolve_fast_dev(
+        &self,
+        selection: &ArtifactSelectionV2,
+    ) -> Result<ResolvedBundleSetV2, ArtifactError> {
+        let guest_root = bundle_root(&selection.store_root, &selection.guest_bundle_digest);
+        let host_root = bundle_root(&selection.store_root, &selection.host_bundle_digest);
+        let guest = read_bundle_manifest_fast(
+            &guest_root,
+            &selection.guest_bundle_digest,
+            ArtifactBundleKindV2::Guest,
+        )?;
+        let host = read_bundle_manifest_fast(
+            &host_root,
+            &selection.host_bundle_digest,
+            ArtifactBundleKindV2::HostTools,
+        )?;
+        validate_platform(&host)?;
+        validate_guest_architecture(&guest)?;
+        let guest_file_root = std::env::var_os("HD_DEV_GUEST_BUNDLE_ROOT")
+            .map_or_else(|| guest_root.clone(), PathBuf::from);
+        let host_file_root = std::env::var_os("HD_DEV_HOST_TOOLS_ROOT")
+            .map_or_else(|| host_root.clone(), PathBuf::from);
+        let mut guest_files = role_map(&guest_file_root, &guest)?;
+        if let Some(path) = std::env::var_os("HD_DEV_SENSOR_INJECTOR") {
+            guest_files.insert("sensor-injector".to_owned(), PathBuf::from(path));
+        }
+        let host_tools = role_map(&host_file_root, &host)?;
+        require_dev_files(&guest_files, "guest")?;
+        require_dev_files(&host_tools, "host tool")?;
+        for role in [
+            "kernel",
+            "initrd",
+            "rootfs",
+            "android_fstab",
+            "sensor-injector",
+        ] {
+            require_role(&guest_files, role)?;
+        }
+        for role in ["crosvm", "adb", "aapt2", "hd-device-sim", "frame-producer"] {
+            require_role(&host_tools, role)?;
+        }
+        require_windows_runtime_roles(&host_tools)?;
+        for role in [
+            "adb-bridge",
+            "rootcanal-adapter",
+            "casimir-adapter",
+            "modem-adapter",
+            "uwb-adapter",
+        ] {
+            require_role(&host_tools, role)?;
+        }
+        require_executable_roles(
+            &host,
+            &[
+                "crosvm",
+                "adb",
+                "aapt2",
+                "hd-device-sim",
+                "frame-producer",
+                "adb-bridge",
+                "rootcanal-adapter",
+                "casimir-adapter",
+                "modem-adapter",
+                "uwb-adapter",
+            ],
+        )?;
+        require_capabilities(
+            &guest,
+            &[
+                "android-15.0.0_r14",
+                "hd-guest-profile-v2",
+                "hd-device-bridge-v2",
+            ],
+        )?;
+        let frame_transport = match hd_platform::platform_name() {
+            "windows" => "frame-vulkan-win32-v2",
+            "linux" => "frame-vulkan-dmabuf-v2",
+            "macos" => "frame-metal-iosurface-v2",
+            _ => return Err(ArtifactError::UnsupportedHost),
+        };
+        require_capabilities(
+            &host,
+            &[
+                "hd-host-tools-v2",
+                "input-external-v2",
+                "device-profile-cf-phone-v2",
+                frame_transport,
+            ],
+        )?;
+        require_capabilities(&host, &["adb-loopback-vsock-v2"])?;
+        Ok(ResolvedBundleSetV2 {
+            artifacts: ResolvedGuestArtifactsV2 {
+                guest_bundle_digest: guest.digest.clone(),
+                host_bundle_digest: host.digest.clone(),
+                guest_bundle_root: guest_root,
+                host_bundle_root: host_root,
+                kernel: guest_files["kernel"].clone(),
+                initrd: guest_files["initrd"].clone(),
+                rootfs: guest_files["rootfs"].clone(),
+                android_fstab: guest_files["android_fstab"].clone(),
+                sensor_injector: guest_files["sensor-injector"].clone(),
                 system_image: guest_files.get("system_image").cloned(),
                 vendor_image: guest_files.get("vendor_image").cloned(),
                 host_tools,
@@ -268,7 +382,85 @@ impl ArtifactResolver {
     }
 }
 
+fn read_bundle_manifest_fast(
+    root: &Path,
+    expected_digest: &str,
+    expected_kind: ArtifactBundleKindV2,
+) -> Result<ArtifactBundleV2, ArtifactError> {
+    validate_digest(expected_digest)?;
+    let manifest_path = root.join(MANIFEST_FILE);
+    let ready_path = root.join(READY_FILE);
+    let manifest_bytes = read_limited(&manifest_path, MAX_MANIFEST_BYTES)?;
+    let ready_bytes = read_limited(&ready_path, MAX_MANIFEST_BYTES)?;
+    let manifest: ArtifactBundleV2 =
+        serde_json::from_slice(&manifest_bytes).map_err(ArtifactError::Decode)?;
+    let ready: ArtifactReadyMarkerV2 =
+        serde_json::from_slice(&ready_bytes).map_err(ArtifactError::Decode)?;
+    if manifest.schema_version != ARTIFACT_INDEX_VERSION
+        || ready.schema_version != ARTIFACT_INDEX_VERSION
+    {
+        return Err(ArtifactError::UnsupportedVersion(
+            manifest.schema_version.min(ready.schema_version),
+        ));
+    }
+    if manifest.kind != expected_kind {
+        return Err(ArtifactError::WrongKind {
+            expected: expected_kind,
+            actual: manifest.kind,
+        });
+    }
+    let computed_digest = hex::encode(Sha256::digest(canonical_payload(&manifest)?));
+    if manifest.digest != expected_digest || manifest.digest != computed_digest {
+        return Err(ArtifactError::DigestMismatch {
+            label: "bundle manifest".to_owned(),
+            expected: expected_digest.to_owned(),
+            actual: computed_digest,
+        });
+    }
+    if ready.bundle_digest != manifest.digest {
+        return Err(ArtifactError::DigestMismatch {
+            label: "READY bundle".to_owned(),
+            expected: manifest.digest.clone(),
+            actual: ready.bundle_digest,
+        });
+    }
+    validate_bundle_manifest_fast(&manifest)?;
+    Ok(manifest)
+}
+
+fn require_windows_runtime_roles(
+    host_tools: &BTreeMap<String, PathBuf>,
+) -> Result<(), ArtifactError> {
+    if hd_platform::platform_name() != "windows" {
+        return Ok(());
+    }
+    for role in [
+        "gfxstream-backend",
+        "angle-egl",
+        "angle-glesv2",
+        "angle-vulkan-loader",
+        "crosvm-runtime-slirp",
+        "crosvm-runtime-audio",
+        "gnu-runtime-stdcpp",
+        "gnu-runtime-gcc",
+        "gnu-runtime-winpthread",
+        "adb-winapi",
+        "adb-winusb",
+    ] {
+        require_role(host_tools, role)?;
+    }
+    Ok(())
+}
+
 fn validate_bundle_contents(root: &Path, manifest: &ArtifactBundleV2) -> Result<(), ArtifactError> {
+    validate_bundle_manifest_fast(manifest)?;
+    for file in &manifest.files {
+        verify_file(root, file)?;
+    }
+    Ok(())
+}
+
+fn validate_bundle_manifest_fast(manifest: &ArtifactBundleV2) -> Result<(), ArtifactError> {
     validate_digest(&manifest.source_manifest_digest)?;
     if manifest.files.is_empty() {
         return Err(ArtifactError::Manifest("bundle has no files".to_owned()));
@@ -305,7 +497,6 @@ fn validate_bundle_contents(root: &Path, manifest: &ArtifactBundleV2) -> Result<
             )));
         }
         validate_digest(&file.sha256)?;
-        verify_file(root, file)?;
     }
     let mut capabilities = BTreeSet::new();
     if manifest.capabilities.is_empty() || manifest.capabilities.len() > 128 {
@@ -386,6 +577,26 @@ fn require_role(files: &BTreeMap<String, PathBuf>, role: &str) -> Result<(), Art
     } else {
         Err(ArtifactError::MissingRole(role.to_owned()))
     }
+}
+
+fn require_dev_files(
+    files: &BTreeMap<String, PathBuf>,
+    bundle_label: &str,
+) -> Result<(), ArtifactError> {
+    for (role, path) in files {
+        let metadata = std::fs::symlink_metadata(path).map_err(|source| ArtifactError::Io {
+            operation: "inspect fast-development artifact",
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(ArtifactError::Manifest(format!(
+                "fast-development {bundle_label} role {role} is not a regular file: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn require_executable_roles(

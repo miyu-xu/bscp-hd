@@ -1,0 +1,101 @@
+{
+  "schema_version": 2,
+  "task_id": "cuttlefish-import-v1",
+  "objective": "实现 Android x86_64 Cuttlefish 官方 image/target-files 或 image/OTA-metadata 发布包到 HD Guest bundle staging 的确定性离线导入器。",
+  "status": "in_progress",
+  "scope": {
+    "repositories": ["hd", "bscp-root"],
+    "owned_paths": ["hd/xtask/", "hd/docs/", "hd/automation/tasks/cuttlefish-import-v1.json", "scripts/import_cuttlefish_to_hd.py", "scripts/sensors_simulator_host.py", "scripts/cf_host_devices.py"],
+    "excluded_paths": ["out/", "target/", "HD runtime 启动与认证契约", "用户既有未提交改动中与本任务无关的部分"]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "windows_uses_mingw_only",
+    "preserve_user_changes",
+    "do_not_download_guest_images",
+    "do_not_sign_or_certify_without_authorized_keys",
+    "reject_unmatched_android_version_or_architecture",
+    "do_not_push"
+  ],
+  "acceptance": [
+    {
+      "id": "CFI-001",
+      "criterion": "导入器安全读取 Cuttlefish image ZIP 与 target-files ZIP 或 OTA metadata，拒绝路径穿越、冲突关键文件、未支持版本/架构和缺失必需镜像。",
+      "evidence": ["gate:cuttlefish-import-self-check", "artifact:import-events.jsonl"]
+    },
+    {
+      "id": "CFI-002",
+      "criterion": "导入器生成 kernel、initrd、rootfs、android_fstab staging，正确展开 Android sparse 分区、合成缺失 metadata 并构造 GPT；sensor-injector 缺失时明确阻止发布。",
+      "evidence": ["gate:cuttlefish-import-self-check", "artifact:import-manifest-v1.json"]
+    },
+    {
+      "id": "CFI-003",
+      "criterion": "输出明确区分 staging 与正式签名 bundle，提供 publish-bundle 参数清单且不自动签名、认证或下载。",
+      "evidence": ["gate:process-check", "artifact:publish-request-v1.json"]
+    },
+    {
+      "id": "CFI-004",
+      "criterion": "xtask 暴露跨平台导入入口，格式、all-targets 编译和 Clippy 通过。",
+      "evidence": ["gate:hd-quality", "artifact:readback.json"]
+    }
+  ],
+  "required_gates": [
+    "process-check",
+    "cuttlefish-import-self-check",
+    "hd-quality"
+  ],
+  "evidence_state": {
+    "code_present": true,
+    "tests_authored": true,
+    "contract_smoke_verified": true,
+    "real_guest_verified": true
+  },
+  "direction_decisions": [
+    {
+      "id": "D-CFI-PINNED",
+      "decision": "Android 15 x86_64 userdebug 可按固定 profile 导入；latest Android 17/SDK 37 使用 cuttlefish-android17-split-sensors-v1（hvc18/hvc19）生成 staging，已用 Windows crosvm 2D Guest SwiftShader 完整启动到 sys.boot_completed=1，但正式 runtime/profile 接入和认证完成前不得发布。",
+      "owner": "human",
+      "rationale": "当前 HD resolver 固定要求 android-15.0.0_r14、hd-guest-profile-v2 和 hd-device-bridge-v2。"
+    },
+    {
+      "id": "D-CFI-OFFLINE",
+      "decision": "导入器只消费人工提供的发布包和可选 sensor-injector，不负责信任根管理、签名或认证。",
+      "owner": "ai",
+      "rationale": "保持 guest 来源、发布授权和密钥边界由人工控制。"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "B-CFI-RUNTIME-ANDROID17",
+      "description": "官方 build 15885347 已成功转换并由 Windows crosvm 2D Guest SwiftShader 完整启动，ADB 已确认 Android 17/SDK 37、sys.boot_completed=1、PackageManager、CrosvmDisplay 和 Sensors；当前 HD resolver/profile 仍固定 Android 15，尚不能通过正式 HD start/认证流程发布。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "B-CFI-SENSOR",
+      "description": "本机缺少 Android x86_64 正式 hd-sensor-injector；staging 已明确记录 sensor_injector_missing，不能作为完整 Guest bundle 发布。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "B-CFI-APEXD-ANDROID17",
+      "description": "补齐 Android 17 multi-install vendor APEX selector 后，WHPX/crosvm 可写盘 smoke 已成功扫描并激活 87 个 APEX；原 bootstrap-apexd-failed 阻塞已关闭。",
+      "scope": "current_task",
+      "state": "resolved"
+    },
+    {
+      "id": "B-CFI-GFXSTREAM-ANDROID17",
+      "description": "HD 正式 gfxstream guest-ANGLE/ranchu 参数仍会在 DRM_IOCTL_VIRTGPU_GET_CAPS/CONTEXT_INIT 后触发 WHPX soft-lockup；但官方 guest_swiftshader 合约（crosvm backend=2d、Guest ANGLE/Pastel/minigbm/ranchu）已消除 rutabaga -22 和 SurfaceFlinger 阻塞，并实测 sys.boot_completed=1。该软件 Vulkan 路径不满足正式硬件渲染和零拷贝契约。",
+      "scope": "current_task",
+      "state": "resolved"
+    },
+    {
+      "id": "B-CFI-DEVICE-TOPOLOGY-ANDROID17",
+      "description": "已从 android17-release 和同 build 官方 launcher.log 确认 20-console 布局：hvc18 sensors control、hvc19 sensors data。Windows 双命名管道、官方 RawMessage 握手及 ISensors/default 注册均已实机验证；旧 hvc13/ENODEV 结论已关闭。lights 参数仍需由正式 runtime 按实例动态注入。",
+      "scope": "current_task",
+      "state": "resolved"
+    }
+  ],
+  "human_decisions_needed": [],
+  "next_iteration": "把已验证的 crosvm 2D Guest SwiftShader 选择和 cuttlefish-android17-split-sensors-v1 接入 HD resolver、VmLaunchContext 和 hd-device-sim，按 capability 生成 hvc18/hvc19 两组 endpoint，并由 runtime 按实例 CID 注入 lights bootconfig。随后提供正式 x86_64 sensor-injector，执行 device-profile、zero-copy 和 certification gates，同时清理 hd-platform Windows Clippy 存量告警。"
+}

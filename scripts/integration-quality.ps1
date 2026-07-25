@@ -4,6 +4,7 @@ param(
     [string]$Output = "out/ai/integration",
     [string]$MingwRoot = "C:\workspace\mingw64",
     [string]$CrosvmFeatures = "whpx,composite-disk,android-sparse,net,slirp,balloon,gpu,gfxstream,vulkan_display,vulkano",
+    [string]$Android17GfxstreamRun = "",
     [switch]$RunRootBuild,
     [switch]$PlanOnly
 )
@@ -25,6 +26,8 @@ $make = Join-Path $mingwBin "mingw32-make.exe"
 $objdump = Join-Path $mingwBin "objdump.exe"
 $cargo = (Get-Command cargo.exe -ErrorAction Stop).Source
 $git = (Get-Command git.exe -ErrorAction Stop).Source
+$taskDocument = Get-Content -LiteralPath $taskPath -Raw | ConvertFrom-Json
+$requiredGates = @($taskDocument.required_gates)
 
 if (-not $PlanOnly) {
     foreach ($required in @($gcc, $make, $objdump)) {
@@ -123,11 +126,49 @@ function Invoke-Gate {
 }
 
 $records = [Collections.Generic.List[object]]::new()
+if ($requiredGates -contains "angle-runtime-probe") {
+    $records.Add((Invoke-Gate `
+        -Name "angle-runtime-probe" `
+        -Executable (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -Arguments @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+            (Join-Path $workspaceRoot "scripts\check_angle_runtime.ps1"),
+            "-RuntimeDir", (Join-Path $workspaceRoot "out\dist\windows\gfx\angle")
+        ) `
+        -WorkingDirectory $workspaceRoot))
+}
+if ($requiredGates -contains "android17-real-guest") {
+    if (-not $Android17GfxstreamRun) {
+        throw "-Android17GfxstreamRun is required for the android17-real-guest gate"
+    }
+    $records.Add((Invoke-Gate `
+        -Name "android17-real-guest" `
+        -Executable (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -Arguments @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+            (Join-Path $workspaceRoot "scripts\check_android17_gfxstream_evidence.ps1"),
+            "-RunDir", $Android17GfxstreamRun,
+            "-ResultPath", (Join-Path $outputPath "android17-gfxstream-result.json")
+        ) `
+        -WorkingDirectory $workspaceRoot))
+}
 $records.Add((Invoke-Gate `
     -Name "hd-quality" `
     -Executable $cargo `
     -Arguments @("run", "--target", "x86_64-pc-windows-gnu", "-p", "xtask", "--", "quality") `
     -WorkingDirectory $hdRoot))
+
+$gfxstreamBuild = Join-Path $workspaceRoot "out\gfxstream_build_windows"
+$records.Add((Invoke-Gate `
+    -Name "gfxstream-mingw-build" `
+    -Executable $make `
+    -Arguments @("-C", $gfxstreamBuild, "gfxstream_backend", "-j4") `
+    -WorkingDirectory $workspaceRoot))
+
+# rutabaga_gfx uses GFXSTREAM_PATH as the explicit Windows GNU link contract. Without it,
+# its build script falls back to pkg-config, which correctly rejects a host/target cross query.
+# Build the backend first so the crosvm gates validate the same artifact used by build_all.bat.
+$env:GFXSTREAM_PATH = $gfxstreamBuild
 
 $crosvmRoot = Join-Path $workspaceRoot "external\crosvm"
 $crosvmArguments = @(
@@ -152,12 +193,6 @@ $records.Add((Invoke-Gate `
     -Arguments @("diff", "--check") `
     -WorkingDirectory $crosvmRoot))
 
-$gfxstreamBuild = Join-Path $workspaceRoot "out\gfxstream_build_windows"
-$records.Add((Invoke-Gate `
-    -Name "gfxstream-mingw-build" `
-    -Executable $make `
-    -Arguments @("-C", $gfxstreamBuild, "gfxstream_backend", "-j4") `
-    -WorkingDirectory $workspaceRoot))
 $records.Add((Invoke-Gate `
     -Name "gfxstream-diff-check" `
     -Executable $git `

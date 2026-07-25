@@ -1,19 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt as _;
 use hd_core::{
-    AdbModeV2, ApiErrorV2, COMPONENT_PROTOCOL_VERSION, DeviceSerialEndpointV2,
-    FRAME_PROTOCOL_VERSION, FormalComponentConfigurationV2, FormalComponentLaunchV2,
-    FormalComponentReadyV2, FrameMetricsV2, FrameReadyMarkerV2, InstanceActionV2, InstanceSpecV2,
-    LaunchPlanV2, LeaseKindV2, LeaseV2, ObservedStateV2, RunManifestV2, RunResultV2, StopModeV2,
+    AdbModeV2, ApiErrorV2, COMPONENT_PROTOCOL_VERSION, DEVICE_GUEST_ENDPOINT_ROLES_V2,
+    DeviceControlCommandV2, DeviceControlRequestV2, DeviceControlTokenV2, DeviceSerialEndpointV2,
+    DisplayViewportV2, FRAME_PROTOCOL_VERSION, FormalComponentConfigurationV2,
+    FormalComponentLaunchV2, FormalComponentReadyV2, FrameMetricsV2, FrameReadyMarkerV2,
+    InstanceActionV2, InstanceSpecV2, LaunchPlanV2, LeaseKindV2, LeaseV2, NativeDisplayTargetV2,
+    ObservedStateV2, RunManifestV2, RunResultV2, ScreenshotRecordV2, StopModeV2,
     WORKER_PROTOCOL_VERSION, WorkerCommandV2, WorkerDescriptorV2, WorkerIdentityV2,
     WorkerPayloadV2, WorkerRequestV2, WorkerResponseV2, WorkerStatusV2,
-};
-use hd_device_sim::{
-    DeviceCommandV2, DeviceRequestV2, DeviceSimulatorV2, MAX_DEVICE_MESSAGE_BYTES,
+    device_component_guest_roles_v2,
 };
 use hd_platform::{
     DataPaths, DiskProvisioner as _, ProcessSpec, ProcessSupervisor as _, VmBackend as _,
@@ -22,18 +23,19 @@ use hd_platform::{
 use sha2::Digest as _;
 use subtle::ConstantTimeEq as _;
 use time::OffsetDateTime;
-use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 use crate::{
     AdbClient, CapabilityDiscovery, CrosvmBackend, ManagedProcess, NativeDiskProvisioner,
-    RunJournalV2, TokioProcessSupervisor, expected_frame_transport,
+    RunJournalV2, TokioProcessSupervisor, expected_frame_transport, send_device_control_request,
 };
 
 const FRAME_READY_TIMEOUT: Duration = Duration::from_secs(90);
 const COMPONENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const DEVICE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const ADBD_LOG_READY_TIMEOUT: Duration = Duration::from_mins(3);
+const DEV_BOOT_LOG_READY_TIMEOUT: Duration = Duration::from_secs(150);
+const DEV_BOOT_LOG_SCAN_LIMIT: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 struct ManagedComponent {
@@ -66,14 +68,23 @@ struct WorkerMutable {
     active_spec: Option<InstanceSpecV2>,
     process: Option<ManagedProcess>,
     components: Vec<ManagedComponent>,
+    device_control_tokens: BTreeMap<String, DeviceControlTokenV2>,
     backend: Option<CrosvmBackend>,
     launch: Option<LaunchPlanV2>,
     adb: Option<AdbClient>,
     journal: Option<Arc<RunJournalV2>>,
     started_at: Option<OffsetDateTime>,
-    device_simulator: DeviceSimulatorV2,
+    display_session: Option<ActiveDisplaySession>,
     #[cfg(unix)]
     device_output_sockets: Vec<tokio::net::UnixDatagram>,
+}
+
+#[derive(Debug)]
+struct ActiveDisplaySession {
+    id: Uuid,
+    generation: u64,
+    target: NativeDisplayTargetV2,
+    viewport_revision: u64,
 }
 
 pub struct WorkerService {
@@ -176,12 +187,13 @@ impl WorkerService {
                 active_spec: None,
                 process: None,
                 components: Vec::new(),
+                device_control_tokens: BTreeMap::new(),
                 backend: None,
                 launch: None,
                 adb: None,
                 journal: None,
                 started_at: None,
-                device_simulator: DeviceSimulatorV2::default(),
+                display_session: None,
                 #[cfg(unix)]
                 device_output_sockets: Vec::new(),
             }),
@@ -199,7 +211,20 @@ impl WorkerService {
     }
 
     pub async fn status(&self) -> WorkerStatusV2 {
-        self.mutable.lock().await.status.clone()
+        let mut status = self.mutable.lock().await.status.clone();
+        if let Some(run_id) = status.run_id {
+            let metrics_path = self
+                .paths
+                .run_dir(self.instance_id, run_id)
+                .join("frame-metrics-v2.json");
+            if let Ok(bytes) = hd_platform::read_regular_nofollow_limited(&metrics_path, 64 * 1024)
+                && let Ok(metrics) = serde_json::from_slice::<FrameMetricsV2>(&bytes)
+                && metrics.generation == status.frame_generation
+            {
+                status.frame_metrics = metrics;
+            }
+        }
+        status
     }
 
     pub async fn shutdown_gracefully(&self) -> Result<(), WorkerError> {
@@ -254,7 +279,27 @@ impl WorkerService {
                 ApiErrorV2::new("worker_unauthorized", "worker authentication failed"),
             );
         }
-        let result = match request.command {
+        let result = self.dispatch_command(request.command).await;
+        match result {
+            Ok(payload) => WorkerResponseV2::success(request_id, payload),
+            Err(error) => {
+                tracing::error!(
+                    event = "worker.command.failed",
+                    error_code = error.code(),
+                    instance_id = %self.instance_id,
+                    %error,
+                    "worker command failed"
+                );
+                WorkerResponseV2::failure(request_id, error.api_error())
+            }
+        }
+    }
+
+    async fn dispatch_command(
+        self: &Arc<Self>,
+        command: WorkerCommandV2,
+    ) -> Result<WorkerPayloadV2, WorkerError> {
+        match command {
             WorkerCommandV2::Ping => Ok(WorkerPayloadV2::Pong(self.status().await)),
             WorkerCommandV2::Status => Ok(WorkerPayloadV2::Status(self.status().await)),
             WorkerCommandV2::Start {
@@ -289,6 +334,34 @@ impl WorkerService {
                 .install_apk(&upload_path, &sha256)
                 .await
                 .map(|()| WorkerPayloadV2::Empty),
+            WorkerCommandV2::AttachDisplay {
+                session_id,
+                generation,
+                target,
+                viewport,
+            } => self
+                .attach_display(session_id, generation, target, viewport)
+                .await
+                .map(|()| WorkerPayloadV2::Empty),
+            WorkerCommandV2::ResizeDisplay {
+                session_id,
+                generation,
+                viewport,
+            } => self
+                .resize_display(session_id, generation, viewport)
+                .await
+                .map(|()| WorkerPayloadV2::Empty),
+            WorkerCommandV2::DetachDisplay {
+                session_id,
+                generation,
+            } => self
+                .detach_display(session_id, generation)
+                .await
+                .map(|()| WorkerPayloadV2::Empty),
+            WorkerCommandV2::CaptureScreenshot { output_path } => self
+                .capture_screenshot(&output_path)
+                .await
+                .map(WorkerPayloadV2::Screenshot),
             WorkerCommandV2::CollectGuestLogs => self
                 .collect_guest_logs()
                 .await
@@ -305,19 +378,6 @@ impl WorkerService {
                         .await
                         .map(|()| WorkerPayloadV2::Empty)
                 }
-            }
-        };
-        match result {
-            Ok(payload) => WorkerResponseV2::success(request_id, payload),
-            Err(error) => {
-                tracing::error!(
-                    event = "worker.command.failed",
-                    error_code = error.code(),
-                    instance_id = %self.instance_id,
-                    %error,
-                    "worker command failed"
-                );
-                WorkerResponseV2::failure(request_id, error.api_error())
             }
         }
     }
@@ -406,10 +466,17 @@ impl WorkerService {
             let bundles = discovery.bundles.ok_or_else(|| {
                 WorkerError::CapabilityBlocked(vec!["artifact.bundles".to_owned()])
             })?;
-            let frame_tool = discovery.frame_tool.ok_or_else(|| {
-                WorkerError::CapabilityBlocked(vec!["display.zero_copy".to_owned()])
-            })?;
+            let dev_display_copy_fallback = crate::dev::allow_display_copy_fallback_enabled();
+            let frame_tool = if dev_display_copy_fallback {
+                None
+            } else {
+                Some(discovery.frame_tool.ok_or_else(|| {
+                    WorkerError::CapabilityBlocked(vec!["display.zero_copy".to_owned()])
+                })?)
+            };
             let adb_bridge = discovery.adb_bridge;
+            let host_tools = bundles.artifacts.host_tools.clone();
+            let sensor_injector = bundles.artifacts.sensor_injector.clone();
             journal.boundary_succeeded("capability.discovery", 0, BTreeMap::new())?;
 
             self.transition(ObservedStateV2::StartingWorker, None)
@@ -460,6 +527,7 @@ impl WorkerService {
                 frame_endpoint: endpoints.frame,
                 keyboard_endpoint: endpoints.keyboard,
                 device_endpoints: endpoints.devices,
+                device_control_endpoints: endpoints.device_controls,
                 adb_host_port: adb_port,
             };
             let launch = backend.build_launch_plan(&context).await?;
@@ -477,23 +545,25 @@ impl WorkerService {
                 mutable.backend = Some(backend.clone());
                 mutable.launch = Some(launch.clone());
             }
-            self.start_component(
-                ComponentStartSpec {
-                    executable: frame_tool,
-                    component: "frame-producer".to_owned(),
-                    run_id,
-                    run_dir: run_dir.clone(),
-                    configuration: FormalComponentConfigurationV2::FrameBroker {
-                        broker_endpoint: launch.frame_endpoint.clone(),
-                        frame_ready_marker: run_dir.join("frame-ready-v2.json"),
-                        generation: frame_generation,
-                        transport: expected_frame_transport(),
-                        display: spec.display.clone(),
+            if let Some(frame_tool) = frame_tool {
+                self.start_component(
+                    ComponentStartSpec {
+                        executable: frame_tool,
+                        component: "frame-producer".to_owned(),
+                        run_id,
+                        run_dir: run_dir.clone(),
+                        configuration: FormalComponentConfigurationV2::FrameBroker {
+                            broker_endpoint: launch.frame_endpoint.clone(),
+                            frame_ready_marker: run_dir.join("frame-ready-v2.json"),
+                            generation: frame_generation,
+                            transport: expected_frame_transport(),
+                            display: spec.display.clone(),
+                        },
                     },
-                },
-                &journal,
-            )
-            .await?;
+                    &journal,
+                )
+                .await?;
+            }
             self.transition(ObservedStateV2::LaunchingGuest, None)
                 .await?;
             let process = TokioProcessSupervisor
@@ -516,10 +586,25 @@ impl WorkerService {
                 mutable.process = Some(process);
             }
 
+            self.start_device_components(
+                &spec,
+                run_id,
+                &run_dir,
+                guest_cid,
+                &launch,
+                &host_tools,
+                &journal,
+            )
+            .await?;
+
             self.transition(ObservedStateV2::NegotiatingDisplay, None)
                 .await?;
-            self.wait_frame_ready(&run_dir, run_id, frame_generation)
-                .await?;
+            if dev_display_copy_fallback {
+                self.wait_display_copy_fallback_ready().await?;
+            } else {
+                self.wait_frame_ready(&run_dir, run_id, frame_generation)
+                    .await?;
+            }
             self.transition(ObservedStateV2::GuestBooting, None).await?;
 
             if let Some(serial) = &launch.adb_serial {
@@ -540,15 +625,32 @@ impl WorkerService {
                             guest_cid,
                             guest_port: 5555,
                             vm_control_endpoint: launch.control_endpoint.clone(),
+                            crosvm_executable: launch.executable.clone(),
                         },
                     },
                     &journal,
                 )
                 .await?;
                 let adb = AdbClient::new(discovery.adb, None)
-                    .with_aapt2(bundles.artifacts.host_tools.get("aapt2").cloned());
-                adb.connect(serial).await.map_err(WorkerError::Adb)?;
-                adb.wait_ready(serial).await.map_err(WorkerError::Adb)?;
+                    .with_aapt2(host_tools.get("aapt2").cloned())
+                    .with_sensor_injector(Some(sensor_injector));
+                if crate::dev::allow_adb_offline_boot_ready_enabled() {
+                    tracing::warn!(
+                        event = "worker.adb.readiness.dev_fallback",
+                        instance_id = %self.instance_id,
+                        run_id = %run_id,
+                        %serial,
+                        "using dev boot-log readiness fallback instead of strict ADB connect/readiness"
+                    );
+                    self.wait_dev_boot_log_ready(&run_dir).await?;
+                } else {
+                    self.wait_adbd_log_ready(&run_dir).await?;
+                    adb.connect(serial).await.map_err(WorkerError::Adb)?;
+                    adb.wait_ready(serial).await.map_err(WorkerError::Adb)?;
+                }
+                adb.set_orientation(serial, spec.display.orientation)
+                    .await
+                    .map_err(WorkerError::Adb)?;
                 self.ensure_components_alive().await?;
                 self.mutable.lock().await.adb = Some(adb);
             } else {
@@ -595,6 +697,123 @@ impl WorkerService {
             )?;
         }
         result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_device_components(
+        &self,
+        spec: &InstanceSpecV2,
+        run_id: Uuid,
+        run_dir: &Path,
+        guest_cid: u32,
+        launch: &LaunchPlanV2,
+        host_tools: &BTreeMap<String, PathBuf>,
+        journal: &RunJournalV2,
+    ) -> Result<(), WorkerError> {
+        for component in enabled_device_components(spec) {
+            let executable = host_tools.get(component).cloned().ok_or_else(|| {
+                WorkerError::CapabilityBlocked(vec![format!("device.{component}")])
+            })?;
+            let control_endpoint = launch
+                .device_control_endpoints
+                .get(component)
+                .cloned()
+                .ok_or_else(|| {
+                    WorkerError::ComponentContract(format!(
+                        "device component {component} has no control endpoint"
+                    ))
+                })?;
+            let guest_endpoints = device_component_guest_roles_v2(component)
+                .iter()
+                .filter(|role| device_role_enabled(spec, role))
+                .map(|role| {
+                    launch
+                        .device_endpoints
+                        .get(*role)
+                        .cloned()
+                        .map(|endpoint| ((*role).to_owned(), endpoint))
+                        .ok_or_else(|| {
+                            WorkerError::ComponentContract(format!(
+                                "device component {component} is missing enabled Guest role {role}"
+                            ))
+                        })
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let control_token = random_device_control_token()?;
+            self.start_component(
+                ComponentStartSpec {
+                    executable,
+                    component: component.to_owned(),
+                    run_id,
+                    run_dir: run_dir.to_owned(),
+                    configuration: FormalComponentConfigurationV2::DeviceAdapter {
+                        control_endpoint,
+                        control_token: control_token.clone(),
+                        guest_cid,
+                        vm_control_endpoint: launch.control_endpoint.clone(),
+                        guest_endpoints,
+                    },
+                },
+                journal,
+            )
+            .await?;
+            self.mutable
+                .lock()
+                .await
+                .device_control_tokens
+                .insert(component.to_owned(), control_token);
+            self.call_device_component(component, DeviceControlCommandV2::Ping)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn call_device_component(
+        &self,
+        component: &str,
+        command: DeviceControlCommandV2,
+    ) -> Result<(), WorkerError> {
+        let (endpoint, run_id, bearer_token) = {
+            let mutable = self.mutable.lock().await;
+            let launch = mutable.launch.as_ref().ok_or(WorkerError::NotRunning)?;
+            let endpoint = launch
+                .device_control_endpoints
+                .get(component)
+                .cloned()
+                .ok_or_else(|| WorkerError::DeviceEndpoint(component.to_owned()))?;
+            let bearer_token = mutable
+                .device_control_tokens
+                .get(component)
+                .cloned()
+                .ok_or_else(|| WorkerError::DeviceEndpoint(component.to_owned()))?;
+            (endpoint, launch.run_id, bearer_token)
+        };
+        let request = DeviceControlRequestV2 {
+            protocol_version: COMPONENT_PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            instance_id: self.instance_id,
+            run_id,
+            bearer_token,
+            command,
+        };
+        let response = send_device_control_request(&endpoint, &request).await?;
+        if response.protocol_version != COMPONENT_PROTOCOL_VERSION
+            || response.request_id != request.request_id
+            || response.instance_id != self.instance_id
+            || response.run_id != run_id
+        {
+            return Err(WorkerError::ComponentContract(format!(
+                "device component {component} returned a mismatched control response"
+            )));
+        }
+        if response.ok && response.error.is_none() {
+            Ok(())
+        } else {
+            Err(WorkerError::DeviceRejected(response.error.map_or_else(
+                || format!("device component {component} rejected the request"),
+                |error| format!("{}: {}", error.code, error.message),
+            )))
+        }
     }
 
     async fn spawn_formal_component(
@@ -823,6 +1042,179 @@ impl WorkerService {
         }
     }
 
+    async fn wait_display_copy_fallback_ready(&self) -> Result<(), WorkerError> {
+        let started = Instant::now();
+        let minimum_alive = Duration::from_secs(3);
+        loop {
+            if let Some(exit) = self.poll_process().await? {
+                return Err(WorkerError::GuestExited(exit.code));
+            }
+            self.ensure_components_alive().await?;
+            if started.elapsed() >= minimum_alive {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_dev_boot_log_ready(&self, run_dir: &Path) -> Result<(), WorkerError> {
+        let started = Instant::now();
+        loop {
+            if let Some(exit) = self.poll_process().await? {
+                return Err(WorkerError::GuestExited(exit.code));
+            }
+            self.ensure_components_alive().await?;
+            if dev_boot_completed_from_logs(run_dir)? {
+                return Ok(());
+            }
+            if started.elapsed() >= DEV_BOOT_LOG_READY_TIMEOUT {
+                return Err(WorkerError::FrameHandshake(
+                    "dev boot-log readiness fallback timed out".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn wait_adbd_log_ready(&self, run_dir: &Path) -> Result<(), WorkerError> {
+        let started = Instant::now();
+        loop {
+            if let Some(exit) = self.poll_process().await? {
+                return Err(WorkerError::GuestExited(exit.code));
+            }
+            self.ensure_components_alive().await?;
+            if adbd_started_from_logs(run_dir)? {
+                return Ok(());
+            }
+            if started.elapsed() >= ADBD_LOG_READY_TIMEOUT {
+                return Err(WorkerError::FrameHandshake(
+                    "adbd log readiness timed out before strict ADB connect".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn attach_display(
+        &self,
+        session_id: Uuid,
+        generation: u64,
+        target: NativeDisplayTargetV2,
+        viewport: DisplayViewportV2,
+    ) -> Result<(), WorkerError> {
+        if !viewport.is_valid() {
+            return Err(WorkerError::DisplaySession(
+                "viewport is outside supported bounds".to_owned(),
+            ));
+        }
+        if !hd_platform::process_identity_is_alive(target.owner()) {
+            return Err(WorkerError::DisplaySession(
+                "Player process identity is not alive".to_owned(),
+            ));
+        }
+        let status = self.status().await;
+        if status.frame_generation != generation {
+            return Err(WorkerError::DisplaySession(
+                "display generation is stale".to_owned(),
+            ));
+        }
+        let child_pid = status.child_pid.ok_or(WorkerError::NotRunning)?;
+        hd_platform::attach_native_display(child_pid, &target, &viewport)?;
+        self.mutable.lock().await.display_session = Some(ActiveDisplaySession {
+            id: session_id,
+            generation,
+            target,
+            viewport_revision: viewport.revision,
+        });
+        Ok(())
+    }
+
+    async fn resize_display(
+        &self,
+        session_id: Uuid,
+        generation: u64,
+        viewport: DisplayViewportV2,
+    ) -> Result<(), WorkerError> {
+        if !viewport.is_valid() {
+            return Err(WorkerError::DisplaySession(
+                "viewport is outside supported bounds".to_owned(),
+            ));
+        }
+        let child_pid = self
+            .status()
+            .await
+            .child_pid
+            .ok_or(WorkerError::NotRunning)?;
+        let mut mutable = self.mutable.lock().await;
+        let session = mutable.display_session.as_mut().ok_or_else(|| {
+            WorkerError::DisplaySession("no display session is attached".to_owned())
+        })?;
+        if session.id != session_id || session.generation != generation {
+            return Err(WorkerError::DisplaySession(
+                "display session identity or generation mismatch".to_owned(),
+            ));
+        }
+        if viewport.revision <= session.viewport_revision {
+            return Ok(());
+        }
+        hd_platform::resize_native_display(child_pid, &session.target, &viewport)?;
+        session.viewport_revision = viewport.revision;
+        Ok(())
+    }
+
+    async fn detach_display(&self, session_id: Uuid, generation: u64) -> Result<(), WorkerError> {
+        let child_pid = self
+            .status()
+            .await
+            .child_pid
+            .ok_or(WorkerError::NotRunning)?;
+        let mut mutable = self.mutable.lock().await;
+        if let Some(session) = &mutable.display_session
+            && (session.id != session_id || session.generation != generation)
+        {
+            return Err(WorkerError::DisplaySession(
+                "display session identity or generation mismatch".to_owned(),
+            ));
+        }
+        hd_platform::detach_native_display(child_pid)?;
+        mutable.display_session = None;
+        Ok(())
+    }
+
+    async fn capture_screenshot(
+        &self,
+        output_path: &Path,
+    ) -> Result<ScreenshotRecordV2, WorkerError> {
+        let screenshot_dir = self.paths.root.join("screenshots");
+        if output_path.parent() != Some(screenshot_dir.as_path()) {
+            return Err(WorkerError::DisplaySession(
+                "screenshot path is outside the managed screenshot directory".to_owned(),
+            ));
+        }
+        hd_platform::ensure_owner_only_directory(&screenshot_dir)?;
+        let (adb, serial) = {
+            let mutable = self.mutable.lock().await;
+            (
+                mutable.adb.clone().ok_or(WorkerError::NotReady)?,
+                mutable
+                    .status
+                    .adb_serial
+                    .clone()
+                    .ok_or(WorkerError::ReadinessUnavailable)?,
+            )
+        };
+        let png = adb.screenshot(&serial).await?;
+        let sha256 = hex::encode(sha2::Sha256::digest(&png));
+        hd_platform::write_owner_only(output_path, &png)?;
+        Ok(ScreenshotRecordV2 {
+            instance_id: self.instance_id,
+            path: output_path.to_owned(),
+            sha256,
+            size_bytes: png.len() as u64,
+            created_at: OffsetDateTime::now_utc(),
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn stop(&self, mode: StopModeV2, graceful_timeout: Duration) -> Result<(), WorkerError> {
         let _operation = self.operation.lock().await;
@@ -848,12 +1240,18 @@ impl WorkerService {
                 next: ObservedStateV2::Stopping,
             });
         }
-        let (process, backend, launch) = {
+        if let Some(child_pid) = status.child_pid
+            && self.mutable.lock().await.display_session.is_some()
+        {
+            let _ = hd_platform::detach_native_display(child_pid);
+        }
+        let (process, backend, launch, adb) = {
             let mut mutable = self.mutable.lock().await;
             (
                 mutable.process.take(),
                 mutable.backend.clone(),
                 mutable.launch.clone(),
+                mutable.adb.clone(),
             )
         };
         let mut retained_process = None;
@@ -863,7 +1261,30 @@ impl WorkerService {
             if matches!(mode, StopModeV2::Graceful)
                 && let (Some(backend), Some(launch)) = (&backend, &launch)
             {
-                match backend.power_button(&launch.control_endpoint).await {
+                let adb_poweroff_requested = if let (Some(adb), Some(serial)) =
+                    (&adb, launch.adb_serial.as_deref())
+                {
+                    match adb.power_off(serial).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::warn!(
+                                event = "worker.stop.adb_power_off.failed",
+                                instance_id = %self.instance_id,
+                                %error,
+                                "Android power-off request failed; falling back to crosvm power button"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                let power_requested = if adb_poweroff_requested {
+                    Ok(())
+                } else {
+                    backend.power_button(&launch.control_endpoint).await
+                };
+                match power_requested {
                     Ok(()) => {
                         let started = Instant::now();
                         while started.elapsed() < graceful_timeout {
@@ -962,7 +1383,9 @@ impl WorkerService {
         mutable.backend = None;
         mutable.launch = None;
         mutable.adb = None;
+        mutable.display_session = None;
         mutable.components.clear();
+        mutable.device_control_tokens.clear();
         mutable.journal = None;
         #[cfg(unix)]
         mutable.device_output_sockets.clear();
@@ -997,30 +1420,27 @@ impl WorkerService {
         adb_config: hd_core::AdbConfigV2,
     ) -> Result<(), WorkerError> {
         let _operation = self.operation.lock().await;
-        let (mut spec, backend, endpoint, adb, serial) = {
+        let (mut spec, adb, serial) = {
             let mutable = self.mutable.lock().await;
             (
                 mutable.active_spec.clone().ok_or(WorkerError::NotRunning)?,
-                mutable.backend.clone().ok_or(WorkerError::NotRunning)?,
-                mutable
-                    .launch
-                    .as_ref()
-                    .map(|plan| plan.control_endpoint.clone())
-                    .ok_or(WorkerError::NotRunning)?,
                 mutable.adb.clone(),
                 mutable.status.adb_serial.clone(),
             )
         };
-        if display.vsync != spec.display.vsync || adb_config != spec.adb {
+        if display == spec.display && adb_config == spec.adb {
+            return Ok(());
+        }
+        let mut restart_display = spec.display.clone();
+        restart_display.orientation = display.orientation;
+        if display != restart_display || adb_config != spec.adb {
             return Err(WorkerError::RestartRequired);
         }
         let previous = spec.display.clone();
-        backend.replace_display(&endpoint, &display).await?;
         if display.orientation != previous.orientation
             && let (Some(adb), Some(serial)) = (&adb, serial.as_deref())
             && let Err(error) = adb.set_orientation(serial, display.orientation).await
         {
-            backend.replace_display(&endpoint, &previous).await?;
             return Err(WorkerError::Adb(error));
         }
         spec.display = display;
@@ -1028,98 +1448,161 @@ impl WorkerService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn action(&self, action: InstanceActionV2) -> Result<(), WorkerError> {
+        action.validate()?;
         if self.status().await.observed != ObservedStateV2::Ready {
             return Err(WorkerError::NotReady);
         }
         match action {
             InstanceActionV2::Key { key } => {
-                let (backend, endpoint) = {
+                let (adb, serial) = {
                     let mutable = self.mutable.lock().await;
                     (
-                        mutable.backend.clone().ok_or(WorkerError::NotRunning)?,
                         mutable
-                            .launch
-                            .as_ref()
-                            .map(|plan| plan.keyboard_endpoint.clone())
-                            .ok_or(WorkerError::NotRunning)?,
+                            .adb
+                            .clone()
+                            .ok_or(WorkerError::ReadinessUnavailable)?,
+                        mutable
+                            .status
+                            .adb_serial
+                            .clone()
+                            .ok_or(WorkerError::ReadinessUnavailable)?,
                     )
                 };
-                backend.send_key(&endpoint, key).await?;
+                adb.send_key(&serial, key).await?;
             }
             InstanceActionV2::Rotate { orientation } => {
-                let (mut display, adb) = {
+                let (adb, serial) = {
                     let mutable = self.mutable.lock().await;
-                    let spec = mutable
-                        .active_spec
-                        .as_ref()
-                        .ok_or(WorkerError::NotRunning)?;
-                    (spec.display.clone(), spec.adb.clone())
+                    (
+                        mutable
+                            .adb
+                            .clone()
+                            .ok_or(WorkerError::ReadinessUnavailable)?,
+                        mutable
+                            .status
+                            .adb_serial
+                            .clone()
+                            .ok_or(WorkerError::ReadinessUnavailable)?,
+                    )
                 };
-                display.orientation = orientation;
-                self.reconfigure(display, adb).await?;
+                adb.set_orientation(&serial, orientation).await?;
+                self.mutable
+                    .lock()
+                    .await
+                    .active_spec
+                    .as_mut()
+                    .ok_or(WorkerError::NotRunning)?
+                    .display
+                    .orientation = orientation;
             }
             InstanceActionV2::SetLocation { location } => {
-                self.device_action("mcu-control", DeviceCommandV2::SetLocation { location })
-                    .await?;
-            }
-            InstanceActionV2::SetBattery { battery } => {
-                self.device_action("mcu-control", DeviceCommandV2::SetBattery { battery })
-                    .await?;
-            }
-            InstanceActionV2::SetNetworkCondition { condition } => {
-                self.device_action(
-                    "mcu-control",
-                    DeviceCommandV2::SetNetworkCondition { condition },
+                self.call_device_component(
+                    "hd-device-sim",
+                    DeviceControlCommandV2::Action {
+                        action: InstanceActionV2::SetLocation { location },
+                    },
                 )
                 .await?;
             }
+            InstanceActionV2::SetBattery { battery } => {
+                self.call_device_component(
+                    "hd-device-sim",
+                    DeviceControlCommandV2::Action {
+                        action: InstanceActionV2::SetBattery {
+                            battery: battery.clone(),
+                        },
+                    },
+                )
+                .await?;
+                let (adb, serial) = {
+                    let mutable = self.mutable.lock().await;
+                    (
+                        mutable
+                            .adb
+                            .clone()
+                            .ok_or(WorkerError::ReadinessUnavailable)?,
+                        mutable
+                            .status
+                            .adb_serial
+                            .clone()
+                            .ok_or(WorkerError::ReadinessUnavailable)?,
+                    )
+                };
+                adb.set_battery(&serial, &battery).await?;
+            }
+            InstanceActionV2::SetNetworkCondition { condition } => {
+                self.call_device_component(
+                    "hd-device-sim",
+                    DeviceControlCommandV2::Action {
+                        action: InstanceActionV2::SetNetworkCondition {
+                            condition: condition.clone(),
+                        },
+                    },
+                )
+                .await?;
+                let (adb, serial) = {
+                    let mutable = self.mutable.lock().await;
+                    (
+                        mutable
+                            .adb
+                            .clone()
+                            .ok_or(WorkerError::ReadinessUnavailable)?,
+                        mutable
+                            .status
+                            .adb_serial
+                            .clone()
+                            .ok_or(WorkerError::ReadinessUnavailable)?,
+                    )
+                };
+                adb.set_network_condition(&serial, &condition).await?;
+            }
             InstanceActionV2::InjectSensor { injection } => {
-                self.device_action("sensors", DeviceCommandV2::InjectSensor { injection })
-                    .await?;
+                self.call_device_component(
+                    "hd-device-sim",
+                    DeviceControlCommandV2::Action {
+                        action: InstanceActionV2::InjectSensor {
+                            injection: injection.clone(),
+                        },
+                    },
+                )
+                .await?;
+                let (adb, serial) = {
+                    let mutable = self.mutable.lock().await;
+                    (
+                        mutable
+                            .adb
+                            .clone()
+                            .ok_or(WorkerError::ReadinessUnavailable)?,
+                        mutable
+                            .status
+                            .adb_serial
+                            .clone()
+                            .ok_or(WorkerError::ReadinessUnavailable)?,
+                    )
+                };
+                adb.inject_sensor(&serial, &injection).await?;
             }
-            InstanceActionV2::BluetoothPeer { .. } => {
-                return Err(WorkerError::ExternalDeviceControl("rootcanal"));
+            InstanceActionV2::BluetoothPeer { action } => {
+                self.call_device_component(
+                    "rootcanal-adapter",
+                    DeviceControlCommandV2::Action {
+                        action: InstanceActionV2::BluetoothPeer { action },
+                    },
+                )
+                .await?;
             }
-            InstanceActionV2::NfcTag { .. } => {
-                return Err(WorkerError::ExternalDeviceControl("casimir"));
+            InstanceActionV2::NfcTag { action } => {
+                self.call_device_component(
+                    "casimir-adapter",
+                    DeviceControlCommandV2::Action {
+                        action: InstanceActionV2::NfcTag { action },
+                    },
+                )
+                .await?;
             }
         }
-        Ok(())
-    }
-
-    async fn device_action(&self, role: &str, command: DeviceCommandV2) -> Result<(), WorkerError> {
-        let request = DeviceRequestV2 {
-            protocol_version: hd_device_sim::DEVICE_SIM_PROTOCOL_VERSION,
-            request_id: Uuid::new_v4(),
-            command,
-        };
-        let (endpoint, candidate, response) = {
-            let mutable = self.mutable.lock().await;
-            let endpoint = mutable
-                .launch
-                .as_ref()
-                .and_then(|plan| plan.device_endpoints.get(role))
-                .cloned()
-                .ok_or(WorkerError::DeviceEndpoint(role.to_owned()))?;
-            let mut candidate = mutable.device_simulator.clone();
-            let response = candidate.handle(request.clone());
-            (endpoint, candidate, response)
-        };
-        if !response.ok {
-            return Err(WorkerError::DeviceRejected(
-                response
-                    .message
-                    .unwrap_or_else(|| "device request was rejected".to_owned()),
-            ));
-        }
-        let mut bytes = serde_json::to_vec(&request)?;
-        if bytes.len() > MAX_DEVICE_MESSAGE_BYTES {
-            return Err(WorkerError::DeviceMessageTooLarge);
-        }
-        bytes.push(b'\n');
-        write_device_input(&endpoint.guest_input, &bytes).await?;
-        self.mutable.lock().await.device_simulator = candidate;
         Ok(())
     }
 
@@ -1394,6 +1877,7 @@ impl WorkerService {
             if cleanup_error.is_none() {
                 mutable.backend = None;
                 mutable.launch = None;
+                mutable.device_control_tokens.clear();
                 #[cfg(unix)]
                 mutable.device_output_sockets.clear();
             }
@@ -1440,8 +1924,40 @@ struct RuntimeEndpoints {
     frame: String,
     keyboard: String,
     devices: BTreeMap<String, DeviceSerialEndpointV2>,
+    device_controls: BTreeMap<String, String>,
     #[cfg(unix)]
     output_sockets: Vec<tokio::net::UnixDatagram>,
+}
+
+fn enabled_device_components(spec: &InstanceSpecV2) -> Vec<&'static str> {
+    let mut components = Vec::new();
+    if spec.devices.gnss || spec.devices.sensors || spec.devices.power || spec.devices.network {
+        components.push("hd-device-sim");
+    }
+    for (enabled, component) in [
+        (spec.devices.bluetooth, "rootcanal-adapter"),
+        (spec.devices.nfc, "casimir-adapter"),
+        (spec.devices.uwb, "uwb-adapter"),
+        (spec.devices.modem, "modem-adapter"),
+    ] {
+        if enabled {
+            components.push(component);
+        }
+    }
+    components
+}
+
+fn device_role_enabled(spec: &InstanceSpecV2, role: &str) -> bool {
+    match role {
+        "bluetooth" => spec.devices.bluetooth,
+        "gnss" | "location" => spec.devices.gnss,
+        "uwb" => spec.devices.uwb,
+        "nfc" => spec.devices.nfc,
+        "sensors" => spec.devices.sensors,
+        "mcu-control" | "mcu-uart" => spec.devices.power,
+        "modem" => spec.devices.modem,
+        _ => false,
+    }
 }
 
 impl RuntimeEndpoints {
@@ -1449,29 +1965,18 @@ impl RuntimeEndpoints {
         let control = runtime_endpoint(spec.id, run_id, "vm-control", "sock")?;
         let frame = runtime_endpoint(spec.id, run_id, "frame", "sock")?;
         let keyboard = runtime_endpoint(spec.id, run_id, "keyboard", "sock")?;
+        let device_controls = enabled_device_components(spec)
+            .into_iter()
+            .map(|component| {
+                runtime_endpoint(spec.id, run_id, &format!("{component}-control"), "sock")
+                    .map(|endpoint| (component.to_owned(), endpoint))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let mut devices = BTreeMap::new();
         #[cfg(unix)]
         let mut output_sockets = Vec::new();
-        for role in [
-            "bluetooth",
-            "gnss",
-            "location",
-            "uwb",
-            "nfc",
-            "sensors",
-            "mcu-control",
-            "mcu-uart",
-        ] {
-            let enabled = match role {
-                "bluetooth" => spec.devices.bluetooth,
-                "gnss" | "location" => spec.devices.gnss,
-                "uwb" => spec.devices.uwb,
-                "nfc" => spec.devices.nfc,
-                "sensors" => spec.devices.sensors,
-                "mcu-control" | "mcu-uart" => spec.devices.power,
-                _ => false,
-            };
-            if !enabled {
+        for role in DEVICE_GUEST_ENDPOINT_ROLES_V2 {
+            if !device_role_enabled(spec, role) {
                 continue;
             }
             let output = runtime_endpoint(spec.id, run_id, &format!("{role}-out"), "sock")?;
@@ -1508,6 +2013,7 @@ impl RuntimeEndpoints {
             frame,
             keyboard,
             devices,
+            device_controls,
             #[cfg(unix)]
             output_sockets,
         })
@@ -1577,6 +2083,7 @@ fn cleanup_runtime_endpoints(launch: &LaunchPlanV2) -> Result<(), WorkerError> {
             endpoints.insert(endpoint.guest_output.clone());
             endpoints.insert(endpoint.guest_input.clone());
         }
+        endpoints.extend(launch.device_control_endpoints.values().cloned());
         for endpoint in endpoints {
             let path = PathBuf::from(&endpoint);
             let valid_parent = path.parent().is_some_and(|parent| parent == root);
@@ -1611,61 +2118,84 @@ fn cleanup_runtime_endpoints(launch: &LaunchPlanV2) -> Result<(), WorkerError> {
     }
 }
 
-async fn write_device_input(endpoint: &str, bytes: &[u8]) -> Result<(), WorkerError> {
-    #[cfg(windows)]
-    {
-        use tokio::net::windows::named_pipe::ClientOptions;
-        let operation = async {
-            loop {
-                match ClientOptions::new().open(endpoint) {
-                    Ok(mut pipe) => {
-                        pipe.write_all(bytes).await?;
-                        pipe.flush().await?;
-                        return Ok::<_, std::io::Error>(());
-                    }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::WouldBlock
-                        ) =>
-                    {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        };
-        tokio::time::timeout(DEVICE_WRITE_TIMEOUT, operation)
-            .await
-            .map_err(|_| WorkerError::DeviceWriteTimeout)?
-            .map_err(|source| WorkerError::Io {
-                operation: "write device named pipe",
-                path: PathBuf::from(endpoint),
-                source,
-            })
+fn dev_boot_completed_from_logs(run_dir: &Path) -> Result<bool, WorkerError> {
+    for name in ["console-hvc0.txt", "logcat-hvc2.txt"] {
+        let path = run_dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let text = read_log_tail_lossy(&path)?;
+        if text.contains("sys.boot_completed=1")
+            || text.contains("Posting BOOT_COMPLETED")
+            || text.contains("Finished processing BOOT_COMPLETED")
+            || text.contains("BOOT_COMPLETED_BROADCAST_COMPLETION_LATENCY_REPORTED")
+        {
+            tracing::warn!(
+                event = "worker.dev.boot_log_ready",
+                path = %path.display(),
+                "dev boot-log readiness fallback observed boot completion"
+            );
+            return Ok(true);
+        }
     }
-    #[cfg(unix)]
-    {
-        let endpoint = endpoint.to_owned();
-        let bytes = bytes.to_vec();
-        tokio::time::timeout(
-            DEVICE_WRITE_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
-                use std::io::Write as _;
-                let mut file = std::fs::OpenOptions::new().write(true).open(&endpoint)?;
-                file.write_all(&bytes)?;
-                file.flush()
-            }),
-        )
-        .await
-        .map_err(|_| WorkerError::DeviceWriteTimeout)?
-        .map_err(|error| WorkerError::Task(error.to_string()))?
+    Ok(false)
+}
+
+fn adbd_started_from_logs(run_dir: &Path) -> Result<bool, WorkerError> {
+    for name in ["console-hvc0.txt", "logcat-hvc2.txt"] {
+        let path = run_dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let text = read_log_tail_lossy(&path)?;
+        if text.contains("adbd started")
+            || text.contains("adbd listening on tcp:5555")
+            || text.contains("adbd listening on vsock:5555")
+            || text.contains("authentication not required")
+        {
+            tracing::info!(
+                event = "worker.adbd.log_ready",
+                path = %path.display(),
+                "observed adbd startup before strict ADB connect"
+            );
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_log_tail_lossy(path: &Path) -> Result<String, WorkerError> {
+    let mut file = std::fs::File::open(path).map_err(|source| WorkerError::Io {
+        operation: "open dev readiness log",
+        path: path.to_owned(),
+        source,
+    })?;
+    let len = file
+        .metadata()
         .map_err(|source| WorkerError::Io {
-            operation: "write device FIFO",
-            path: PathBuf::from(endpoint),
+            operation: "inspect dev readiness log",
+            path: path.to_owned(),
             source,
-        })
+        })?
+        .len();
+    if len > DEV_BOOT_LOG_SCAN_LIMIT {
+        file.seek(SeekFrom::Start(len - DEV_BOOT_LOG_SCAN_LIMIT))
+            .map_err(|source| WorkerError::Io {
+                operation: "seek dev readiness log",
+                path: path.to_owned(),
+                source,
+            })?;
     }
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(len.min(DEV_BOOT_LOG_SCAN_LIMIT)).unwrap_or_default());
+    file.take(DEV_BOOT_LOG_SCAN_LIMIT)
+        .read_to_end(&mut bytes)
+        .map_err(|source| WorkerError::Io {
+            operation: "read dev readiness log",
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn validate_start_leases(
@@ -1865,6 +2395,13 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn random_device_control_token() -> Result<DeviceControlTokenV2, WorkerError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| WorkerError::Random(error.to_string()))?;
+    DeviceControlTokenV2::from_hex(hex::encode(bytes))
+        .ok_or_else(|| WorkerError::Random("generated an invalid device control token".to_owned()))
+}
+
 fn acquire_worker_instance_lock(
     paths: &DataPaths,
     instance_id: Uuid,
@@ -1884,6 +2421,10 @@ fn acquire_worker_instance_lock(
 pub enum WorkerError {
     #[error("worker secret must be exactly 64 hexadecimal bytes")]
     SecretInvalid,
+    #[error("secure random generation failed: {0}")]
+    Random(String),
+    #[error(transparent)]
+    Action(#[from] hd_core::ActionValidationError),
     #[error("request instance does not match this worker")]
     InstanceMismatch,
     #[error("worker is busy: {0}")]
@@ -1929,12 +2470,8 @@ pub enum WorkerError {
     DeviceEndpoint(String),
     #[error("device request was rejected: {0}")]
     DeviceRejected(String),
-    #[error("device message exceeds the protocol limit")]
-    DeviceMessageTooLarge,
-    #[error("device input write timed out")]
-    DeviceWriteTimeout,
-    #[error("typed control for {0} requires its signed formal component adapter")]
-    ExternalDeviceControl(&'static str),
+    #[error("display session failed: {0}")]
+    DisplaySession(String),
     #[error("APK digest mismatch: expected {expected}, actual {actual}")]
     UploadDigestMismatch { expected: String, actual: String },
     #[error("runtime endpoint path is too long: {0}")]
@@ -1958,6 +2495,8 @@ pub enum WorkerError {
     Artifacts(#[from] crate::ArtifactError),
     #[error(transparent)]
     Adb(#[from] crate::AdbError),
+    #[error(transparent)]
+    DeviceIpc(#[from] crate::DeviceIpcError),
     #[error("JSON operation failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("{operation} failed for {path}: {source}")]
@@ -1985,6 +2524,8 @@ impl WorkerError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::SecretInvalid => "worker_secret_invalid",
+            Self::Random(_) => "secure_random",
+            Self::Action(_) => "action_invalid",
             Self::InstanceMismatch => "worker_instance_mismatch",
             Self::Busy(_) => "worker_busy",
             Self::NotRunning => "worker_not_running",
@@ -2005,9 +2546,7 @@ impl WorkerError {
             Self::GuestExited(_) => "guest_exited",
             Self::DeviceEndpoint(_) => "device_endpoint",
             Self::DeviceRejected(_) => "device_rejected",
-            Self::DeviceMessageTooLarge => "device_message_too_large",
-            Self::DeviceWriteTimeout => "device_write_timeout",
-            Self::ExternalDeviceControl(_) => "device_control_adapter",
+            Self::DisplaySession(_) => "display_session",
             Self::UploadDigestMismatch { .. } => "upload_digest_mismatch",
             Self::EndpointTooLong(_) => "endpoint_too_long",
             Self::UnsafeEndpoint(_) => "unsafe_endpoint",
@@ -2018,6 +2557,7 @@ impl WorkerError {
             Self::Journal(_) => "journal",
             Self::Artifacts(_) => "artifacts",
             Self::Adb(_) => "adb",
+            Self::DeviceIpc(_) => "device_ipc",
             Self::Json(_) => "json",
             Self::Io { .. } => "io",
         }
@@ -2026,7 +2566,7 @@ impl WorkerError {
     pub fn api_error(&self) -> ApiErrorV2 {
         ApiErrorV2::new(self.code(), self.to_string()).retryable(matches!(
             self,
-            Self::Busy(_) | Self::CapabilityChanged { .. } | Self::DeviceWriteTimeout
+            Self::Busy(_) | Self::CapabilityChanged { .. } | Self::DeviceIpc(_)
         ))
     }
 }

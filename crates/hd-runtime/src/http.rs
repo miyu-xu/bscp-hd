@@ -14,9 +14,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::{Stream, StreamExt as _, TryStreamExt as _};
 use hd_core::{
-    ActionRequestV2, ApiErrorV2, CONTROL_PROTOCOL_VERSION, CreateInstanceRequestV2,
-    CreateOperationRequestV2, DiagnosticRequestV2, HealthResponseV2, HostRuntimeDescriptorV2,
-    ShutdownHostRequestV2, UpdateInstanceRequestV2,
+    AcquireDisplaySessionRequestV2, ActionRequestV2, ApiErrorV2, CONTROL_PROTOCOL_VERSION,
+    CreateInstanceRequestV2, CreateOperationRequestV2, DiagnosticRequestV2, HealthResponseV2,
+    HostRuntimeDescriptorV2, ReleaseDisplaySessionRequestV2, ShutdownHostRequestV2,
+    UpdateDisplaySessionRequestV2, UpdateInstanceRequestV2,
 };
 use subtle::ConstantTimeEq as _;
 use tokio_stream::wrappers::BroadcastStream;
@@ -61,17 +62,19 @@ pub async fn run_host_http(host: Arc<HostService>, port: Option<u16>) -> Result<
         started_at: host.started_at(),
     };
     let descriptor_bytes = serde_json::to_vec_pretty(&descriptor).map_err(HttpError::Json)?;
+    let openapi_value = openapi_document(&origin);
+    hd_platform::write_owner_only(
+        &host.paths().root.join("openapi-v2.json"),
+        &serde_json::to_vec_pretty(&openapi_value).map_err(HttpError::Json)?,
+    )?;
+    // The descriptor is the client readiness signal, so publish it only after every file a
+    // connected client can immediately read has been atomically materialized.
     hd_platform::write_owner_only(&host.paths().host_runtime_descriptor(), &descriptor_bytes)?;
     let _descriptor_guard = RuntimeDescriptorGuard {
         paths: host.paths().clone(),
         pid: descriptor.pid,
         process_start_marker: descriptor.process_start_marker.clone(),
     };
-    let openapi_value = openapi_document(&origin);
-    hd_platform::write_owner_only(
-        &host.paths().root.join("openapi-v2.json"),
-        &serde_json::to_vec_pretty(&openapi_value).map_err(HttpError::Json)?,
-    )?;
 
     let state = Arc::new(HttpState {
         host: Arc::clone(&host),
@@ -92,6 +95,13 @@ pub async fn run_host_http(host: Arc<HostService>, port: Option<u16>) -> Result<
         )
         .route("/v2/instances/{id}/operations", post(create_operation))
         .route("/v2/instances/{id}/actions", post(action))
+        .route(
+            "/v2/instances/{id}/display-session",
+            post(acquire_display_session)
+                .put(update_display_session)
+                .delete(release_display_session),
+        )
+        .route("/v2/instances/{id}/screenshots", post(capture_screenshot))
         .route("/v2/operations", get(list_operations))
         .route("/v2/operations/{id}", get(get_operation))
         .route("/v2/uploads/apk", post(upload_apk))
@@ -386,6 +396,57 @@ async fn action(
             .host
             .action(parse_uuid(&id)?, json_payload(payload)?)
             .await?,
+    ))
+}
+
+async fn acquire_display_session(
+    State(state): State<Arc<HttpState>>,
+    AxumPath(id): AxumPath<String>,
+    payload: Result<Json<AcquireDisplaySessionRequestV2>, JsonRejection>,
+) -> ApiResult<impl IntoResponse> {
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            state
+                .host
+                .acquire_display_session(parse_uuid(&id)?, json_payload(payload)?)
+                .await?,
+        ),
+    ))
+}
+
+async fn update_display_session(
+    State(state): State<Arc<HttpState>>,
+    AxumPath(id): AxumPath<String>,
+    payload: Result<Json<UpdateDisplaySessionRequestV2>, JsonRejection>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(
+        state
+            .host
+            .update_display_session(parse_uuid(&id)?, json_payload(payload)?)
+            .await?,
+    ))
+}
+
+async fn release_display_session(
+    State(state): State<Arc<HttpState>>,
+    AxumPath(id): AxumPath<String>,
+    payload: Result<Json<ReleaseDisplaySessionRequestV2>, JsonRejection>,
+) -> ApiResult<impl IntoResponse> {
+    state
+        .host
+        .release_display_session(parse_uuid(&id)?, json_payload(payload)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn capture_screenshot(
+    State(state): State<Arc<HttpState>>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<impl IntoResponse> {
+    Ok((
+        StatusCode::CREATED,
+        Json(state.host.capture_screenshot(parse_uuid(&id)?).await?),
     ))
 }
 
@@ -816,7 +877,9 @@ impl From<HostError> for ApiHttpError {
                 | StoreError::IdempotencyConflict,
             ) => StatusCode::CONFLICT,
             HostError::CapabilityBlocked => StatusCode::PRECONDITION_FAILED,
-            HostError::Store(StoreError::Config(_)) => StatusCode::UNPROCESSABLE_ENTITY,
+            HostError::Store(StoreError::Config(_)) | HostError::Action(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {

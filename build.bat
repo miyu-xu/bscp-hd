@@ -41,7 +41,7 @@ echo Building HD with %CC% for %RUST_TARGET%
 cargo run --manifest-path "%HD_ROOT%Cargo.toml" --target "%RUST_TARGET%" -p xtask -- process-check
 if errorlevel 1 exit /b 1
 
-cargo build --manifest-path "%HD_ROOT%Cargo.toml" --workspace --release --target "%RUST_TARGET%"
+cargo build --manifest-path "%HD_ROOT%Cargo.toml" --workspace --bins --release --target "%RUST_TARGET%"
 if errorlevel 1 exit /b 1
 
 cargo run --manifest-path "%HD_ROOT%Cargo.toml" --target "%RUST_TARGET%" -p xtask -- pe-audit ^

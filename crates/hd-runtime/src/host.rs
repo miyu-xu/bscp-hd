@@ -6,15 +6,18 @@ use std::time::{Duration, Instant};
 
 use fs2::FileExt as _;
 use hd_core::{
-    ActionRequestV2, ApiErrorV2, CreateInstanceRequestV2, DesiredStateV2, HostCapabilitiesV2,
-    HostEventKindV2, HostEventV2, InstanceRecordV2, InstanceSummaryV2, ObservedStateV2,
-    OperationKindV2, OperationRecordV2, OperationStateV2, ReconcileReportV2, RestartPolicyV2,
-    StopModeV2, UpdateInstanceRequestV2, WORKER_PROTOCOL_VERSION, WorkerCommandV2,
-    WorkerDescriptorV2, WorkerIdentityV2, WorkerPayloadV2, WorkerRequestV2, WorkerResponseV2,
-    WorkerStatusV2,
+    AcquireDisplaySessionRequestV2, ActionRequestV2, ApiErrorV2, CreateInstanceRequestV2,
+    DesiredStateV2, DisplaySessionV2, FrameReadyMarkerV2, HostCapabilitiesV2, HostEventKindV2,
+    HostEventV2, InstanceRecordV2, InstanceSummaryV2, NativeDisplayTargetV2, ObservedStateV2,
+    OperationKindV2, OperationRecordV2, OperationStateV2, ReconcileReportV2,
+    ReleaseDisplaySessionRequestV2, RestartPolicyV2, ScreenshotRecordV2, StopModeV2,
+    UpdateDisplaySessionRequestV2, UpdateInstanceRequestV2, WORKER_PROTOCOL_VERSION,
+    WorkerCommandV2, WorkerDescriptorV2, WorkerIdentityV2, WorkerPayloadV2, WorkerRequestV2,
+    WorkerResponseV2, WorkerStatusV2,
 };
 use hd_platform::{DataPaths, executable_name, process_identity_is_alive};
 use parking_lot::Mutex as ParkingMutex;
+use subtle::ConstantTimeEq as _;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use uuid::Uuid;
@@ -26,6 +29,20 @@ use crate::{
 
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(15);
 const SECRET_BYTES: usize = 32;
+const MAX_AUTOMATIC_RUNTIME_RESTARTS: u8 = 3;
+
+#[derive(Debug, Default)]
+struct RuntimeRestartState {
+    attempts: u8,
+    last_failed_revision: u64,
+}
+
+#[derive(Debug)]
+struct ActiveHostDisplaySession {
+    session: DisplaySessionV2,
+    target: NativeDisplayTargetV2,
+    viewport_revision: u64,
+}
 
 #[derive(Debug)]
 pub struct HostService {
@@ -36,6 +53,8 @@ pub struct HostService {
     capabilities: RwLock<HostCapabilitiesV2>,
     worker_executable: PathBuf,
     instance_operations: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    runtime_restarts: ParkingMutex<HashMap<Uuid, RuntimeRestartState>>,
+    display_sessions: Mutex<HashMap<Uuid, ActiveHostDisplaySession>>,
     events: broadcast::Sender<HostEventV2>,
     shutdown: watch::Sender<bool>,
     started_at: OffsetDateTime,
@@ -80,13 +99,16 @@ impl HostService {
             capabilities: RwLock::new(capabilities),
             worker_executable,
             instance_operations: Mutex::new(HashMap::new()),
+            runtime_restarts: ParkingMutex::new(HashMap::new()),
+            display_sessions: Mutex::new(HashMap::new()),
             events,
             shutdown,
             started_at: OffsetDateTime::now_utc(),
             _data_lock: ParkingMutex::new(data_lock),
         });
-        service.reconcile().await?;
         service.recover_operations()?;
+        service.reconcile().await?;
+        service.spawn_runtime_refresh_monitor();
         Ok(service)
     }
 
@@ -196,20 +218,13 @@ impl HostService {
     fn recover_operations(self: &Arc<Self>) -> Result<(), HostError> {
         for mut operation in self.store.list_operations()? {
             match operation.state {
-                OperationStateV2::Queued => {
-                    let host = Arc::clone(self);
-                    let operation_id = operation.id;
-                    tokio::spawn(async move {
-                        host.execute_operation(operation_id).await;
-                    });
-                }
-                OperationStateV2::Running => {
+                OperationStateV2::Queued | OperationStateV2::Running => {
                     operation.state = OperationStateV2::Cancelled;
                     operation.finished_at = Some(OffsetDateTime::now_utc());
                     operation.progress_per_mille = 1000;
                     operation.error = Some(ApiErrorV2::new(
                         "host_restarted",
-                        "operation outcome is not inferred after host restart; instance state was independently reconciled",
+                        "pending operation was cancelled after host restart; instance state was independently reconciled",
                     ));
                     self.store.put_operation(&operation)?;
                     self.emit(HostEventKindV2::Operation(operation.clone()))?;
@@ -217,7 +232,7 @@ impl HostService {
                         event = "operation.recovered.cancelled",
                         operation_id = %operation.id,
                         instance_id = ?operation.instance_id,
-                        "cancelled an operation left Running by a previous host"
+                        "cancelled a pending operation left by a previous host"
                     );
                 }
                 OperationStateV2::Succeeded
@@ -254,6 +269,7 @@ impl HostService {
         instance_id: Uuid,
         request: ActionRequestV2,
     ) -> Result<WorkerStatusV2, HostError> {
+        request.action.validate()?;
         let operation_lock = {
             let mut locks = self.instance_operations.lock().await;
             Arc::clone(
@@ -277,6 +293,177 @@ impl HostService {
             .await?;
         ensure_worker_success(response)?;
         self.refresh_from_worker(instance_id).await
+    }
+
+    pub async fn acquire_display_session(
+        &self,
+        instance_id: Uuid,
+        request: AcquireDisplaySessionRequestV2,
+    ) -> Result<DisplaySessionV2, HostError> {
+        if !request.viewport.is_valid() {
+            return Err(HostError::DisplaySession(
+                "viewport is outside supported bounds".to_owned(),
+            ));
+        }
+        if !process_identity_is_alive(request.target.owner()) {
+            return Err(HostError::DisplaySession(
+                "Player process identity is not alive".to_owned(),
+            ));
+        }
+        let record = self.get_instance(instance_id)?;
+        let generation = record.frame_generation;
+        if record.status.observed == ObservedStateV2::Stopped || record.worker.is_none() {
+            return Err(HostError::Busy("display attach requires a running worker"));
+        }
+        let previous = self.display_sessions.lock().await.remove(&instance_id);
+        if let Some(previous) = previous {
+            // A Worker accepts a single target. Detach the old target before assigning the new
+            // Player so a stale hidden Player cannot retain the crosvm child window.
+            let _ = self
+                .call_worker(
+                    instance_id,
+                    WorkerCommandV2::DetachDisplay {
+                        session_id: previous.session.id,
+                        generation: previous.session.generation,
+                    },
+                )
+                .await;
+        }
+        let descriptor = self.read_worker_descriptor(instance_id)?;
+        let session_id = Uuid::new_v4();
+        let token = random_session_token()?;
+        let response = self
+            .call_worker(
+                instance_id,
+                WorkerCommandV2::AttachDisplay {
+                    session_id,
+                    generation,
+                    target: request.target.clone(),
+                    viewport: request.viewport.clone(),
+                },
+            )
+            .await?;
+        ensure_worker_success(response)?;
+        let session = DisplaySessionV2 {
+            id: session_id,
+            instance_id,
+            worker_endpoint: descriptor.endpoint,
+            session_token: token,
+            generation,
+            expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(15),
+        };
+        self.display_sessions.lock().await.insert(
+            instance_id,
+            ActiveHostDisplaySession {
+                session: session.clone(),
+                target: request.target,
+                viewport_revision: request.viewport.revision,
+            },
+        );
+        Ok(session)
+    }
+
+    pub async fn update_display_session(
+        &self,
+        instance_id: Uuid,
+        request: UpdateDisplaySessionRequestV2,
+    ) -> Result<DisplaySessionV2, HostError> {
+        if !request.viewport.is_valid() {
+            return Err(HostError::DisplaySession(
+                "viewport is outside supported bounds".to_owned(),
+            ));
+        }
+        let mut sessions = self.display_sessions.lock().await;
+        let active = sessions
+            .get_mut(&instance_id)
+            .ok_or_else(|| HostError::DisplaySession("display session was not found".to_owned()))?;
+        if !tokens_equal(&active.session.session_token, &request.session_token) {
+            return Err(HostError::DisplaySession(
+                "display session authentication failed".to_owned(),
+            ));
+        }
+        if !process_identity_is_alive(active.target.owner()) {
+            return Err(HostError::DisplaySession(
+                "Player process identity is no longer alive".to_owned(),
+            ));
+        }
+        if request.viewport.revision > active.viewport_revision {
+            let response = self
+                .call_worker(
+                    instance_id,
+                    WorkerCommandV2::ResizeDisplay {
+                        session_id: active.session.id,
+                        generation: active.session.generation,
+                        viewport: request.viewport.clone(),
+                    },
+                )
+                .await?;
+            ensure_worker_success(response)?;
+            active.viewport_revision = request.viewport.revision;
+        }
+        active.session.expires_at = OffsetDateTime::now_utc() + time::Duration::seconds(15);
+        Ok(active.session.clone())
+    }
+
+    pub async fn release_display_session(
+        &self,
+        instance_id: Uuid,
+        request: ReleaseDisplaySessionRequestV2,
+    ) -> Result<(), HostError> {
+        let mut sessions = self.display_sessions.lock().await;
+        let active = sessions
+            .get(&instance_id)
+            .ok_or_else(|| HostError::DisplaySession("display session was not found".to_owned()))?;
+        if !tokens_equal(&active.session.session_token, &request.session_token) {
+            return Err(HostError::DisplaySession(
+                "display session authentication failed".to_owned(),
+            ));
+        }
+        let active = sessions
+            .remove(&instance_id)
+            .expect("session checked above");
+        drop(sessions);
+        let response = self
+            .call_worker(
+                instance_id,
+                WorkerCommandV2::DetachDisplay {
+                    session_id: active.session.id,
+                    generation: active.session.generation,
+                },
+            )
+            .await?;
+        ensure_worker_success(response)?;
+        Ok(())
+    }
+
+    pub async fn capture_screenshot(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<ScreenshotRecordV2, HostError> {
+        let record = self.get_instance(instance_id)?;
+        if record.status.observed != ObservedStateV2::Ready {
+            return Err(HostError::Busy("screenshots require Ready"));
+        }
+        let directory = self.paths.screenshot_directory();
+        std::fs::create_dir_all(&directory).map_err(|source| HostError::Io {
+            operation: "create screenshot directory",
+            path: directory.clone(),
+            source,
+        })?;
+        let output_path =
+            directory.join(format!("{}-{}.png", instance_id, Uuid::new_v4().simple()));
+        let response = self
+            .call_worker(
+                instance_id,
+                WorkerCommandV2::CaptureScreenshot { output_path },
+            )
+            .await?;
+        match ensure_worker_success(response)? {
+            Some(WorkerPayloadV2::Screenshot(record)) => Ok(record),
+            _ => Err(HostError::WorkerProtocol(
+                "worker screenshot response had an unexpected payload".to_owned(),
+            )),
+        }
     }
 
     pub async fn reconcile(self: &Arc<Self>) -> Result<Vec<ReconcileReportV2>, HostError> {
@@ -419,6 +606,18 @@ impl HostService {
                 self.wait_operation(operation.id, Duration::from_secs(45))
                     .await?;
             }
+            // `stop_all` is also the controlled deployment/maintenance boundary. A stopped VM's
+            // detached Worker normally survives Host exit, but retaining it here would keep the
+            // Worker executable locked on Windows and make an in-place runtime upgrade
+            // impossible. Shut down only authenticated idle Workers after every active instance
+            // has reached its terminal stop state.
+            for record in self.store.list_instances()? {
+                if let Some(identity) = record.worker.as_ref()
+                    && process_identity_is_alive(identity)
+                {
+                    self.shutdown_idle_worker(record.spec.id, identity).await?;
+                }
+            }
         }
         let _ = self.shutdown.send(true);
         Ok(())
@@ -553,7 +752,10 @@ impl HostService {
             "host operation started"
         );
         let result = match operation.kind.clone() {
-            OperationKindV2::Start => self.start_instance(instance_id).await,
+            OperationKindV2::Start => {
+                self.start_instance_with_progress(instance_id, operation_id)
+                    .await
+            }
             OperationKindV2::Stop {
                 mode,
                 graceful_timeout_ms,
@@ -566,13 +768,16 @@ impl HostService {
                 .await
             }
             OperationKindV2::Restart => {
+                self.update_operation_progress(operation_id, 150);
                 if let Err(error) = self
                     .stop_instance(instance_id, StopModeV2::Graceful, Duration::from_secs(20))
                     .await
                 {
                     Err(error)
                 } else {
-                    self.start_instance(instance_id).await
+                    self.update_operation_progress(operation_id, 200);
+                    self.start_instance_with_progress(instance_id, operation_id)
+                        .await
                 }
             }
             OperationKindV2::Pause => {
@@ -628,6 +833,71 @@ impl HostService {
         );
     }
 
+    async fn start_instance_with_progress(
+        &self,
+        instance_id: Uuid,
+        operation_id: Uuid,
+    ) -> Result<(), HostError> {
+        let start = self.start_instance(instance_id);
+        tokio::pin!(start);
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                result = &mut start => return result,
+                _ = interval.tick() => {
+                    let Ok(status) = self.refresh_from_worker(instance_id).await else {
+                        continue;
+                    };
+                    let progress = start_progress(status.observed);
+                    let Ok(mut operation) = self.operation(operation_id) else {
+                        continue;
+                    };
+                    if operation.state == OperationStateV2::Running
+                        && progress > operation.progress_per_mille
+                    {
+                        operation.progress_per_mille = progress;
+                        if let Err(error) = self.store.put_operation(&operation) {
+                            tracing::warn!(
+                                event = "operation.progress.persist.failed",
+                                %operation_id,
+                                %error,
+                                "failed to persist optional operation progress"
+                            );
+                            continue;
+                        }
+                        let _ = self.emit(HostEventKindV2::Operation(operation));
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_operation_progress(&self, operation_id: Uuid, progress: u16) {
+        let Ok(mut operation) = self.operation(operation_id) else {
+            return;
+        };
+        if operation.state != OperationStateV2::Running || progress <= operation.progress_per_mille
+        {
+            return;
+        }
+        operation.progress_per_mille = progress;
+        if let Err(error) = self.store.put_operation(&operation) {
+            tracing::warn!(
+                event = "operation.progress.persist.failed",
+                %operation_id,
+                %error,
+                "failed to persist optional operation progress"
+            );
+            return;
+        }
+        let _ = self.emit(HostEventKindV2::Operation(operation));
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn start_instance(&self, id: Uuid) -> Result<(), HostError> {
         let mut record = self.get_instance(id)?;
         self.guard_existing_worker(&mut record).await?;
@@ -654,6 +924,9 @@ impl HostService {
                 return Err(HostError::CapabilityBlocked);
             }
             self.leases.release_instance(id)?;
+            record.frame_generation = record
+                .frame_generation
+                .max(frame_generation_high_water(&self.paths, id));
             let frame_generation = record
                 .frame_generation
                 .checked_add(1)
@@ -663,23 +936,57 @@ impl HostService {
                 .reserve_start(&record.spec, None, frame_generation)?;
             transition_record(&mut record, ObservedStateV2::StartingWorker, None)?;
             self.persist_instance(&record)?;
-            let descriptor = self.ensure_worker(&record).await?;
+            let mut descriptor = self.ensure_worker(&record).await?;
             let bound = self.leases.bind_worker_identity(id, &descriptor.identity)?;
             record.worker = Some(descriptor.identity.clone());
-            let run_id = Uuid::new_v4();
+            let mut run_id = Uuid::new_v4();
             record.active_run_id = Some(run_id);
             self.persist_instance(&record)?;
-            let response = self
+            let mut response = self
                 .call_worker(
                     id,
                     WorkerCommandV2::Start {
                         spec: Box::new(record.spec.clone()),
                         run_id,
                         leases: if bound.is_empty() { reserved } else { bound },
-                        capabilities_fingerprint: discovery.capabilities.fingerprint,
+                        capabilities_fingerprint: discovery.capabilities.fingerprint.clone(),
                     },
                 )
                 .await?;
+            if response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == "capability_changed")
+            {
+                tracing::warn!(
+                    event = "worker.capability_changed.replacing_idle_worker",
+                    instance_id = %id,
+                    worker_pid = descriptor.identity.pid,
+                    "replacing an idle worker that inherited a stale host environment"
+                );
+                self.shutdown_idle_worker(id, &descriptor.identity).await?;
+                record.worker = None;
+                record.active_run_id = None;
+                self.persist_instance(&record)?;
+
+                descriptor = self.ensure_worker(&record).await?;
+                let rebound = self.leases.bind_worker_identity(id, &descriptor.identity)?;
+                record.worker = Some(descriptor.identity.clone());
+                run_id = Uuid::new_v4();
+                record.active_run_id = Some(run_id);
+                self.persist_instance(&record)?;
+                response = self
+                    .call_worker(
+                        id,
+                        WorkerCommandV2::Start {
+                            spec: Box::new(record.spec.clone()),
+                            run_id,
+                            leases: rebound,
+                            capabilities_fingerprint: discovery.capabilities.fingerprint,
+                        },
+                    )
+                    .await?;
+            }
             if let Err(error) = ensure_worker_success(response) {
                 let _ = self.refresh_from_worker(id).await;
                 return Err(error);
@@ -857,6 +1164,13 @@ impl HostService {
     ) -> Result<(), HostError> {
         let mut record = self.get_instance(id)?;
         record.status.set_desired(DesiredStateV2::Stopped);
+        self.runtime_restarts.lock().remove(&id);
+        // Persist the user's desired state before consulting the worker.  If the worker is already
+        // Stopped (notably after a failed start), the old flow skipped the transition branch and
+        // refresh_from_worker reloaded the stale desired=Running record.  A successful stop then
+        // exposed the contradictory Running/Stopped pair and the runner could not reliably clean
+        // up a failed cycle.
+        self.persist_instance(&record)?;
         if record.worker.is_none() {
             record
                 .status
@@ -1050,6 +1364,33 @@ impl HostService {
             .await
     }
 
+    async fn shutdown_idle_worker(
+        &self,
+        id: Uuid,
+        identity: &WorkerIdentityV2,
+    ) -> Result<(), HostError> {
+        let status = self.ping_worker(id).await?;
+        if status.identity != *identity {
+            return Err(HostError::WorkerIdentity);
+        }
+        if status.observed.is_active() || status.cleanup_pending || status.child_pid.is_some() {
+            return Err(HostError::Busy(
+                "the stale worker still owns runtime resources",
+            ));
+        }
+        let response = self.call_worker(id, WorkerCommandV2::Shutdown).await?;
+        ensure_worker_success(response)?;
+        wait_for_process_exit(identity, Duration::from_secs(5)).await;
+        if process_identity_is_alive(identity) {
+            hd_platform::terminate_process_identity(identity)?;
+            wait_for_process_exit(identity, Duration::from_secs(5)).await;
+        }
+        if process_identity_is_alive(identity) {
+            return Err(HostError::WorkerShutdownTimeout(id));
+        }
+        Ok(())
+    }
+
     async fn try_reuse_worker(
         &self,
         record: &InstanceRecordV2,
@@ -1204,17 +1545,221 @@ impl HostService {
             ));
         };
         let mut record = self.get_instance(id)?;
-        record.status.force_reconciled(
-            status.observed,
-            status.last_error.as_ref().map(|error| error.code.clone()),
-            status
-                .last_error
-                .as_ref()
-                .map(|error| error.message.clone()),
-        );
+        let previous = record.clone();
+        let error_code = status.last_error.as_ref().map(|error| error.code.clone());
+        let reason = status
+            .last_error
+            .as_ref()
+            .map(|error| error.message.clone());
+        if record.status.observed != status.observed
+            || record.status.error_code != error_code
+            || record.status.reason != reason
+        {
+            record
+                .status
+                .force_reconciled(status.observed, error_code, reason);
+        }
         sync_runtime_fields(&mut record, &status);
-        self.persist_instance(&record)?;
+        if record != previous {
+            self.persist_instance(&record)?;
+        }
         Ok(status)
+    }
+
+    fn spawn_runtime_refresh_monitor(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(host) = weak.upgrade() else {
+                    break;
+                };
+                host.expire_display_sessions().await;
+                let Ok(instances) = host.store.list_instances() else {
+                    continue;
+                };
+                for instance in instances {
+                    if instance.status.observed.is_active() {
+                        host.refresh_runtime_instance(instance.spec.id).await;
+                    } else if instance.status.observed == ObservedStateV2::Failed {
+                        host.schedule_runtime_restart(&instance, "terminal_start_failure");
+                    }
+                }
+            }
+        });
+    }
+
+    async fn expire_display_sessions(&self) {
+        let now = OffsetDateTime::now_utc();
+        let expired = {
+            let mut sessions = self.display_sessions.lock().await;
+            let expired_ids = sessions
+                .iter()
+                .filter_map(|(instance_id, active)| {
+                    (active.session.expires_at <= now
+                        || !process_identity_is_alive(active.target.owner()))
+                    .then_some(*instance_id)
+                })
+                .collect::<Vec<_>>();
+            expired_ids
+                .into_iter()
+                .filter_map(|instance_id| {
+                    sessions
+                        .remove(&instance_id)
+                        .map(|session| (instance_id, session))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (instance_id, active) in expired {
+            if let Err(error) = self
+                .call_worker(
+                    instance_id,
+                    WorkerCommandV2::DetachDisplay {
+                        session_id: active.session.id,
+                        generation: active.session.generation,
+                    },
+                )
+                .await
+            {
+                tracing::debug!(
+                    event = "display_session.expire.detach_failed",
+                    %instance_id,
+                    %error,
+                    "expired Player display session could not be detached"
+                );
+            } else {
+                tracing::info!(
+                    event = "display_session.expired",
+                    %instance_id,
+                    "expired Player display session was detached"
+                );
+            }
+        }
+    }
+
+    async fn refresh_runtime_instance(self: &Arc<Self>, instance_id: Uuid) {
+        match self.refresh_from_worker(instance_id).await {
+            Ok(status) if status.observed == ObservedStateV2::Ready => {
+                self.runtime_restarts.lock().remove(&instance_id);
+            }
+            Ok(status) if status.observed == ObservedStateV2::Failed => {
+                let Ok(record) = self.get_instance(instance_id) else {
+                    return;
+                };
+                self.schedule_runtime_restart(&record, "runtime_failure");
+            }
+            Ok(_) => {}
+            Err(error) => self.handle_runtime_refresh_error(instance_id, &error),
+        }
+    }
+
+    fn handle_runtime_refresh_error(self: &Arc<Self>, instance_id: Uuid, error: &HostError) {
+        let Ok(mut record) = self.get_instance(instance_id) else {
+            return;
+        };
+        if !record.status.observed.is_active()
+            || record.status.observed == ObservedStateV2::Recovering
+                && record.status.error_code.as_deref() == Some("worker_lost")
+        {
+            return;
+        }
+        let Some(worker_alive) = record.worker.as_ref().map(process_identity_is_alive) else {
+            // Preparing/StartingWorker legitimately precedes descriptor and exact identity
+            // persistence. The in-flight start operation owns that interval; absence is not loss.
+            return;
+        };
+        if worker_alive {
+            tracing::warn!(
+                event = "instance.runtime_refresh.transient_failure",
+                instance_id = %record.spec.id,
+                %error,
+                "live Worker did not answer this refresh tick"
+            );
+            return;
+        }
+
+        let restart = should_restart_after_failure(&record);
+        record.status.force_reconciled(
+            if restart {
+                ObservedStateV2::Recovering
+            } else {
+                ObservedStateV2::Failed
+            },
+            Some("worker_lost".to_owned()),
+            Some(format!(
+                "Worker identity exited during an active runtime: {error}"
+            )),
+        );
+        record.worker = None;
+        record.active_run_id = None;
+        record.adb_serial = None;
+        record.host_fps_milli = None;
+        if let Err(release_error) = self.leases.release_instance(record.spec.id) {
+            tracing::error!(
+                event = "instance.worker_lost.lease_release_failed",
+                instance_id = %record.spec.id,
+                %release_error,
+                "failed to release leases after exact Worker identity exit"
+            );
+            return;
+        }
+        if let Err(persist_error) = self.persist_instance(&record) {
+            tracing::error!(
+                event = "instance.worker_lost.persist_failed",
+                instance_id = %record.spec.id,
+                %persist_error,
+                "failed to persist Worker loss recovery state"
+            );
+            return;
+        }
+        self.schedule_runtime_restart(&record, "worker_lost");
+    }
+
+    fn schedule_runtime_restart(self: &Arc<Self>, record: &InstanceRecordV2, cause: &str) {
+        if !should_restart_after_failure(record) {
+            return;
+        }
+        let attempt = {
+            let mut restarts = self.runtime_restarts.lock();
+            let state = restarts.entry(record.spec.id).or_default();
+            if state.last_failed_revision == record.status.revision {
+                return;
+            }
+            if state.attempts >= MAX_AUTOMATIC_RUNTIME_RESTARTS {
+                tracing::error!(
+                    event = "instance.runtime_failure.restart_exhausted",
+                    instance_id = %record.spec.id,
+                    attempts = state.attempts,
+                    %cause,
+                    "automatic runtime recovery reached its bounded retry limit"
+                );
+                state.last_failed_revision = record.status.revision;
+                return;
+            }
+            state.attempts = state.attempts.saturating_add(1);
+            state.last_failed_revision = record.status.revision;
+            state.attempts
+        };
+        let key = format!("{cause}-restart-{}-{attempt}", record.status.revision);
+        tracing::warn!(
+            event = "instance.runtime_failure.restart_scheduled",
+            instance_id = %record.spec.id,
+            error_code = record.status.error_code.as_deref().unwrap_or(cause),
+            %attempt,
+            %cause,
+            "runtime failure scheduled a new start under restart_policy=on_failure"
+        );
+        if let Err(error) = self.create_operation(record.spec.id, OperationKindV2::Start, &key) {
+            tracing::error!(
+                event = "instance.runtime_failure.restart_schedule_failed",
+                instance_id = %record.spec.id,
+                %cause,
+                %error,
+                "failed to schedule runtime recovery"
+            );
+        }
     }
 
     async fn call_worker(
@@ -1274,6 +1819,19 @@ impl HostService {
     }
 }
 
+const fn start_progress(state: ObservedStateV2) -> u16 {
+    match state {
+        ObservedStateV2::Preparing => 100,
+        ObservedStateV2::StartingWorker => 200,
+        ObservedStateV2::LaunchingGuest => 350,
+        ObservedStateV2::NegotiatingDisplay => 500,
+        ObservedStateV2::GuestBooting => 650,
+        ObservedStateV2::AdbConnecting => 800,
+        ObservedStateV2::Ready => 950,
+        _ => 50,
+    }
+}
+
 fn ensure_worker_success(response: WorkerResponseV2) -> Result<Option<WorkerPayloadV2>, HostError> {
     if response.ok {
         Ok(response.payload)
@@ -1289,9 +1847,31 @@ fn sync_runtime_fields(record: &mut InstanceRecordV2, status: &WorkerStatusV2) {
     record.worker = Some(status.identity.clone());
     record.active_run_id = status.run_id;
     record.adb_serial.clone_from(&status.adb_serial);
-    record.frame_generation = status.frame_generation;
+    record.frame_generation = record.frame_generation.max(status.frame_generation);
     record.host_fps_milli =
         (status.frame_metrics.fps_milli > 0).then_some(status.frame_metrics.fps_milli);
+}
+
+fn should_restart_after_failure(record: &InstanceRecordV2) -> bool {
+    record.status.desired == DesiredStateV2::Running
+        && matches!(record.spec.restart_policy, RestartPolicyV2::OnFailure)
+}
+
+fn frame_generation_high_water(paths: &DataPaths, instance_id: Uuid) -> u64 {
+    let run_root = paths.runs.join(instance_id.to_string());
+    let Ok(entries) = std::fs::read_dir(run_root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let marker_path = entry.path().join("frame-ready-v2.json");
+            let bytes = hd_platform::read_regular_nofollow_limited(&marker_path, 64 * 1024).ok()?;
+            let marker = serde_json::from_slice::<FrameReadyMarkerV2>(&bytes).ok()?;
+            (marker.instance_id == instance_id).then_some(marker.generation)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn diagnostic_failure(id: &str, detail: &str) -> hd_core::DiagnosticCheckV2 {
@@ -1391,6 +1971,15 @@ fn random_secret() -> Result<String, HostError> {
     let mut bytes = [0_u8; SECRET_BYTES];
     getrandom::fill(&mut bytes).map_err(|error| HostError::Random(error.to_string()))?;
     Ok(hex::encode(bytes))
+}
+
+fn random_session_token() -> Result<String, HostError> {
+    random_secret()
+}
+
+fn tokens_equal(expected: &str, supplied: &str) -> bool {
+    expected.len() == supplied.len()
+        && expected.as_bytes().ct_eq(supplied.as_bytes()).unwrap_u8() == 1
 }
 
 fn read_secret(path: &Path) -> Result<String, HostError> {
@@ -1523,6 +2112,8 @@ pub enum HostError {
     WorkerProtocol(String),
     #[error("worker rejected the command: {0:?}")]
     WorkerRejected(ApiErrorV2),
+    #[error("display session failed: {0}")]
+    DisplaySession(String),
     #[error("upload digest does not match the operation")]
     UploadDigestMismatch,
     #[error("operation failed: {0}")]
@@ -1535,6 +2126,8 @@ pub enum HostError {
     SecretUtf8(std::string::FromUtf8Error),
     #[error("secure random generation failed: {0}")]
     Random(String),
+    #[error(transparent)]
+    Action(#[from] hd_core::ActionValidationError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -1573,12 +2166,14 @@ impl HostError {
             Self::WorkerIdentity => "worker_identity",
             Self::WorkerProtocol(_) => "worker_protocol",
             Self::WorkerRejected(_) => "worker_rejected",
+            Self::DisplaySession(_) => "display_session",
             Self::UploadDigestMismatch => "upload_digest_mismatch",
             Self::OperationFailed(_) => "operation_failed",
             Self::OperationTimeout(_) => "operation_timeout",
             Self::UnsafeFile(_) => "unsafe_file",
             Self::SecretUtf8(_) => "secret_utf8",
             Self::Random(_) => "random",
+            Self::Action(_) => "action_invalid",
             Self::Store(_) => "store",
             Self::Lease(error) => error.code(),
             Self::Ipc(_) => "ipc",

@@ -19,7 +19,7 @@ HD 是 `bscp` 内的独立 Rust 子仓库，为固定 Android 15/cuttlefish 风�
 
 ## 交付状态
 
-当前工作机已验证 Host V2 契约、HTTP 安全、持久化迁移、租约清理、诊断打包和真实 `hd-worker` 进程分离。真实 Android 启动与发布仍未验收，因为当前 checkout 没有已签名的固定 Guest/Host bundle，也没有 Windows、Linux、macOS 三台专用 GPU/虚拟化 runner 产生的 real-guest、zero-copy 和 device-profile 证据。这个外部阻塞不能由契约 smoke 或代码存在替代。
+当前工作机已验证 Host V2 契约、HTTP 安全、持久化迁移、租约清理、诊断打包、真实 `hd-worker` 进程分离，并已用 `D:\hd-v2-artifact-store` 中 Guest bundle `22281c84556c6e865e4f94498968efc2f651ef4c37bd3e871d930414609b2986` 与 Windows Host-tools bundle `5187de8d05cf29fdbed127c72ab0a96b50fa37f800137079488237208ae1aa7e` 启动 `android-15.0.0_r14` 到严格 Ready。Windows 四方向/720p–1080p/240–480 DPI/30–120 Hz、零 readback/software-blit、30 项设备/APK/双实例、frame producer/crosvm/Worker/Host 退出恢复、最终版本 100/100 生命周期和真实 120 分钟（237 个采样）长稳均已有通过证据；最终 MinGW 质量门、17 个发布 EXE 的 PE audit、8 门签名 Windows certification 及 `dev_fast=false` 的认证启动也已通过。Windows 规划功能已经收口；原子跨平台发布仍未验收，因为 Linux、macOS 原生平台 gate 与三平台聚合 certification 尚未生成，Windows 单平台完成不能替代这些最终证据。
 
 ## 快速开始
 
@@ -30,7 +30,7 @@ cd hd
 build.bat
 ```
 
-项目统一构建会同时发布 `hd.exe`、`hdctl.exe`、`hd-host.exe`、`hd-worker.exe` 和 `hd-device-sim.exe`：
+项目统一构建会发布十五个 HD Windows 运行时：多实例 Manager（`hd.exe`）、每实例 Player（`hd-player.exe`）、CLI/Host/Worker、设备模拟器、ADB bridge、RootCanal/Casimir、frame producer，以及 UWB、modem、network、audio、camera 五个正式 peripheral adapter。
 
 ```bat
 build_all.bat
@@ -49,13 +49,21 @@ cargo run --target x86_64-pc-windows-gnu -p xtask -- quality
 cargo run --target x86_64-pc-windows-gnu -p xtask -- smoke
 ```
 
+固定 Guest/Host 产物可通过 `xtask publish-bundle` 做逐文件 hash、Ed25519 签名、READY 生成、生产 resolver 自验证和内容寻址原子发布；具体参数见 [运行手册](docs/RUNBOOK.md)。
+
+Android x86_64 Cuttlefish 的官方 image ZIP 可通过 `xtask import-cuttlefish` 转换为
+未签名 HD Guest staging。Android 15 使用匹配的 target-files ZIP；已明确接受的
+latest 构建也可使用 OTA metadata，并从 vendor_boot 提取 fstab。导入不会自动声明
+正式 Guest capability；用法和验证边界见 [运行手册](docs/RUNBOOK.md)。
+
 启动 UI 或 CLI。二者都会连接现有 Host，或在不存在时拉起同目录的 `hd-host`：
 
 ```powershell
-hd.exe
-hdctl health
-hdctl create --name Android-1
-hdctl list
+hd.exe --data-root D:\hd-v2-data
+hd-player.exe --instance-id <INSTANCE_UUID> --data-root D:\hd-v2-data
+hdctl --data-root D:\hd-v2-data health
+hdctl --data-root D:\hd-v2-data create --name Android-1
+hdctl --data-root D:\hd-v2-data list
 hdctl capabilities <INSTANCE_UUID>
 hdctl start <INSTANCE_UUID>
 hdctl action <INSTANCE_UUID> key home
@@ -92,6 +100,7 @@ Host 数据根由 `host.lock` 单写者保护；UI 退出不会停止 Host 或�
 
 - Windows 禁止 MSVC fallback 或混合 ABI；发布目录必须通过 PE import audit。
 - 运行时不下载 Guest、工具或设备组件；只接受受信 Ed25519 签名、READY 标记和逐文件 SHA-256 验证通过的 bundle。
+- 官方 Cuttlefish image ZIP 与 Linux `cvd-host_package.tar.gz` 都不是可直接启动的 HD bundle；必须先离线导入，并为对应 Android 版本通过 real-guest、设备拓扑和认证门禁。
 - VSync 是启动参数；不能真实热应用的变更返回需重启。分辨率、DPI、刷新率和方向走 crosvm 显示事务，Guest 方向失败时回滚。
 - 严格零拷贝不支持时阻止启动；没有 readback、软件 blit、视频编码或像素缓冲回退 API。
 - 所有常规 Guest 动作只在唯一 `Ready` 条件成立后执行；APK 会先流式上传、校验 SHA-256 和有界 ZIP32/唯一 manifest 结构，再由 ADB 安装并回读包路径。

@@ -4,11 +4,13 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
 use hd_core::{
-    ActionRequestV2, ApiErrorV2, CONTROL_PROTOCOL_VERSION, CreateInstanceRequestV2,
-    CreateOperationRequestV2, DiagnosticBundleResponseV2, DiagnosticRequestV2, HealthResponseV2,
-    HostCapabilitiesV2, HostRuntimeDescriptorV2, InstanceActionV2, InstanceRecordV2,
-    InstanceSummaryV2, OperationKindV2, OperationRecordV2, OperationStateV2, ShutdownHostRequestV2,
-    UpdateInstanceRequestV2, UploadRecordV2, WorkerIdentityV2,
+    AcquireDisplaySessionRequestV2, ActionRequestV2, ApiErrorV2, CONTROL_PROTOCOL_VERSION,
+    CreateInstanceRequestV2, CreateOperationRequestV2, DiagnosticBundleResponseV2,
+    DiagnosticRequestV2, DisplaySessionV2, DisplayViewportV2, HealthResponseV2, HostCapabilitiesV2,
+    HostRuntimeDescriptorV2, InstanceActionV2, InstanceRecordV2, InstanceSummaryV2,
+    NativeDisplayTargetV2, OperationKindV2, OperationRecordV2, OperationStateV2,
+    ReleaseDisplaySessionRequestV2, ScreenshotRecordV2, ShutdownHostRequestV2,
+    UpdateDisplaySessionRequestV2, UpdateInstanceRequestV2, UploadRecordV2, WorkerIdentityV2,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, HOST, HeaderMap, HeaderValue};
 use serde::Serialize;
@@ -136,7 +138,15 @@ impl HostClientV2 {
             || "/v2/capabilities".to_owned(),
             |id| format!("/v2/capabilities?instance_id={id}"),
         );
-        self.get_json(&path).await
+        // The first discovery for an immutable Guest bundle verifies every file. A production
+        // Android rootfs can be tens of GiB, so it must not inherit the short control-plane
+        // timeout used by health/list/show requests.
+        self.send_json(
+            self.http
+                .get(self.url(&path)?)
+                .timeout(Duration::from_mins(30)),
+        )
+        .await
     }
 
     pub async fn list_instances(&self) -> Result<Vec<InstanceSummaryV2>, ClientError> {
@@ -205,9 +215,26 @@ impl HostClientV2 {
         id: Uuid,
         timeout: Duration,
     ) -> Result<OperationRecordV2, ClientError> {
+        const MAX_CONSECUTIVE_TRANSPORT_FAILURES: u32 = 50;
+
         let started = Instant::now();
+        let mut consecutive_transport_failures = 0_u32;
         loop {
-            let operation = self.operation(id).await?;
+            let operation = match self.operation(id).await {
+                Ok(operation) => {
+                    consecutive_transport_failures = 0;
+                    operation
+                }
+                Err(ClientError::Transport(_))
+                    if consecutive_transport_failures < MAX_CONSECUTIVE_TRANSPORT_FAILURES
+                        && started.elapsed() < timeout =>
+                {
+                    consecutive_transport_failures += 1;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             match operation.state {
                 OperationStateV2::Succeeded => return Ok(operation),
                 OperationStateV2::Failed | OperationStateV2::Cancelled => {
@@ -236,6 +263,56 @@ impl HostClientV2 {
             &ActionRequestV2 { action },
         )
         .await
+    }
+
+    pub async fn acquire_display_session(
+        &self,
+        id: Uuid,
+        target: NativeDisplayTargetV2,
+        viewport: DisplayViewportV2,
+    ) -> Result<DisplaySessionV2, ClientError> {
+        self.post_json(
+            &format!("/v2/instances/{id}/display-session"),
+            &AcquireDisplaySessionRequestV2 { target, viewport },
+        )
+        .await
+    }
+
+    pub async fn update_display_session(
+        &self,
+        id: Uuid,
+        session_token: String,
+        viewport: DisplayViewportV2,
+    ) -> Result<DisplaySessionV2, ClientError> {
+        self.send_json(
+            self.http
+                .put(self.url(&format!("/v2/instances/{id}/display-session"))?)
+                .json(&UpdateDisplaySessionRequestV2 {
+                    session_token,
+                    viewport,
+                }),
+        )
+        .await
+    }
+
+    pub async fn release_display_session(
+        &self,
+        id: Uuid,
+        session_token: String,
+    ) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .delete(self.url(&format!("/v2/instances/{id}/display-session"))?)
+            .json(&ReleaseDisplaySessionRequestV2 { session_token })
+            .send()
+            .await
+            .map_err(ClientError::Transport)?;
+        ensure_empty_success(response).await
+    }
+
+    pub async fn capture_screenshot(&self, id: Uuid) -> Result<ScreenshotRecordV2, ClientError> {
+        self.post_json(&format!("/v2/instances/{id}/screenshots"), &())
+            .await
     }
 
     pub async fn upload_apk(&self, path: &Path) -> Result<UploadRecordV2, ClientError> {
@@ -275,7 +352,7 @@ impl HostClientV2 {
         self.send_json(
             self.http
                 .post(self.url("/v2/uploads/apk")?)
-                .timeout(Duration::from_secs(30 * 60))
+                .timeout(Duration::from_mins(30))
                 .header("x-file-name", file_name)
                 .header("x-content-sha256", sha256)
                 .header(CONTENT_LENGTH, metadata.len())
@@ -291,7 +368,7 @@ impl HostClientV2 {
         self.send_json(
             self.http
                 .post(self.url("/v2/diagnostics")?)
-                .timeout(Duration::from_secs(5 * 60))
+                .timeout(Duration::from_mins(5))
                 .json(request),
         )
         .await

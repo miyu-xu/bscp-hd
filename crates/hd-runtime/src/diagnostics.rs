@@ -185,6 +185,7 @@ impl DiagnosticCollector {
             "console-hvc0.txt",
             "guest-logcat.txt",
             "frame-ready-v2.json",
+            "frame-metrics-v2.json",
         ] {
             let source = run_dir.join(name);
             if source.is_file() {
@@ -253,7 +254,7 @@ impl DiagnosticCollector {
                 .then_some((metadata.modified().ok(), path))
             })
             .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| right.0.cmp(&left.0));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
         for (_, source) in candidates.into_iter().take(3) {
             let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
                 continue;
@@ -337,7 +338,7 @@ impl DiagnosticCollector {
                 .then_some((metadata.modified().ok(), path))
             })
             .collect::<Vec<_>>();
-        bundles.sort_by(|left, right| right.0.cmp(&left.0));
+        bundles.sort_by_key(|bundle| std::cmp::Reverse(bundle.0));
         for (_, path) in bundles.into_iter().skip(RETAIN_BUNDLES) {
             if path != current {
                 std::fs::remove_file(&path).map_err(|source| DiagnosticError::Io {
@@ -614,7 +615,7 @@ fn latest_run_id(paths: &hd_platform::DataPaths, instance_id: Uuid) -> Option<Uu
             Some((metadata.modified().ok(), id))
         })
         .collect::<Vec<_>>();
-    runs.sort_by(|left, right| right.0.cmp(&left.0));
+    runs.sort_by_key(|run| std::cmp::Reverse(run.0));
     runs.first().map(|(_, id)| *id)
 }
 

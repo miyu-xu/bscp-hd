@@ -1,5 +1,6 @@
 #![allow(unsafe_code)]
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::Write as _;
 use std::os::windows::ffi::OsStrExt as _;
@@ -8,10 +9,10 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use hd_core::WorkerIdentityV2;
+use hd_core::{DisplayViewportV2, NativeDisplayTargetV2, WorkerIdentityV2};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FILETIME, GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
-    LocalFree, STILL_ACTIVE,
+    CloseHandle, FILETIME, GENERIC_READ, GENERIC_WRITE, GetLastError, HWND, INVALID_HANDLE_VALUE,
+    LocalFree, STILL_ACTIVE, SetLastError,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -25,11 +26,23 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
     MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS, GetCurrentProcess,
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, TerminateProcess,
+    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
+    GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessTimes, OpenProcess,
+    OpenProcessToken, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+    PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumChildWindows, EnumWindows, GWL_STYLE, GetClassNameW, GetWindowLongPtrW,
+    GetWindowThreadProcessId, IsWindow, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOOWNERZORDER, SWP_NOZORDER, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    WS_CHILD, WS_CLIPCHILDREN, WS_POPUP,
 };
 
 use crate::{NativeCapabilityProbe, PlatformError};
@@ -37,6 +50,275 @@ use crate::{NativeCapabilityProbe, PlatformError};
 const DEVICE_PATH_PREFIX: [u16; 4] = [92, 92, 63, 92];
 const UNC_PATH_PREFIX: [u16; 8] = [92, 92, 63, 92, 85, 78, 67, 92];
 const UNC_PATH_START: [u16; 2] = [92, 92];
+
+struct CrosvmWindowSearch {
+    pids: HashSet<u32>,
+    hwnd: HWND,
+}
+
+unsafe fn window_matches_crosvm(hwnd: HWND, search: &CrosvmWindowSearch) -> bool {
+    let mut pid = 0_u32;
+    // SAFETY: hwnd is supplied by Win32 enumeration and pid points to writable storage.
+    unsafe { GetWindowThreadProcessId(hwnd, &raw mut pid) };
+    if !search.pids.contains(&pid) {
+        return false;
+    }
+    let mut class_name = [0_u16; 128];
+    let Ok(class_name_capacity) = i32::try_from(class_name.len()) else {
+        return false;
+    };
+    // SAFETY: the buffer is writable and its element count is exact.
+    let length = unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name_capacity) };
+    let Ok(length) = usize::try_from(length) else {
+        return false;
+    };
+    length > 0 && String::from_utf16_lossy(&class_name[..length]).starts_with("CROSVM")
+}
+
+unsafe extern "system" fn find_crosvm_child_callback(hwnd: HWND, lparam: isize) -> i32 {
+    // SAFETY: EnumWindows synchronously invokes this callback with the pointer supplied below.
+    let search = unsafe { &mut *(lparam as *mut CrosvmWindowSearch) };
+    if unsafe { window_matches_crosvm(hwnd, search) } {
+        search.hwnd = hwnd;
+        return 0;
+    }
+    1
+}
+
+unsafe extern "system" fn find_crosvm_root_callback(hwnd: HWND, lparam: isize) -> i32 {
+    // SAFETY: EnumWindows synchronously invokes this callback with the pointer supplied below.
+    {
+        let search = unsafe { &mut *(lparam as *mut CrosvmWindowSearch) };
+        if unsafe { window_matches_crosvm(hwnd, search) } {
+            search.hwnd = hwnd;
+            return 0;
+        }
+    }
+    // Once attached, the CROSVM window is no longer returned by EnumWindows. Search every root's
+    // descendant tree so resize and detach continue to address the same HWND after SetParent.
+    unsafe { EnumChildWindows(hwnd, Some(find_crosvm_child_callback), lparam) };
+    // SAFETY: the child enumeration has returned, so no callback holds another reference.
+    let search = unsafe { &*(lparam as *const CrosvmWindowSearch) };
+    i32::from(search.hwnd.is_null())
+}
+
+fn crosvm_window(pid: u32) -> Result<HWND, PlatformError> {
+    let pids = process_tree(pid)?;
+    let mut search = CrosvmWindowSearch {
+        pids,
+        hwnd: std::ptr::null_mut(),
+    };
+    // SAFETY: the pointer remains valid for the synchronous enumeration.
+    unsafe {
+        EnumWindows(Some(find_crosvm_root_callback), (&raw mut search) as isize);
+    }
+    if search.hwnd.is_null() {
+        Err(PlatformError::Process(format!(
+            "crosvm GUI window was not found for process {pid}"
+        )))
+    } else {
+        Ok(search.hwnd)
+    }
+}
+
+fn process_tree(root_pid: u32) -> Result<HashSet<u32>, PlatformError> {
+    // SAFETY: ToolHelp returns an owned snapshot handle and writes only into the sized entry.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(last_identity_error(
+            "CreateToolhelp32Snapshot(process tree)",
+        ));
+    }
+    let mut parents = HashMap::new();
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
+        .map_err(|_| PlatformError::Process("PROCESSENTRY32W size overflow".to_owned()))?;
+    // SAFETY: snapshot is valid and entry has the required dwSize.
+    let mut available = unsafe { Process32FirstW(snapshot, &raw mut entry) } != 0;
+    while available {
+        parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+        // SAFETY: same valid snapshot and entry are reused for the next record.
+        available = unsafe { Process32NextW(snapshot, &raw mut entry) } != 0;
+    }
+    // SAFETY: snapshot is owned by this function and no longer used.
+    unsafe { CloseHandle(snapshot) };
+
+    let mut descendants = HashSet::from([root_pid]);
+    loop {
+        let previous_len = descendants.len();
+        for (candidate, parent) in &parents {
+            if descendants.contains(parent) {
+                descendants.insert(*candidate);
+            }
+        }
+        if descendants.len() == previous_len {
+            break;
+        }
+    }
+    Ok(descendants)
+}
+
+fn windows_target(
+    target: &NativeDisplayTargetV2,
+) -> Result<(HWND, &WorkerIdentityV2), PlatformError> {
+    match target {
+        NativeDisplayTargetV2::WindowsHwnd { hwnd, owner } => {
+            let raw_hwnd = usize::try_from(*hwnd).map_err(|_| {
+                PlatformError::Identity(
+                    "Player native display target exceeds pointer width".to_owned(),
+                )
+            })?;
+            let hwnd = raw_hwnd as HWND;
+            if hwnd.is_null() || !process_identity_is_alive(owner) {
+                return Err(PlatformError::Identity(
+                    "Player window owner is not alive".to_owned(),
+                ));
+            }
+            // SAFETY: IsWindow and GetWindowThreadProcessId only inspect the numeric handle.
+            if unsafe { IsWindow(hwnd) } == 0 {
+                return Err(PlatformError::Identity(
+                    "Player native display target is not a window".to_owned(),
+                ));
+            }
+            let mut owner_pid = 0_u32;
+            // SAFETY: owner_pid points to writable storage.
+            unsafe { GetWindowThreadProcessId(hwnd, &raw mut owner_pid) };
+            if owner_pid != owner.pid {
+                return Err(PlatformError::Identity(
+                    "Player native display target owner mismatch".to_owned(),
+                ));
+            }
+            let mut owner_session = 0_u32;
+            let mut worker_session = 0_u32;
+            // The native HWND is valid only in the interactive desktop session of this Worker.
+            // This rejects a PID from a different RDP/console session even when its identity is
+            // otherwise alive under the same user account.
+            if unsafe { ProcessIdToSessionId(owner.pid, &raw mut owner_session) } == 0
+                || unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &raw mut worker_session) }
+                    == 0
+                || owner_session != worker_session
+            {
+                return Err(PlatformError::Identity(
+                    "Player native display target is outside the Worker desktop session".to_owned(),
+                ));
+            }
+            Ok((hwnd, owner))
+        }
+    }
+}
+
+fn win32_style(value: u32) -> isize {
+    isize::try_from(value.cast_signed())
+        .unwrap_or_else(|_| unreachable!("Win32 LONG style must fit LONG_PTR"))
+}
+
+fn viewport_dimensions(viewport: &DisplayViewportV2) -> Result<(i32, i32), PlatformError> {
+    let width = i32::try_from(viewport.width_px).map_err(|_| {
+        PlatformError::Process("native display width exceeds Win32 bounds".to_owned())
+    })?;
+    let height = i32::try_from(viewport.height_px).map_err(|_| {
+        PlatformError::Process("native display height exceeds Win32 bounds".to_owned())
+    })?;
+    Ok((width, height))
+}
+
+pub(crate) fn attach_native_display(
+    child_pid: u32,
+    target: &NativeDisplayTargetV2,
+    viewport: &DisplayViewportV2,
+) -> Result<(), PlatformError> {
+    if !viewport.is_valid() {
+        return Err(PlatformError::Process(
+            "native display viewport is outside supported bounds".to_owned(),
+        ));
+    }
+    let (parent, _) = windows_target(target)?;
+    let child = crosvm_window(child_pid)?;
+    let (width, height) = viewport_dimensions(viewport)?;
+    // SAFETY: both HWNDs were validated above; style and parent changes are synchronous.
+    unsafe {
+        let style = GetWindowLongPtrW(child, GWL_STYLE);
+        SetWindowLongPtrW(
+            child,
+            GWL_STYLE,
+            (style & !win32_style(WS_POPUP)) | win32_style(WS_CHILD) | win32_style(WS_CLIPCHILDREN),
+        );
+        SetLastError(0);
+        if SetParent(child, parent).is_null() && GetLastError() != 0 {
+            return Err(last_identity_error("SetParent(attach display)"));
+        }
+        if SetWindowPos(
+            child,
+            std::ptr::null_mut(),
+            0,
+            0,
+            width,
+            height,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER,
+        ) == 0
+        {
+            return Err(last_identity_error("SetWindowPos(attach display)"));
+        }
+        ShowWindow(child, if viewport.visible { SW_SHOW } else { SW_HIDE });
+    }
+    Ok(())
+}
+
+pub(crate) fn resize_native_display(
+    child_pid: u32,
+    target: &NativeDisplayTargetV2,
+    viewport: &DisplayViewportV2,
+) -> Result<(), PlatformError> {
+    let (parent, _) = windows_target(target)?;
+    let child = crosvm_window(child_pid)?;
+    let (width, height) = viewport_dimensions(viewport)?;
+    // SAFETY: handles and dimensions are validated before the synchronous calls.
+    unsafe {
+        SetLastError(0);
+        if SetParent(child, parent).is_null() && GetLastError() != 0 {
+            return Err(last_identity_error("SetParent(resize display)"));
+        }
+        if SetWindowPos(
+            child,
+            std::ptr::null_mut(),
+            0,
+            0,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER,
+        ) == 0
+        {
+            return Err(last_identity_error("SetWindowPos(resize display)"));
+        }
+        ShowWindow(child, if viewport.visible { SW_SHOW } else { SW_HIDE });
+    }
+    Ok(())
+}
+
+pub(crate) fn detach_native_display(child_pid: u32) -> Result<(), PlatformError> {
+    let child = crosvm_window(child_pid)?;
+    // SAFETY: child is a live crosvm window and is detached before the Player parent is destroyed.
+    unsafe {
+        ShowWindow(child, SW_HIDE);
+        SetParent(child, std::ptr::null_mut());
+        let style = GetWindowLongPtrW(child, GWL_STYLE);
+        SetWindowLongPtrW(
+            child,
+            GWL_STYLE,
+            (style & !win32_style(WS_CHILD)) | win32_style(WS_POPUP) | win32_style(WS_CLIPCHILDREN),
+        );
+        SetWindowPos(
+            child,
+            std::ptr::null_mut(),
+            0,
+            0,
+            1,
+            1,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER,
+        );
+    }
+    Ok(())
+}
 
 pub(crate) fn platform_baseline() -> NativeCapabilityProbe {
     let version = windows_version().unwrap_or((0, 0, 0));
@@ -700,7 +982,67 @@ pub(crate) fn configure_detached(command: &mut Command) {
 }
 
 pub(crate) fn configure_managed(command: &mut Command) {
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_SUSPENDED);
+}
+
+pub(crate) fn resume_managed_process(pid: u32) -> Result<(), PlatformError> {
+    // SAFETY: the snapshot handle is owned by this function and closed on every path below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(last_identity_error("CreateToolhelp32Snapshot(threads)"));
+    }
+    let result = (|| {
+        let mut entry = THREADENTRY32 {
+            dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>())
+                .map_err(|error| PlatformError::Identity(error.to_string()))?,
+            ..Default::default()
+        };
+        // SAFETY: snapshot is a valid thread snapshot and entry is correctly sized and writable.
+        let mut has_entry = unsafe { Thread32First(snapshot, &raw mut entry) } != 0;
+        let mut resumed = 0_u32;
+        while has_entry {
+            if entry.th32OwnerProcessID == pid {
+                // SAFETY: OpenThread is called for a thread ID obtained from the live snapshot.
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread.is_null() {
+                    return Err(last_identity_error("OpenThread(resume managed process)"));
+                }
+                // SAFETY: the handle was opened with THREAD_SUSPEND_RESUME. A newly created
+                // CREATE_SUSPENDED process must have exactly one suspension owned by HD.
+                let previous = unsafe { ResumeThread(thread) };
+                let resume_error = if previous == u32::MAX {
+                    Some(last_identity_error("ResumeThread(managed process)"))
+                } else if previous != 1 {
+                    Some(PlatformError::Process(format!(
+                        "managed process thread had unexpected suspend count {previous}"
+                    )))
+                } else {
+                    None
+                };
+                // SAFETY: the temporary thread handle is closed exactly once.
+                unsafe {
+                    CloseHandle(thread);
+                }
+                if let Some(error) = resume_error {
+                    return Err(error);
+                }
+                resumed = resumed.saturating_add(1);
+            }
+            // SAFETY: snapshot and entry remain valid for enumeration.
+            has_entry = unsafe { Thread32Next(snapshot, &raw mut entry) } != 0;
+        }
+        if resumed != 1 {
+            return Err(PlatformError::Process(format!(
+                "managed process {pid} exposed {resumed} resumable threads"
+            )));
+        }
+        Ok(())
+    })();
+    // SAFETY: snapshot is an owned handle and is closed exactly once.
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    result
 }
 
 #[derive(Debug)]

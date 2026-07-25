@@ -17,6 +17,63 @@ pub const ARTIFACT_INDEX_VERSION: u32 = 2;
 pub const DIAGNOSTIC_MANIFEST_VERSION: u32 = 2;
 pub const HOST_CERTIFICATION_VERSION: u32 = 2;
 pub const COMPONENT_PROTOCOL_VERSION: u32 = 2;
+pub const DEVICE_GUEST_ENDPOINT_ROLES_V2: [&str; 9] = [
+    "bluetooth",
+    "gnss",
+    "location",
+    "uwb",
+    "nfc",
+    "sensors",
+    "mcu-control",
+    "mcu-uart",
+    "modem",
+];
+
+pub fn device_component_guest_roles_v2(component: &str) -> &'static [&'static str] {
+    match component {
+        "hd-device-sim" => &["gnss", "location", "sensors", "mcu-control", "mcu-uart"],
+        "rootcanal-adapter" => &["bluetooth"],
+        "casimir-adapter" => &["nfc"],
+        "uwb-adapter" => &["uwb"],
+        // Modem uses host-vsock, network shaping uses typed ADB, and audio/camera
+        // are native Guest virtio/HAL devices. Unknown components likewise receive
+        // no private serial control channel.
+        _ => &[],
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct DeviceControlTokenV2(String);
+
+impl DeviceControlTokenV2 {
+    pub fn from_hex(value: String) -> Option<Self> {
+        (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then_some(Self(value))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl std::fmt::Debug for DeviceControlTokenV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl<'de> Deserialize<'de> for DeviceControlTokenV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_hex(value).ok_or_else(|| {
+            serde::de::Error::custom("device control token must be 64 hexadecimal characters")
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,7 +130,7 @@ pub struct SensorInjectionV2 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum BluetoothPeerActionV2 {
-    CreateGattPeer { name: String },
+    CreateGattPeer { peer_id: Uuid, name: String },
     RemovePeer { peer_id: Uuid },
     SetAdvertising { peer_id: Uuid, enabled: bool },
 }
@@ -97,6 +154,104 @@ pub enum InstanceActionV2 {
     InjectSensor { injection: SensorInjectionV2 },
     BluetoothPeer { action: BluetoothPeerActionV2 },
     NfcTag { action: NfcTagActionV2 },
+}
+
+impl InstanceActionV2 {
+    pub fn validate(&self) -> Result<(), ActionValidationError> {
+        match self {
+            Self::Key { .. }
+            | Self::Rotate { .. }
+            | Self::NfcTag {
+                action: NfcTagActionV2::Remove,
+            } => Ok(()),
+            Self::SetLocation { location } if location.is_valid() => Ok(()),
+            Self::SetLocation { .. } => Err(ActionValidationError::Location),
+            Self::SetBattery { battery }
+                if battery.level_percent <= 100
+                    && (-500..=1_500).contains(&battery.temperature_deci_celsius) =>
+            {
+                Ok(())
+            }
+            Self::SetBattery { .. } => Err(ActionValidationError::Battery),
+            Self::SetNetworkCondition { condition }
+                if condition.latency_ms <= 60_000
+                    && condition.loss_basis_points <= 10_000
+                    && condition.bandwidth_kbps != Some(0) =>
+            {
+                Ok(())
+            }
+            Self::SetNetworkCondition { .. } => Err(ActionValidationError::Network),
+            Self::InjectSensor { injection } => validate_sensor_injection(injection),
+            Self::BluetoothPeer { action } => validate_bluetooth_action(action),
+            Self::NfcTag {
+                action:
+                    NfcTagActionV2::PresentType2 { ndef_hex }
+                    | NfcTagActionV2::PresentType4 { ndef_hex },
+            } => validate_ndef_hex(ndef_hex),
+        }
+    }
+}
+
+fn validate_sensor_injection(injection: &SensorInjectionV2) -> Result<(), ActionValidationError> {
+    let expected_values = match injection.sensor.as_str() {
+        "accelerometer" | "gyroscope" | "magnetometer" => 3,
+        "light" | "proximity" => 1,
+        _ => return Err(ActionValidationError::Sensor),
+    };
+    if injection.values_microunits.len() == expected_values
+        && injection.duration_ms <= 3_600_000
+        && injection
+            .values_microunits
+            .iter()
+            .all(|value| value.unsigned_abs() <= 1_000_000_000_000)
+    {
+        Ok(())
+    } else {
+        Err(ActionValidationError::Sensor)
+    }
+}
+
+fn validate_bluetooth_action(action: &BluetoothPeerActionV2) -> Result<(), ActionValidationError> {
+    let valid = match action {
+        BluetoothPeerActionV2::CreateGattPeer { peer_id, name } => {
+            !peer_id.is_nil() && !name.trim().is_empty() && name.len() <= 128
+        }
+        BluetoothPeerActionV2::RemovePeer { peer_id }
+        | BluetoothPeerActionV2::SetAdvertising { peer_id, .. } => !peer_id.is_nil(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ActionValidationError::Bluetooth)
+    }
+}
+
+fn validate_ndef_hex(ndef_hex: &str) -> Result<(), ActionValidationError> {
+    if !ndef_hex.is_empty()
+        && ndef_hex.len() <= 16 * 1024
+        && ndef_hex.len().is_multiple_of(2)
+        && ndef_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        Ok(())
+    } else {
+        Err(ActionValidationError::Nfc)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ActionValidationError {
+    #[error("location is outside the supported geodetic range")]
+    Location,
+    #[error("battery state is outside the supported range")]
+    Battery,
+    #[error("network condition is outside the supported range")]
+    Network,
+    #[error("sensor injection is outside the supported range")]
+    Sensor,
+    #[error("Bluetooth peer action is outside the supported contract")]
+    Bluetooth,
+    #[error("NFC NDEF payload is outside the supported contract")]
+    Nfc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,6 +548,14 @@ pub enum FormalComponentConfigurationV2 {
         guest_cid: u32,
         guest_port: u32,
         vm_control_endpoint: String,
+        crosvm_executable: PathBuf,
+    },
+    DeviceAdapter {
+        control_endpoint: String,
+        control_token: DeviceControlTokenV2,
+        guest_cid: u32,
+        vm_control_endpoint: String,
+        guest_endpoints: BTreeMap<String, DeviceSerialEndpointV2>,
     },
 }
 
@@ -417,6 +580,35 @@ pub struct FormalComponentReadyV2 {
     pub launch_sha256: String,
     pub pid: u32,
     pub process_start_marker: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", content = "parameters", rename_all = "snake_case")]
+pub enum DeviceControlCommandV2 {
+    Ping,
+    Action { action: InstanceActionV2 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceControlRequestV2 {
+    pub protocol_version: u32,
+    pub request_id: Uuid,
+    pub instance_id: Uuid,
+    pub run_id: Uuid,
+    pub bearer_token: DeviceControlTokenV2,
+    pub command: DeviceControlCommandV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceControlResponseV2 {
+    pub protocol_version: u32,
+    pub request_id: Uuid,
+    pub instance_id: Uuid,
+    pub run_id: Uuid,
+    pub ok: bool,
+    pub error: Option<ApiErrorV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -628,6 +820,7 @@ pub struct ResolvedGuestArtifactsV2 {
     pub initrd: PathBuf,
     pub rootfs: PathBuf,
     pub android_fstab: PathBuf,
+    pub sensor_injector: PathBuf,
     pub system_image: Option<PathBuf>,
     pub vendor_image: Option<PathBuf>,
     pub host_tools: BTreeMap<String, PathBuf>,
@@ -746,6 +939,8 @@ pub struct LaunchPlanV2 {
     pub keyboard_endpoint: String,
     /// Ephemeral host/guest serial bridges keyed by the fixed Android device role.
     pub device_endpoints: BTreeMap<String, DeviceSerialEndpointV2>,
+    /// Authenticated local control endpoints keyed by signed formal device component id.
+    pub device_control_endpoints: BTreeMap<String, String>,
     pub adb_serial: Option<String>,
     pub guest_cid: u32,
 }
@@ -820,6 +1015,24 @@ pub enum WorkerCommandV2 {
         upload_path: PathBuf,
         sha256: String,
     },
+    AttachDisplay {
+        session_id: Uuid,
+        generation: u64,
+        target: NativeDisplayTargetV2,
+        viewport: DisplayViewportV2,
+    },
+    ResizeDisplay {
+        session_id: Uuid,
+        generation: u64,
+        viewport: DisplayViewportV2,
+    },
+    DetachDisplay {
+        session_id: Uuid,
+        generation: u64,
+    },
+    CaptureScreenshot {
+        output_path: PathBuf,
+    },
     CollectGuestLogs,
     Diagnose,
     Shutdown,
@@ -847,6 +1060,7 @@ pub enum WorkerPayloadV2 {
     Status(WorkerStatusV2),
     Diagnostics(Vec<DiagnosticCheckV2>),
     GuestLog(DiagnosticFileV2),
+    Screenshot(ScreenshotRecordV2),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -905,12 +1119,97 @@ pub struct ShutdownHostRequestV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplaySessionV2 {
+    pub id: Uuid,
     pub instance_id: Uuid,
     pub worker_endpoint: String,
     pub session_token: String,
     pub generation: u64,
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "platform", rename_all = "snake_case")]
+pub enum NativeDisplayTargetV2 {
+    WindowsHwnd { hwnd: u64, owner: WorkerIdentityV2 },
+}
+
+impl NativeDisplayTargetV2 {
+    pub const fn owner(&self) -> &WorkerIdentityV2 {
+        match self {
+            Self::WindowsHwnd { owner, .. } => owner,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplayViewportV2 {
+    pub width_px: u32,
+    pub height_px: u32,
+    pub dpi: u32,
+    pub visible: bool,
+    pub revision: u64,
+}
+
+impl DisplayViewportV2 {
+    pub const fn is_valid(&self) -> bool {
+        self.width_px > 0
+            && self.height_px > 0
+            && self.width_px <= 16_384
+            && self.height_px <= 16_384
+            && self.dpi >= 72
+            && self.dpi <= 960
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcquireDisplaySessionRequestV2 {
+    pub target: NativeDisplayTargetV2,
+    pub viewport: DisplayViewportV2,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateDisplaySessionRequestV2 {
+    pub session_token: String,
+    pub viewport: DisplayViewportV2,
+}
+
+impl std::fmt::Debug for UpdateDisplaySessionRequestV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpdateDisplaySessionRequestV2")
+            .field("session_token", &"[REDACTED]")
+            .field("viewport", &self.viewport)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseDisplaySessionRequestV2 {
+    pub session_token: String,
+}
+
+impl std::fmt::Debug for ReleaseDisplaySessionRequestV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReleaseDisplaySessionRequestV2")
+            .field("session_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenshotRecordV2 {
+    pub instance_id: Uuid,
+    pub path: PathBuf,
+    pub sha256: String,
+    pub size_bytes: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

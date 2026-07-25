@@ -73,8 +73,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let timeout = match &request.command {
-        hd_core::WorkerCommandV2::Start { .. } => Duration::from_secs(480),
-        hd_core::WorkerCommandV2::InstallApk { .. } => Duration::from_secs(360),
+        hd_core::WorkerCommandV2::Start { .. } => Duration::from_mins(8),
+        hd_core::WorkerCommandV2::InstallApk { .. } => Duration::from_mins(6),
         hd_core::WorkerCommandV2::Stop {
             graceful_timeout_ms,
             ..

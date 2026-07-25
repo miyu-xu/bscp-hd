@@ -17,7 +17,7 @@
 - `automation/tasks/*.json`：可跨会话继续的事实状态；
 - `xtask process-check`：逐个校验上述 schema/任务/样例/必需文档，并扫描自动脚本中的 unittest 调用；
 - `xtask quality`：流程、diff、格式、all-targets、Clippy、build 和独立 smoke；
-- `xtask ai-cycle`：执行质量门，即使失败也生成 gate report 与 readback；
+- `xtask ai-cycle`：执行质量门，即使失败也生成 gate report 与 readback；成功时把 Host smoke 的五个子门禁及其持久化制品写入同一输出目录；
 - `xtask readback`：合并已有 gate，回读 HD/crosvm/gfxstream/根仓库状态；
 - `scripts/integration-quality.ps1`：在同一 MinGW ABI 下执行跨仓编译和根发布验证；
 - `.github/workflows/ci.yml`：CI 调用同一入口，并在失败时仍上传回读证据。

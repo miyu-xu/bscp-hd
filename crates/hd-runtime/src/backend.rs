@@ -88,7 +88,7 @@ impl CrosvmBackend {
     fn gpu_argument(display: &DisplayConfigV2) -> String {
         let (width, height) = display.oriented_size();
         format!(
-            "backend=gfxstream,displays=[[mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh}]],context-types=gfxstream-vulkan:gfxstream-composer,angle=true,gles=false,vulkan=true,wsi=vk,external-blob=true,udmabuf=false,renderer-features=VulkanAllocateHostMemory:enabled",
+            "backend=gfxstream,max-num-displays=1,audio-device-mode=one-global,displays=[[mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh},hidden=true]],context-types=gfxstream-vulkan:gfxstream-composer,angle=true,gles=false,vulkan=true,wsi=vk,external-blob=true,udmabuf=false,renderer-features=VulkanAllocateHostMemory:enabled",
             dpi = display.dpi,
             refresh = display.refresh_rate_hz,
         )
@@ -187,7 +187,7 @@ impl VmBackend for CrosvmBackend {
         let spec = &context.spec;
         let mut arguments = vec![
             "--log-level".to_owned(),
-            "info".to_owned(),
+            "warn".to_owned(),
             if cfg!(windows) { "run-mp" } else { "run" }.to_owned(),
             "--cid".to_owned(),
             context.guest_cid.to_string(),
@@ -227,6 +227,14 @@ impl VmBackend for CrosvmBackend {
             ]);
         }
 
+        if spec.devices.audio {
+            arguments.extend([
+                "--virtio-snd".to_owned(),
+                "capture=true,backend=null,num_output_devices=1,num_input_devices=1,num_output_streams=1,num_input_streams=1"
+                    .to_owned(),
+            ]);
+        }
+
         arguments.extend([
             "--block".to_owned(),
             format!(
@@ -247,7 +255,7 @@ impl VmBackend for CrosvmBackend {
             ),
         ]);
 
-        let serial_roles: [(u8, u8, &str); 15] = [
+        let serial_roles: [(u8, u8, &str); 18] = [
             (2, 0x04, "reserved"),
             (3, 0x05, "logcat"),
             (4, 0x06, "keymaster"),
@@ -263,6 +271,9 @@ impl VmBackend for CrosvmBackend {
             (14, 0x10, "sensors"),
             (15, 0x11, "mcu-control"),
             (16, 0x12, "mcu-uart"),
+            (18, 0x16, "network-control"),
+            (19, 0x17, "audio-control"),
+            (20, 0x18, "camera-control"),
         ];
         for (number, slot, role) in serial_roles {
             let endpoint = context.device_endpoints.get(role);
@@ -304,6 +315,14 @@ impl VmBackend for CrosvmBackend {
         }
 
         let mut kernel_arguments = vec!["console=hvc0,ttyS0".to_owned(), "init=/init".to_owned()];
+        // The virtio-gpu EDID carries the configured DPI, but Android's SurfaceFlinger does not
+        // derive its logical/physical density from that EDID on this guest profile.  Android's
+        // emulator boot contract consumes androidboot.lcd_density, so keep the guest UI density
+        // in the same cold-start transaction as the crosvm display parameters.
+        kernel_arguments.push(format!("androidboot.lcd_density={}", spec.display.dpi));
+        if spec.devices.uwb {
+            kernel_arguments.push("androidboot.uwbcountrycode=US".to_owned());
+        }
         kernel_arguments.extend(spec.boot.kernel_arguments());
         arguments.extend([
             "--android-fstab".to_owned(),
@@ -319,13 +338,13 @@ impl VmBackend for CrosvmBackend {
             context.artifacts.kernel.to_string_lossy().into_owned(),
         ]);
 
-        let environment = BTreeMap::from([
-            ("HD_FRAME_REQUIRED".to_owned(), "1".to_owned()),
-            ("HD_FRAME_PROTOCOL".to_owned(), "2".to_owned()),
+        let dev_display_copy_fallback = crate::dev::allow_display_copy_fallback_enabled();
+        let mut environment = BTreeMap::from([
             (
-                "HD_FRAME_BROKER_V2".to_owned(),
-                context.frame_endpoint.clone(),
+                "HD_FRAME_REQUIRED".to_owned(),
+                if dev_display_copy_fallback { "0" } else { "1" }.to_owned(),
             ),
+            ("HD_FRAME_PROTOCOL".to_owned(), "2".to_owned()),
             ("HD_FRAME_INSTANCE".to_owned(), spec.id.to_string()),
             (
                 "HD_VSYNC".to_owned(),
@@ -336,6 +355,81 @@ impl VmBackend for CrosvmBackend {
                 .to_owned(),
             ),
         ]);
+        if !dev_display_copy_fallback {
+            environment.insert(
+                "HD_FRAME_BROKER_V2".to_owned(),
+                context.frame_endpoint.clone(),
+            );
+        }
+        #[cfg(windows)]
+        {
+            let gfxstream = context
+                .artifacts
+                .host_tools
+                .get("gfxstream-backend")
+                .ok_or_else(|| {
+                    PlatformError::Vm("host bundle has no gfxstream backend".to_owned())
+                })?;
+            let angle_egl = context
+                .artifacts
+                .host_tools
+                .get("angle-egl")
+                .ok_or_else(|| {
+                    PlatformError::Vm("host bundle has no ANGLE EGL runtime".to_owned())
+                })?;
+            let angle_gles = context
+                .artifacts
+                .host_tools
+                .get("angle-glesv2")
+                .ok_or_else(|| {
+                    PlatformError::Vm("host bundle has no ANGLE GLES runtime".to_owned())
+                })?;
+            let angle_vulkan_loader = context
+                .artifacts
+                .host_tools
+                .get("angle-vulkan-loader")
+                .ok_or_else(|| {
+                    PlatformError::Vm("host bundle has no ANGLE Vulkan loader".to_owned())
+                })?;
+            let gfxstream_dir = gfxstream
+                .parent()
+                .ok_or_else(|| PlatformError::Vm("gfxstream backend has no parent".to_owned()))?;
+            let angle_dir = angle_egl
+                .parent()
+                .ok_or_else(|| PlatformError::Vm("ANGLE EGL runtime has no parent".to_owned()))?;
+            if angle_gles.parent() != Some(angle_dir)
+                || angle_vulkan_loader.parent() != Some(angle_dir)
+            {
+                return Err(PlatformError::Vm(
+                    "ANGLE EGL, GLES and Vulkan loader runtimes are not colocated".to_owned(),
+                ));
+            }
+            let crosvm_dir = self
+                .executable
+                .parent()
+                .ok_or_else(|| PlatformError::Vm("crosvm executable has no parent".to_owned()))?;
+            environment.insert(
+                "GFXSTREAM_PATH".to_owned(),
+                gfxstream_dir.to_string_lossy().into_owned(),
+            );
+            environment.insert(
+                "GFXSTREAM_ANGLE_ROOT".to_owned(),
+                angle_dir.to_string_lossy().into_owned(),
+            );
+            let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut search_dirs = vec![
+                crosvm_dir.to_owned(),
+                gfxstream_dir.to_owned(),
+                angle_dir.to_owned(),
+            ];
+            search_dirs.extend(std::env::split_paths(&inherited_path));
+            let search_path = std::env::join_paths(search_dirs)
+                .map_err(|error| PlatformError::Vm(format!("construct crosvm PATH: {error}")))?;
+            environment.insert(
+                "PATH".to_owned(),
+                search_path.to_string_lossy().into_owned(),
+            );
+        }
         let adb_serial = context
             .adb_host_port
             .map(|port| format!("127.0.0.1:{port}"));
@@ -351,6 +445,7 @@ impl VmBackend for CrosvmBackend {
             frame_endpoint: context.frame_endpoint.clone(),
             keyboard_endpoint: context.keyboard_endpoint.clone(),
             device_endpoints: context.device_endpoints.clone(),
+            device_control_endpoints: context.device_control_endpoints.clone(),
             adb_serial,
             guest_cid: context.guest_cid,
         })

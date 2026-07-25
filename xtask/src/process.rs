@@ -166,7 +166,7 @@ struct TaskRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum GateStatus {
+pub(crate) enum GateStatus {
     Pass,
     Fail,
     Skipped,
@@ -186,18 +186,18 @@ impl GateStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GateRecord {
-    name: String,
-    command: String,
-    status: GateStatus,
-    duration_ms: Option<u64>,
-    log_path: Option<String>,
-    summary: String,
+pub(crate) struct GateRecord {
+    pub(crate) name: String,
+    pub(crate) command: String,
+    pub(crate) status: GateStatus,
+    pub(crate) duration_ms: Option<u64>,
+    pub(crate) log_path: Option<String>,
+    pub(crate) summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GateReport {
+pub(crate) struct GateReport {
     schema_version: u32,
     generated_at: String,
     source: String,
@@ -336,19 +336,25 @@ pub(crate) fn ai_cycle(root: &Path, task_path: &Path, output_path: &Path) -> Res
         .with_context(|| format!("create AI cycle output {}", output_path.display()))?;
 
     let executable = std::env::current_exe().context("resolve current xtask executable")?;
+    let output_argument = output_path.to_string_lossy().into_owned();
     let gate = execute_gate(
         root,
         &output_path,
         "hd-quality",
-        "xtask quality",
+        "xtask quality --evidence-output <output>",
         &executable,
-        &["quality"],
+        &["quality", "--evidence-output", &output_argument],
     );
+    let mut gates = vec![gate.clone()];
+    if gate.status == GateStatus::Pass {
+        let smoke_report = read_gate_report(&output_path.join("host-smoke-gates.json"))?;
+        gates.extend(smoke_report.gates);
+    }
     let report = GateReport {
         schema_version: PROCESS_SCHEMA_VERSION,
         generated_at: now_rfc3339()?,
         source: "xtask ai-cycle".to_owned(),
-        gates: vec![gate.clone()],
+        gates,
     };
     let gate_report_path = output_path.join("hd-gates.json");
     write_json(&gate_report_path, &report)?;
@@ -363,6 +369,17 @@ pub(crate) fn ai_cycle(root: &Path, task_path: &Path, output_path: &Path) -> Res
             output_path.join("logs/hd-quality.log").display()
         )
     }
+}
+
+pub(crate) fn write_smoke_gate_report(output_path: &Path, gates: Vec<GateRecord>) -> Result<()> {
+    ensure!(!gates.is_empty(), "smoke gate report cannot be empty");
+    let report = GateReport {
+        schema_version: PROCESS_SCHEMA_VERSION,
+        generated_at: now_rfc3339()?,
+        source: "xtask smoke".to_owned(),
+        gates,
+    };
+    write_json(&output_path.join("host-smoke-gates.json"), &report)
 }
 
 pub(crate) fn readback(

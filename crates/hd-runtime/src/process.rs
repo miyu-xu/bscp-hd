@@ -3,7 +3,7 @@ use std::fs::OpenOptions;
 use async_trait::async_trait;
 use hd_platform::{
     PlatformError, ProcessContainment, ProcessExit, ProcessSpec, ProcessSupervisor,
-    configure_managed_command, contain_process,
+    configure_managed_command, contain_process, resume_managed_process,
 };
 use tokio::process::{Child, Command};
 
@@ -79,6 +79,13 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                 return Err(error);
             }
         };
+        if let Err(error) = resume_managed_process(pid) {
+            // Dropping the kill-on-close containment terminates the still-suspended process tree.
+            drop(containment);
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
+        }
         tracing::info!(
             event = "process.spawn.succeeded",
             pid,

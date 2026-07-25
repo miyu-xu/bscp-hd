@@ -15,7 +15,6 @@ ed25519-dalek.workspace = true
 futures.workspace = true
 getrandom.workspace = true
 hd-core = { path = "../hd-core" }
-hd-device-sim = { path = "../hd-device-sim" }
 hd-frame = { path = "../hd-frame" }
 hd-platform = { path = "../hd-platform" }
 hex.workspace = true

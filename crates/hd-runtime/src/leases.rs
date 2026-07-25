@@ -19,6 +19,18 @@ const MAX_GUEST_CID: u32 = i32::MAX as u32;
 const GPU_INSTANCE_CAPACITY: u32 = 4;
 const GIB: u64 = 1024 * 1024 * 1024;
 
+pub(crate) const fn host_cpu_reserve(logical_cpus: usize) -> usize {
+    match logical_cpus {
+        0 => 0,
+        1 | 2 => 1,
+        _ => 2,
+    }
+}
+
+pub(crate) const fn guest_cpu_capacity(logical_cpus: usize) -> usize {
+    logical_cpus.saturating_sub(host_cpu_reserve(logical_cpus))
+}
+
 #[derive(Debug, Clone)]
 pub struct LeaseManager {
     store: PersistentStore,
@@ -371,8 +383,8 @@ fn validate_host_capacity(
     let host = hd_platform::host_resources()?;
     let reserved_cpu = leased_quantity(existing, LeaseKindV2::CpuCapacity)?;
     let requested_cpu = u64::from(spec.cpu_count);
-    let cpu_capacity = u64::try_from(host.logical_cpus)
-        .map_err(|_| LeaseError::Corrupt("logical CPU capacity overflows u64".to_owned()))?;
+    let cpu_capacity = u64::try_from(guest_cpu_capacity(host.logical_cpus))
+        .map_err(|_| LeaseError::Corrupt("guest CPU capacity overflows u64".to_owned()))?;
     if reserved_cpu.saturating_add(requested_cpu) > cpu_capacity {
         return Err(LeaseError::CpuCapacity {
             requested: requested_cpu,

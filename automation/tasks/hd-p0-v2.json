@@ -4,8 +4,8 @@
   "objective": "一次性交付 HD V2：独立 host/worker、六项 P0、真实 Guest 契约、严格零拷贝显示契约、正式设备能力、诊断和三平台发布门禁。",
   "status": "in_progress",
   "scope": {
-    "repositories": ["hd", "external/crosvm", "hardware/google/gfxstream", "bscp-root"],
-    "owned_paths": ["hd/", "external/crosvm/", "hardware/google/gfxstream/host/", "scripts/"],
+    "repositories": ["hd", "external/crosvm", "hardware/google/gfxstream", "packages/modules/Bluetooth", "system/nfc", "bscp-root"],
+    "owned_paths": ["hd/", "external/crosvm/", "hardware/google/gfxstream/host/", "packages/modules/Bluetooth/tools/rootcanal/", "system/nfc/tools/casimir/", "scripts/"],
     "excluded_paths": ["out/", "target/", "third_party/minijail/", "用户既有未提交改动中与本任务无关的部分"]
   },
   "constraints": [
@@ -114,9 +114,9 @@
   "blockers": [
     {
       "id": "B-GUEST-BUNDLE",
-      "description": "当前 checkout 没有可认证的 Android Guest bundle，真实启动必须由固定源码矩阵构建并签名后才能验证。",
+      "description": "Windows 开发机已从 D:\\hd-v2-artifact-store 使用最终签名 Guest bundle 22281c84556c6e865e4f94498968efc2f651ef4c37bd3e871d930414609b2986 启动固定 Android 15 profile；正式 sensor-injector 角色与设备桥接均由 bundle 解析，未使用 Guest 根目录覆盖。",
       "scope": "external",
-      "state": "open"
+      "state": "resolved"
     },
     {
       "id": "B-HARDWARE-RUNNERS",
@@ -125,12 +125,12 @@
       "state": "open"
     },
     {
-      "id": "B-OFFICIAL-DEVICES",
-      "description": "当前 checkout 不包含固定 RootCanal/Casimir 正式源码或已签名 host bundle，非正式脚本不具备发布验收资格。",
+      "id": "B-WINDOWS-FRAME-BUNDLE",
+      "description": "Windows Host-tools bundle 5187de8d05cf29fdbed127c72ab0a96b50fa37f800137079488237208ae1aa7e 与当前 MinGW release runtime 已部署。真实 Android 15 显示矩阵覆盖四方向、720p/1080p、240/320/420/480 DPI 和 30/60/90/120 Hz，严格 produced/imported/presented 相等且 drop/readback/software-blit 为零；30 项正式设备/APK/双实例、frame producer/crosvm/Worker/Host 四类退出恢复、最终版本 100/100 生命周期、真实 120 分钟长稳、最终质量门、17 EXE PE audit、8 门签名认证及 dev_fast=false 的认证启动均已通过。",
       "scope": "external",
-      "state": "open"
+      "state": "resolved"
     }
   ],
   "human_decisions_needed": [],
-  "next_iteration": "持续回读并修复 V2 Host 门禁；获得固定签名 Guest/Host bundle 后，在 Windows/Linux/macOS 专用 runner 自动执行 real-guest、zero-copy 和 device-profile gate，失败即迭代直至全绿。"
+  "next_iteration": "Windows 规划功能和最终门已经完成：显示矩阵、故障注入、30 项设备/APK/双实例、100 次生命周期、120 分钟长稳、质量/PE、8 门签名 certification 与正式认证启动均通过。Windows 后续日常迭代继续使用 scripts/dev-fast.ps1 和 runner 的 skipped-by-design 路径，只在发布收口使用 performed-by-host；原子任务下一步仅剩 Linux KVM 与 macOS HVF 原生 runner gate 及三平台聚合回读。"
 }

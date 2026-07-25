@@ -89,7 +89,7 @@ enum Command {
         height: u32,
         #[arg(long)]
         dpi: u32,
-        #[arg(long, value_parser = ["30", "60", "90", "120"])]
+        #[arg(long, value_parser = parse_refresh_rate)]
         refresh_rate: u16,
         #[arg(long, value_enum)]
         orientation: OrientationArg,
@@ -166,6 +166,7 @@ enum ActionCommand {
         duration_ms: u32,
     },
     BluetoothCreate {
+        peer_id: Uuid,
         name: String,
     },
     BluetoothRemove {
@@ -173,6 +174,7 @@ enum ActionCommand {
     },
     BluetoothAdvertise {
         peer_id: Uuid,
+        #[arg(action = clap::ArgAction::Set)]
         enabled: bool,
     },
     NfcType2 {
@@ -276,7 +278,7 @@ async fn main() -> Result<()> {
                 id,
                 OperationKindV2::Start,
                 no_wait,
-                Duration::from_secs(600),
+                Duration::from_mins(10),
             )
             .await?;
         }
@@ -308,7 +310,7 @@ async fn main() -> Result<()> {
                 id,
                 OperationKindV2::Restart,
                 no_wait,
-                Duration::from_secs(660),
+                Duration::from_mins(11),
             )
             .await?;
         }
@@ -338,7 +340,7 @@ async fn main() -> Result<()> {
                 id,
                 OperationKindV2::Delete,
                 no_wait,
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             )
             .await?;
         }
@@ -387,7 +389,7 @@ async fn main() -> Result<()> {
                     sha256: upload.sha256,
                 },
                 no_wait,
-                Duration::from_secs(600),
+                Duration::from_mins(10),
             )
             .await?;
         }
@@ -405,7 +407,7 @@ async fn main() -> Result<()> {
         Command::Operations => print_json(&client.list_operations().await?)?,
         Command::Operation { id, wait } => {
             if wait {
-                print_json(&client.wait_operation(id, Duration::from_secs(660)).await?)?;
+                print_json(&client.wait_operation(id, Duration::from_mins(11)).await?)?;
             } else {
                 print_json(&client.operation(id).await?)?;
             }
@@ -430,6 +432,16 @@ async fn run_operation(
         print_json(&client.wait_operation(operation.id, timeout).await?)?;
     }
     Ok(())
+}
+
+fn parse_refresh_rate(value: &str) -> Result<u16, String> {
+    match value {
+        "30" => Ok(30),
+        "60" => Ok(60),
+        "90" => Ok(90),
+        "120" => Ok(120),
+        _ => Err("refresh rate must be one of 30, 60, 90, or 120".to_owned()),
+    }
 }
 
 fn load_spec(path: &Path) -> Result<InstanceSpecV2> {
@@ -531,8 +543,8 @@ impl From<ActionCommand> for InstanceActionV2 {
                     duration_ms,
                 },
             },
-            ActionCommand::BluetoothCreate { name } => Self::BluetoothPeer {
-                action: BluetoothPeerActionV2::CreateGattPeer { name },
+            ActionCommand::BluetoothCreate { peer_id, name } => Self::BluetoothPeer {
+                action: BluetoothPeerActionV2::CreateGattPeer { peer_id, name },
             },
             ActionCommand::BluetoothRemove { peer_id } => Self::BluetoothPeer {
                 action: BluetoothPeerActionV2::RemovePeer { peer_id },

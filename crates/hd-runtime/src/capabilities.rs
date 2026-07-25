@@ -4,15 +4,15 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use hd_core::{
-    COMPONENT_PROTOCOL_VERSION, CONTROL_PROTOCOL_VERSION, CapabilityProbeV2, CapabilityStatusV2,
-    DeviceBackendKindV2, DeviceCapabilitiesV2, DeviceCapabilityV2, FRAME_PROTOCOL_VERSION,
-    FormalComponentProbeV2, FrameTransportKindV2, HOST_CERTIFICATION_VERSION, HostCapabilitiesV2,
-    HostCertificationV2, InstanceSpecV2,
+    ArtifactSelectionV2, COMPONENT_PROTOCOL_VERSION, CONTROL_PROTOCOL_VERSION, CapabilityProbeV2,
+    CapabilityStatusV2, DeviceBackendKindV2, DeviceCapabilitiesV2, DeviceCapabilityV2,
+    FRAME_PROTOCOL_VERSION, FormalComponentProbeV2, FrameTransportKindV2,
+    HOST_CERTIFICATION_VERSION, HostCapabilitiesV2, HostCertificationV2, InstanceSpecV2,
 };
 use hd_platform::{
     DataPaths, FrameInteropProbeV2, architecture_name, configure_managed_command, contain_process,
     executable_name, hypervisor_available as native_hypervisor_available,
-    platform_baseline as native_platform_baseline, platform_name,
+    platform_baseline as native_platform_baseline, platform_name, resume_managed_process,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -20,6 +20,7 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
 
+use crate::leases::{guest_cpu_capacity, host_cpu_reserve};
 use crate::{ArtifactResolver, ArtifactTrustStore, ResolvedBundleSetV2};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -75,6 +76,9 @@ impl CapabilityDiscovery {
 
     #[allow(clippy::too_many_lines)]
     pub async fn discover(&self, spec: Option<&InstanceSpecV2>) -> CapabilityDiscoveryResultV2 {
+        let fast_artifacts = crate::dev::fast_artifacts_enabled();
+        let fast_capabilities = crate::dev::fast_capabilities_enabled();
+        let dev_display_copy_fallback = crate::dev::allow_display_copy_fallback_enabled();
         let mut probes = Vec::new();
         probes.push(platform_baseline_probe());
         probes.push(hypervisor_probe());
@@ -113,7 +117,7 @@ impl CapabilityDiscovery {
             (Some(instance), Ok(trust)) => match &instance.artifacts {
                 Some(selection) => {
                     let resolver = ArtifactResolver::new((*trust).clone());
-                    match resolver.resolve(selection) {
+                    match resolve_bundles(resolver, selection.clone(), fast_artifacts).await {
                         Ok(bundle_set) => {
                             crosvm = bundle_set
                                 .artifacts
@@ -124,9 +128,18 @@ impl CapabilityDiscovery {
                             if let Some(bundle_adb) = bundle_set.artifacts.host_tools.get("adb") {
                                 adb = bundle_adb.clone();
                             }
-                            devices =
-                                Box::pin(device_capabilities(&bundle_set.artifacts.host_tools))
-                                    .await;
+                            devices = if fast_capabilities {
+                                fast_device_capabilities(
+                                    &bundle_set.artifacts.host_tools,
+                                    &bundle_set.artifacts.sensor_injector,
+                                )
+                            } else {
+                                Box::pin(device_capabilities(
+                                    &bundle_set.artifacts.host_tools,
+                                    &bundle_set.artifacts.sensor_injector,
+                                ))
+                                .await
+                            };
                             frame_tool = bundle_set
                                 .artifacts
                                 .host_tools
@@ -135,7 +148,11 @@ impl CapabilityDiscovery {
                             probes.push(supported_probe(
                                 "artifact.bundles",
                                 true,
-                                "guest and host bundles passed signature, READY and file validation",
+                                if fast_artifacts {
+                                    "dev fast path used manifest-only bundle resolution without file hashing"
+                                } else {
+                                    "guest and host bundles passed signature, READY and file validation"
+                                },
                                 BTreeMap::from([
                                     (
                                         "guest_digest".to_owned(),
@@ -147,7 +164,27 @@ impl CapabilityDiscovery {
                                     ),
                                 ]),
                             ));
-                            if let Some(frame_tool) = &frame_tool {
+                            if dev_display_copy_fallback {
+                                probes.push(supported_probe(
+                                    "display.zero_copy",
+                                    true,
+                                    "dev display copy fallback skips strict zero-copy probing for local iteration",
+                                    BTreeMap::from([(
+                                        "mode".to_owned(),
+                                        "dev_display_copy_fallback".to_owned(),
+                                    )]),
+                                ));
+                            } else if fast_capabilities {
+                                probes.push(fast_supported_probe(
+                                    "display.zero_copy",
+                                    true,
+                                    "dev fast capability mode trusts the selected host bundle frame role without running the zero-copy probe",
+                                    BTreeMap::from([(
+                                        "mode".to_owned(),
+                                        "dev_fast_capabilities".to_owned(),
+                                    )]),
+                                ));
+                            } else if let Some(frame_tool) = &frame_tool {
                                 match run_json_probe::<FrameInteropProbeV2>(
                                     frame_tool,
                                     &["--probe-v2", "--json"],
@@ -192,19 +229,27 @@ impl CapabilityDiscovery {
                             }
                             let adb_required = true;
                             adb_bridge = bundle_set.artifacts.host_tools.get("adb-bridge").cloned();
-                            let status = formal_tool_status(
-                                adb_required,
-                                &bundle_set.artifacts.host_tools,
-                                "adb-bridge",
-                                "adb-bridge",
-                                &[
-                                    "loopback-tcp-v2",
-                                    "vsock-guest-v2",
-                                    "ready-marker-v2",
-                                    "lifecycle-v2",
-                                ],
-                            )
-                            .await;
+                            let status = if fast_capabilities {
+                                fast_formal_tool_status(
+                                    adb_required,
+                                    &bundle_set.artifacts.host_tools,
+                                    "adb-bridge",
+                                )
+                            } else {
+                                formal_tool_status(
+                                    adb_required,
+                                    &bundle_set.artifacts.host_tools,
+                                    "adb-bridge",
+                                    "adb-bridge",
+                                    &[
+                                        "loopback-tcp-v2",
+                                        "vsock-guest-v2",
+                                        "ready-marker-v2",
+                                        "lifecycle-v2",
+                                    ],
+                                )
+                                .await
+                            };
                             adb_bridge_probe = Some(formal_component_capability_probe(
                                 "adb.bridge",
                                 adb_required,
@@ -215,7 +260,7 @@ impl CapabilityDiscovery {
                         Err(error) => probes.push(blocked_probe(
                             "artifact.bundles",
                             true,
-                            error.to_string(),
+                            error,
                             BTreeMap::new(),
                         )),
                     }
@@ -249,9 +294,27 @@ impl CapabilityDiscovery {
             }
         }
 
-        probes.push(tool_probe("tool.crosvm", &crosvm, true).await);
+        probes.push(
+            tool_probe(
+                "tool.crosvm",
+                &crosvm,
+                true,
+                &["version"],
+                fast_capabilities,
+            )
+            .await,
+        );
         let adb_required = spec.is_some();
-        probes.push(tool_probe("tool.adb", &adb, adb_required).await);
+        probes.push(
+            tool_probe(
+                "tool.adb",
+                &adb,
+                adb_required,
+                &["version"],
+                fast_capabilities,
+            )
+            .await,
+        );
         probes.push(adb_bridge_probe.unwrap_or_else(|| {
             blocked_probe(
                 "adb.bridge",
@@ -269,8 +332,13 @@ impl CapabilityDiscovery {
                 supported_probe(
                     "guest.readiness",
                     true,
-                    "V2 readiness uses authenticated loopback ADB after the strict frame handshake"
-                        .to_owned(),
+                    if dev_display_copy_fallback {
+                        "V2 readiness uses authenticated loopback ADB after dev display fallback"
+                            .to_owned()
+                    } else {
+                        "V2 readiness uses authenticated loopback ADB after the strict frame handshake"
+                            .to_owned()
+                    },
                     BTreeMap::new(),
                 )
             }
@@ -291,36 +359,59 @@ impl CapabilityDiscovery {
         probes.push(device_probe(&devices, spec.is_some()));
 
         let evidence_fingerprint = release_fingerprint(&probes, &devices);
-        let certification = certification_matches(
-            &self.paths,
-            spec,
-            &evidence_fingerprint,
-            trust.as_ref().ok(),
-        );
-        let certified = certification.is_ok();
-        probes.push(match certification {
-            Ok(certification) => supported_probe(
+        let certified = if fast_artifacts && spec.is_some() {
+            probes.push(supported_probe(
                 "release.certification",
                 true,
-                "signed real-guest, zero-copy and device-profile evidence matches this platform and bundle",
-                BTreeMap::from([
-                    ("evidence_fingerprint".to_owned(), evidence_fingerprint.clone()),
-                    ("certification_id".to_owned(), certification.certification_id.to_string()),
-                    ("issued_at".to_owned(), certification.issued_at.to_string()),
-                    ("expires_at".to_owned(), certification.expires_at.to_string()),
-                    ("evidence_count".to_owned(), certification.evidence_sha256.len().to_string()),
-                ]),
-            ),
-            Err(error) => blocked_probe(
-                "release.certification",
-                true,
-                error,
+                "dev fast artifact mode skips release certification for local iteration",
                 BTreeMap::from([(
                     "evidence_fingerprint".to_owned(),
                     evidence_fingerprint.clone(),
-                )]),
-            ),
-        });
+                )])
+                .into_iter()
+                .chain([("mode".to_owned(), "dev_fast_artifacts".to_owned())])
+                .collect(),
+            ));
+            true
+        } else {
+            let certification = certification_matches(
+                &self.paths,
+                spec,
+                &evidence_fingerprint,
+                trust.as_ref().ok(),
+            );
+            let certified = certification.is_ok();
+            probes.push(match certification {
+                Ok(certification) => supported_probe(
+                    "release.certification",
+                    true,
+                    "signed real-guest, zero-copy and device-profile evidence matches this platform and bundle",
+                    BTreeMap::from([
+                        ("evidence_fingerprint".to_owned(), evidence_fingerprint.clone()),
+                        (
+                            "certification_id".to_owned(),
+                            certification.certification_id.to_string(),
+                        ),
+                        ("issued_at".to_owned(), certification.issued_at.to_string()),
+                        ("expires_at".to_owned(), certification.expires_at.to_string()),
+                        (
+                            "evidence_count".to_owned(),
+                            certification.evidence_sha256.len().to_string(),
+                        ),
+                    ]),
+                ),
+                Err(error) => blocked_probe(
+                    "release.certification",
+                    true,
+                    error,
+                    BTreeMap::from([(
+                        "evidence_fingerprint".to_owned(),
+                        evidence_fingerprint.clone(),
+                    )]),
+                ),
+            });
+            certified
+        };
         let fingerprint = capability_fingerprint(&probes, &devices);
         let capabilities = HostCapabilitiesV2 {
             schema_version: 2,
@@ -344,12 +435,43 @@ impl CapabilityDiscovery {
     }
 }
 
-async fn tool_probe(id: &str, path: &Path, required: bool) -> CapabilityProbeV2 {
+async fn resolve_bundles(
+    resolver: ArtifactResolver,
+    selection: ArtifactSelectionV2,
+    fast_artifacts: bool,
+) -> Result<ResolvedBundleSetV2, String> {
+    tokio::task::spawn_blocking(move || {
+        if fast_artifacts {
+            resolver.resolve_fast_dev(&selection)
+        } else {
+            resolver.resolve(&selection)
+        }
+    })
+    .await
+    .map_err(|error| format!("artifact resolver task failed: {error}"))?
+    .map_err(|error| error.to_string())
+}
+
+async fn tool_probe(
+    id: &str,
+    path: &Path,
+    required: bool,
+    arguments: &[&str],
+    fast_capabilities: bool,
+) -> CapabilityProbeV2 {
     let properties = BTreeMap::from([("path".to_owned(), path.display().to_string())]);
     if !path.is_file() && path.components().count() > 1 {
         return blocked_probe(id, required, "executable is missing".to_owned(), properties);
     }
-    match run_tool(path, &["--version"]).await {
+    if fast_capabilities {
+        return fast_supported_probe(
+            id,
+            required,
+            "dev fast capability mode skipped executable version probe",
+            properties,
+        );
+    }
+    match run_tool(path, arguments).await {
         Ok(version) => supported_probe(id, required, version, properties),
         Err(error) => blocked_probe(id, required, error, properties),
     }
@@ -417,6 +539,11 @@ async fn run_probe_process(path: &Path, arguments: &[&str]) -> Result<ProbeOutpu
             return Err(format!("contain {} probe: {error}", path.display()));
         }
     };
+    if let Err(error) = resume_managed_process(pid) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(format!("resume {} probe: {error}", path.display()));
+    }
     let stdout = child
         .stdout
         .take()
@@ -484,6 +611,8 @@ fn resource_probe(paths: &DataPaths, spec: Option<&InstanceSpecV2>) -> Capabilit
     const GIB: u64 = 1024 * 1024 * 1024;
     let resources = hd_platform::host_resources();
     let logical_cpus = resources.as_ref().map_or(0, |value| value.logical_cpus);
+    let host_cpu_reserve = host_cpu_reserve(logical_cpus);
+    let guest_cpu_capacity = guest_cpu_capacity(logical_cpus);
     let total_memory_bytes = resources
         .as_ref()
         .map_or(0, |value| value.total_memory_bytes);
@@ -499,6 +628,11 @@ fn resource_probe(paths: &DataPaths, spec: Option<&InstanceSpecV2>) -> Capabilit
     let available_bytes = fs2::available_space(&paths.root).unwrap_or(0);
     let mut properties = BTreeMap::from([
         ("logical_cpus".to_owned(), logical_cpus.to_string()),
+        ("host_cpu_reserve".to_owned(), host_cpu_reserve.to_string()),
+        (
+            "guest_cpu_capacity".to_owned(),
+            guest_cpu_capacity.to_string(),
+        ),
         ("requested_cpus".to_owned(), requested_cpus.to_string()),
         (
             "total_memory_bytes".to_owned(),
@@ -528,7 +662,7 @@ fn resource_probe(paths: &DataPaths, spec: Option<&InstanceSpecV2>) -> Capabilit
         );
     }
     if resources.is_ok()
-        && logical_cpus >= requested_cpus
+        && guest_cpu_capacity >= requested_cpus
         && available_memory_bytes >= required_memory_bytes
         && available_bytes >= 10 * GIB
     {
@@ -546,7 +680,7 @@ fn resource_probe(paths: &DataPaths, spec: Option<&InstanceSpecV2>) -> Capabilit
                 |error| format!("query host resources: {error}"),
                 |_| {
                     format!(
-                        "requires {requested_cpus} logical CPUs, {required_memory_bytes} available memory bytes including host reserve, and 10 GiB free disk"
+                        "requires {requested_cpus} guest CPUs from capacity {guest_cpu_capacity} after reserving {host_cpu_reserve} of {logical_cpus} logical CPUs for the Host, {required_memory_bytes} available memory bytes including host reserve, and 10 GiB free disk"
                     )
                 },
             ),
@@ -579,8 +713,11 @@ fn device_probe(devices: &DeviceCapabilitiesV2, required: bool) -> CapabilityPro
     }
 }
 
-async fn device_capabilities(tools: &BTreeMap<String, PathBuf>) -> DeviceCapabilitiesV2 {
-    let (simulator, bluetooth, nfc, uwb, modem, network, audio, camera) = tokio::join!(
+async fn device_capabilities(
+    tools: &BTreeMap<String, PathBuf>,
+    sensor_injector: &Path,
+) -> DeviceCapabilitiesV2 {
+    let (simulator, bluetooth, nfc, uwb, modem) = tokio::join!(
         formal_tool_status(
             true,
             tools,
@@ -612,39 +749,30 @@ async fn device_capabilities(tools: &BTreeMap<String, PathBuf>) -> DeviceCapabil
             tools,
             "uwb-adapter",
             "uwb-adapter",
-            &["guest-serial-v2", "uwb-control-v2"],
+            &[
+                "guest-serial-v2",
+                "uwb-control-v2",
+                "deterministic-ranging-v2",
+            ],
         ),
         formal_tool_status(
             true,
             tools,
             "modem-adapter",
             "modem-adapter",
-            &["guest-serial-v2", "modem-control-v2"],
-        ),
-        formal_tool_status(
-            true,
-            tools,
-            "network-adapter",
-            "network-adapter",
-            &["network-control-v2", "virtio-net-v2"],
-        ),
-        formal_tool_status(
-            true,
-            tools,
-            "audio-adapter",
-            "audio-adapter",
-            &["audio-control-v2", "virtio-snd-v2"],
-        ),
-        formal_tool_status(
-            true,
-            tools,
-            "camera-adapter",
-            "camera-adapter",
-            &["camera-control-v2", "guest-camera-v2"],
+            &[
+                "guest-vsock-v2",
+                "modem-control-v2",
+                "at-command-baseline-v2",
+            ],
         ),
     );
+    let network = artifact_roles_status(tools, &["crosvm", "hd-device-sim"]);
+    let audio = artifact_roles_status(tools, &["crosvm", "crosvm-runtime-audio"]);
+    let camera = artifact_roles_status(tools, &["crosvm", "gfxstream-backend"]);
     let statuses = FormalDeviceStatuses {
         simulator,
+        sensor_injector: artifact_file_status(sensor_injector, "sensor-injector"),
         bluetooth,
         nfc,
         uwb,
@@ -656,9 +784,28 @@ async fn device_capabilities(tools: &BTreeMap<String, PathBuf>) -> DeviceCapabil
     compose_device_capabilities(&statuses)
 }
 
+fn fast_device_capabilities(
+    tools: &BTreeMap<String, PathBuf>,
+    sensor_injector: &Path,
+) -> DeviceCapabilitiesV2 {
+    let statuses = FormalDeviceStatuses {
+        simulator: fast_formal_tool_status(true, tools, "hd-device-sim"),
+        sensor_injector: artifact_file_status(sensor_injector, "sensor-injector"),
+        bluetooth: fast_formal_tool_status(true, tools, "rootcanal-adapter"),
+        nfc: fast_formal_tool_status(true, tools, "casimir-adapter"),
+        uwb: fast_formal_tool_status(true, tools, "uwb-adapter"),
+        modem: fast_formal_tool_status(true, tools, "modem-adapter"),
+        network: artifact_roles_status(tools, &["crosvm", "hd-device-sim"]),
+        audio: artifact_roles_status(tools, &["crosvm", "crosvm-runtime-audio"]),
+        camera: artifact_roles_status(tools, &["crosvm", "gfxstream-backend"]),
+    };
+    compose_device_capabilities(&statuses)
+}
+
 #[derive(Debug)]
 struct FormalDeviceStatuses {
     simulator: FormalToolStatus,
+    sensor_injector: FormalToolStatus,
     bluetooth: FormalToolStatus,
     nfc: FormalToolStatus,
     uwb: FormalToolStatus,
@@ -704,20 +851,25 @@ fn primary_device_capabilities(statuses: &FormalDeviceStatuses) -> Vec<DeviceCap
             DeviceBackendKindV2::Simulated,
             statuses.uwb.available,
             &component_boundary(
-                "deterministic ranging only; no RF or CCC certification claim",
+                "deterministic FiRa v2 session lifecycle and short-address distance reports; no angle, RF, or CCC conformance claim",
                 &statuses.uwb,
             ),
-            &["ranging_session", "distance", "azimuth"],
+            &["guest_control", "deterministic_reply"],
         ),
         device(
             "modem",
-            DeviceBackendKindV2::OfficialComponent,
+            DeviceBackendKindV2::Simulated,
             statuses.modem.available,
             &component_boundary(
-                "portable pinned modem simulator; no IMS, 5G, or carrier certification claim",
+                "deterministic basic AT signal/operator/registration baseline; no data attach, SMS, calls, IMS, 5G, or carrier conformance claim",
                 &statuses.modem,
             ),
-            &["sim", "registration", "data_attach", "sms", "call_state"],
+            &[
+                "basic_at",
+                "signal_query",
+                "operator_query",
+                "registration_query",
+            ],
         ),
     ]
 }
@@ -734,10 +886,10 @@ fn simulated_device_capabilities(statuses: &FormalDeviceStatuses) -> Vec<DeviceC
         device(
             "sensors",
             DeviceBackendKindV2::Simulated,
-            statuses.simulator.available,
-            &component_boundary(
-                "deterministic injection for the fixed five-sensor manifest",
-                &statuses.simulator,
+            statuses.simulator.available && statuses.sensor_injector.available,
+            &format!(
+                "Android SensorService HAL-bypass injection for the fixed five-sensor manifest; simulator: {}; Guest injector: {}",
+                statuses.simulator.detail, statuses.sensor_injector.detail
             ),
             &[
                 "accelerometer",
@@ -752,30 +904,39 @@ fn simulated_device_capabilities(statuses: &FormalDeviceStatuses) -> Vec<DeviceC
             DeviceBackendKindV2::Simulated,
             statuses.network.available,
             &component_boundary(
-                "virtio-net NAT/DNS and link shaping; no Wi-Fi RF claim",
+                "two fixed crosvm virtio-net interfaces with typed latency/loss/rate shaping applied and verified through Android tc netem; no port-forward or Wi-Fi RF claim",
                 &statuses.network,
             ),
-            &["nat", "dns", "port_forward", "latency", "loss", "bandwidth"],
+            &["virtio_net", "guest_control"],
         ),
         device(
             "audio",
             DeviceBackendKindV2::Simulated,
             statuses.audio.available,
-            &component_boundary("host audio or deterministic test source", &statuses.audio),
-            &["capture", "playback", "test_source"],
+            &component_boundary(
+                "Android AudioFlinger over crosvm virtio-snd null playback/capture endpoints; no host-device audio claim",
+                &statuses.audio,
+            ),
+            &["virtio_snd_null", "playback", "capture"],
         ),
         device(
             "camera",
             DeviceBackendKindV2::Simulated,
             statuses.camera.available,
-            &component_boundary("host camera or deterministic test source", &statuses.camera),
-            &["capture", "test_source"],
+            &component_boundary(
+                "Android camera provider HAL with deterministic virtual test sources rendered through the Guest graphics stack; no host camera claim",
+                &statuses.camera,
+            ),
+            &["preview", "jpeg_capture", "virtual_test_source"],
         ),
         device(
             "power",
             DeviceBackendKindV2::Simulated,
             statuses.simulator.available,
-            &component_boundary("deterministic battery state injection", &statuses.simulator),
+            &component_boundary(
+                "typed battery state applied and verified through Android BatteryService",
+                &statuses.simulator,
+            ),
             &["battery"],
         ),
     ]
@@ -785,6 +946,75 @@ fn simulated_device_capabilities(statuses: &FormalDeviceStatuses) -> Vec<DeviceC
 struct FormalToolStatus {
     available: bool,
     detail: String,
+}
+
+fn artifact_file_status(path: &Path, role: &str) -> FormalToolStatus {
+    if !path.is_file() {
+        return FormalToolStatus {
+            available: false,
+            detail: format!("artifact role {role} is missing: {}", path.display()),
+        };
+    }
+    FormalToolStatus {
+        available: true,
+        detail: format!("verified artifact role {role} at {}", path.display()),
+    }
+}
+
+fn artifact_roles_status(tools: &BTreeMap<String, PathBuf>, roles: &[&str]) -> FormalToolStatus {
+    let missing = roles
+        .iter()
+        .filter_map(|role| match tools.get(*role) {
+            Some(path) if path.is_file() => None,
+            Some(path) => Some(format!("{role} ({})", path.display())),
+            None => Some((*role).to_owned()),
+        })
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return FormalToolStatus {
+            available: false,
+            detail: format!(
+                "required artifact roles are missing: {}",
+                missing.join(", ")
+            ),
+        };
+    }
+    FormalToolStatus {
+        available: true,
+        detail: format!("verified artifact roles {}", roles.join(", ")),
+    }
+}
+
+fn fast_formal_tool_status(
+    required: bool,
+    tools: &BTreeMap<String, PathBuf>,
+    role: &str,
+) -> FormalToolStatus {
+    if !required {
+        return FormalToolStatus {
+            available: true,
+            detail: "disabled by the instance profile".to_owned(),
+        };
+    }
+    let Some(path) = tools.get(role) else {
+        return FormalToolStatus {
+            available: false,
+            detail: format!("signed host bundle is missing role {role}"),
+        };
+    };
+    if !path.is_file() {
+        return FormalToolStatus {
+            available: false,
+            detail: format!("component adapter is missing: {}", path.display()),
+        };
+    }
+    FormalToolStatus {
+        available: true,
+        detail: format!(
+            "dev fast capability mode trusts manifest role {role} at {} without running component probe",
+            path.display()
+        ),
+    }
 }
 
 async fn formal_tool_status(
@@ -920,6 +1150,16 @@ fn supported_probe(
         detail: detail.into(),
         properties,
     }
+}
+
+fn fast_supported_probe(
+    id: &str,
+    required: bool,
+    detail: impl Into<String>,
+    mut properties: BTreeMap<String, String>,
+) -> CapabilityProbeV2 {
+    properties.insert("mode".to_owned(), "dev_fast_capabilities".to_owned());
+    supported_probe(id, required, detail, properties)
 }
 
 fn blocked_probe(

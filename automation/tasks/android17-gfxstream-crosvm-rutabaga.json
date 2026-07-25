@@ -1,0 +1,105 @@
+{
+  "schema_version": 2,
+  "task_id": "android17-gfxstream-crosvm-rutabaga",
+  "objective": "定位并移植导致 Android 17 在 Windows WHPX 上无法使用 gfxstream 的 crosvm、rutabaga、gfxstream 与 ANGLE 集成差异，并用真实 Guest 启动证明修复。",
+  "status": "in_progress",
+  "scope": {
+    "repositories": ["hd", "external/crosvm", "hardware/google/gfxstream", "root-build"],
+    "owned_paths": [
+      "hd/automation/tasks/android17-gfxstream-crosvm-rutabaga.json",
+      "hd/crates/hd-runtime/src/artifacts.rs",
+      "hd/crates/hd-runtime/src/backend.rs",
+      "hd/xtask/src/main.rs",
+      "hd/crates/hd-platform/src/windows.rs",
+      "hd/scripts/integration-quality.ps1",
+      "build_all.bat",
+      "scripts/check_android17_gfxstream_evidence.ps1",
+      "scripts/check_angle_runtime.ps1",
+      "scripts/run_android_windows_gfxstream_angle.ps1",
+      "doc/ANDROID17_GFXSTREAM_PORT_AUDIT.md",
+      "external/crosvm/devices/src/virtio/gpu/",
+      "external/crosvm/rutabaga_gfx/",
+      "external/crosvm/src/crosvm/"
+    ],
+    "excluded_paths": ["out/", "target/", "third_party/minijail/"]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "windows_uses_mingw_only",
+    "preserve_user_changes",
+    "do_not_push",
+    "do_not_replace_real_gfxstream_with_2d_fallback"
+  ],
+  "acceptance": [
+    {
+      "id": "A17-GFX-001",
+      "criterion": "发布的 ANGLE EGL/GLES 与其 Vulkan loader 同目录且独立 EGL 1.5 初始化探针通过。",
+      "evidence": ["gate:angle-runtime-probe", "artifact:angle-runtime-probe.log"]
+    },
+    {
+      "id": "A17-GFX-002",
+      "criterion": "crosvm 到 rutabaga 的有效 gfxstream 参数包含 Vulkan、GuestVulkanOnly、Vulkan native swapchain 与 ExternalBlob，不被 capset 重写为关闭。",
+      "evidence": [
+        "artifact:android17-gfxstream-stderr.txt",
+        "doc:doc/ANDROID17_GFXSTREAM_PORT_AUDIT.md"
+      ]
+    },
+    {
+      "id": "A17-GFX-003",
+      "criterion": "Android 17 真实 Guest 使用 gfxstream-vulkan 与 gfxstream-composer 启动，SurfaceFlinger 可用且 sys.boot_completed=1。",
+      "evidence": ["gate:android17-real-guest", "artifact:android17-gfxstream-result.json"]
+    },
+    {
+      "id": "A17-GFX-004",
+      "criterion": "HD、crosvm、rutabaga 与 gfxstream 的 MinGW 构建、测试目标编译、diff check 和发布 ABI 审计通过。",
+      "evidence": [
+        "gate:hd-quality",
+        "gate:crosvm-windows-gnu-check",
+        "gate:crosvm-test-targets-compile",
+        "gate:gfxstream-mingw-build",
+        "gate:crosvm-diff-check",
+        "gate:gfxstream-diff-check"
+      ]
+    }
+  ],
+  "required_gates": [
+    "angle-runtime-probe",
+    "android17-real-guest",
+    "hd-quality",
+    "crosvm-windows-gnu-check",
+    "crosvm-test-targets-compile",
+    "gfxstream-mingw-build",
+    "crosvm-diff-check",
+    "gfxstream-diff-check"
+  ],
+  "evidence_state": {
+    "code_present": true,
+    "tests_authored": true,
+    "contract_smoke_verified": true,
+    "real_guest_verified": true
+  },
+  "direction_decisions": [
+    {
+      "id": "D-A17-GFX-001",
+      "decision": "保留真实 gfxstream Vulkan/ANGLE/ExternalBlob 路径，不以 Guest SwiftShader 或 crosvm 2D 作为完成条件。",
+      "owner": "human",
+      "rationale": "目标是找到并移植 gfxstream、crosvm、rutabaga 差异。"
+    },
+    {
+      "id": "D-A17-GFX-002",
+      "decision": "Windows 全链继续使用 MinGW/GNU；ANGLE 的 ClangCL 运行库只作为既有外部图形 ABI，不改用 MSVC crosvm。",
+      "owner": "human",
+      "rationale": "遵守当前仓库 Windows 工具链约束。"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "B-HD-UI-CLIPPY",
+      "description": "hd-quality 的 workspace 严格 Clippy 被任务范围外的现有 hd-ui 改动阻断：未跟踪的 crates/hd-ui/src/player.rs 有 41 个告警，已修改的 crates/hd-ui/src/main.rs 有 4 个告警；gfxstream/Android 17 相关的其余 7 个集成门均通过。",
+      "scope": "current_task",
+      "state": "open"
+    }
+  ],
+  "human_decisions_needed": [],
+  "next_iteration": "在不覆盖用户 hd-ui 改动的前提下处理其严格 Clippy 告警并重跑 hd-quality；停止当前运行的 hd-host 后可重跑 ENABLE_GFXSTREAM_ANGLE=1 的统一发布收集。无需为 Android 17 gfxstream 先合并最新 crosvm/rutabaga。"
+}

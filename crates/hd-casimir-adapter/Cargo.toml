@@ -1,0 +1,24 @@
+[package]
+name = "hd-casimir-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+casimir = { path = "../../../system/nfc/tools/casimir" }
+clap.workspace = true
+hd-core = { path = "../hd-core" }
+hd-platform = { path = "../hd-platform" }
+hex.workspace = true
+pdl-runtime = "0.3.0"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

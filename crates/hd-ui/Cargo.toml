@@ -9,18 +9,35 @@ rust-version.workspace = true
 name = "hd"
 path = "src/main.rs"
 
+[[bin]]
+name = "hd-player"
+path = "src/player.rs"
+
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 eframe.workspace = true
 egui.workspace = true
+egui_extras.workspace = true
 hd-core = { path = "../hd-core" }
 hd-platform = { path = "../hd-platform" }
 hd-runtime = { path = "../hd-runtime" }
 tokio.workspace = true
+raw-window-handle.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [lints]
 workspace = true

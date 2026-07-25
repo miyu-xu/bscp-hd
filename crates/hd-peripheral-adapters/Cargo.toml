@@ -1,0 +1,41 @@
+[package]
+name = "hd-peripheral-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hd-uwb-adapter"
+path = "src/bin/uwb.rs"
+
+[[bin]]
+name = "hd-modem-adapter"
+path = "src/bin/modem.rs"
+
+[[bin]]
+name = "hd-network-adapter"
+path = "src/bin/network.rs"
+
+[[bin]]
+name = "hd-audio-adapter"
+path = "src/bin/audio.rs"
+
+[[bin]]
+name = "hd-camera-adapter"
+path = "src/bin/camera.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hd-core = { path = "../hd-core" }
+hd-platform = { path = "../hd-platform" }
+hex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
