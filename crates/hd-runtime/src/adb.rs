@@ -682,6 +682,7 @@ impl AdbClient {
         serial: &str,
         condition: &NetworkConditionV2,
     ) -> Result<(), AdbError> {
+        let interface = self.primary_data_interface(serial).await?;
         let latency = format!("{}ms", condition.latency_ms);
         let loss = netem_loss(condition.loss_basis_points);
         let mut arguments = vec![
@@ -691,7 +692,7 @@ impl AdbClient {
             "qdisc".to_owned(),
             "replace".to_owned(),
             "dev".to_owned(),
-            "eth1".to_owned(),
+            interface.clone(),
             "root".to_owned(),
             "netem".to_owned(),
             "delay".to_owned(),
@@ -707,7 +708,10 @@ impl AdbClient {
         self.shell(serial, &argument_refs).await?;
 
         let actual = self
-            .shell(serial, &["su", "0", "tc", "qdisc", "show", "dev", "eth1"])
+            .shell(
+                serial,
+                &["su", "0", "tc", "qdisc", "show", "dev", &interface],
+            )
             .await?;
         let latency_value = format!("{}.{:01}ms", condition.latency_ms, 0);
         let loss_value = netem_loss(condition.loss_basis_points);
@@ -746,8 +750,9 @@ impl AdbClient {
     }
 
     /// Performs one bounded link refresh when Android's first validation happened before the
-    /// host uplink became usable. It never loops indefinitely and always restores `eth1` to up
-    /// before waiting for `ConnectivityService` to finish its native validation probes.
+    /// host uplink became usable. Cuttlefish marks its secondary `eth1` profile restricted, so a
+    /// fresh macOS Guest first promotes the shared `socket_vmnet` NIC to `eth0`; existing Guests
+    /// retain whichever primary interface `ConnectivityService` already validated.
     pub async fn refresh_network_validation(
         &self,
         serial: &str,
@@ -756,15 +761,16 @@ impl AdbClient {
         if initial.is_healthy() {
             return Ok(initial);
         }
+        let interface = self.reconcile_primary_ethernet(serial).await?;
         self.shell(
             serial,
-            &["su", "0", "ip", "link", "set", "dev", "eth1", "down"],
+            &["su", "0", "ip", "link", "set", "dev", &interface, "down"],
         )
         .await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         self.shell(
             serial,
-            &["su", "0", "ip", "link", "set", "dev", "eth1", "up"],
+            &["su", "0", "ip", "link", "set", "dev", &interface, "up"],
         )
         .await?;
 
@@ -778,6 +784,76 @@ impl AdbClient {
         }
     }
 
+    async fn reconcile_primary_ethernet(&self, serial: &str) -> Result<String, AdbError> {
+        let links = self.shell(serial, &["ip", "-o", "link", "show"]).await?;
+        if has_network_link(&links, "eth1")
+            && has_network_link(&links, "buried_eth0")
+            && !has_network_link(&links, "eth0")
+        {
+            self.shell(
+                serial,
+                &["su", "0", "ip", "link", "set", "dev", "buried_eth0", "down"],
+            )
+            .await?;
+            self.shell(
+                serial,
+                &[
+                    "su",
+                    "0",
+                    "ip",
+                    "link",
+                    "set",
+                    "dev",
+                    "buried_eth0",
+                    "name",
+                    "hd_offline",
+                ],
+            )
+            .await?;
+            self.shell(
+                serial,
+                &["su", "0", "ip", "link", "set", "dev", "eth1", "down"],
+            )
+            .await?;
+            self.shell(
+                serial,
+                &[
+                    "su", "0", "ip", "link", "set", "dev", "eth1", "name", "eth0",
+                ],
+            )
+            .await?;
+            tracing::info!(
+                event = "adb.network.primary_interface.reconciled",
+                serial,
+                from = "eth1",
+                to = "eth0",
+                "promoted the shared macOS uplink to Android's unrestricted Ethernet profile"
+            );
+            return Ok("eth0".to_owned());
+        }
+        Self::primary_data_interface_from_links(&links)
+    }
+
+    async fn primary_data_interface(&self, serial: &str) -> Result<String, AdbError> {
+        let health = self.network_health(serial).await?;
+        if let Some(interface) = health
+            .interface
+            .filter(|interface| matches!(interface.as_str(), "eth0" | "eth1"))
+        {
+            return Ok(interface);
+        }
+        let links = self.shell(serial, &["ip", "-o", "link", "show"]).await?;
+        Self::primary_data_interface_from_links(&links)
+    }
+
+    fn primary_data_interface_from_links(links: &str) -> Result<String, AdbError> {
+        ["eth0", "eth1"]
+            .into_iter()
+            .find(|interface| has_network_link(links, interface))
+            .map(str::to_owned)
+            .ok_or_else(|| AdbError::NetworkInterfaceUnavailable(links.to_owned()))
+    }
+
     /// Probes the fixed Android 15 phone profile through framework/HAL readback. Passive software
     /// surfaces are reported separately from active radios, and host-controllable devices are
     /// explicitly identified instead of treating every installed package as usable.
@@ -785,26 +861,33 @@ impl AdbClient {
         &self,
         serial: &str,
     ) -> Result<Vec<AndroidDeviceRuntimeHealth>, AdbError> {
-        let packages = self
-            .shell(serial, &["pm", "list", "packages", "-e"])
-            .await?;
-        let services = self.shell(serial, &["service", "list"]).await?;
-        let bluetooth = self
-            .shell(serial, &["dumpsys", "bluetooth_manager"])
-            .await?;
-        let nfc_hal = self.getprop(serial, "init.svc.nfc_hal_service").await?;
-        let uwb = self.shell(serial, &["dumpsys", "uwb"]).await?;
-        let telephony = self
-            .shell(serial, &["dumpsys", "telephony.registry"])
-            .await?;
-        let sensors = self.shell(serial, &["dumpsys", "sensorservice"]).await?;
-        let audio = self
-            .shell(serial, &["dumpsys", "media.audio_flinger"])
-            .await?;
-        let camera = self.shell(serial, &["dumpsys", "media.camera"]).await?;
-        let battery = self.shell(serial, &["dumpsys", "battery"]).await?;
-        let location = self.shell(serial, &["dumpsys", "location"]).await?;
-        let network = self.network_health(serial).await?;
+        let (
+            packages,
+            services,
+            bluetooth,
+            nfc_hal,
+            uwb,
+            telephony,
+            sensors,
+            audio,
+            camera,
+            battery,
+            location,
+            network,
+        ) = tokio::try_join!(
+            self.shell(serial, &["pm", "list", "packages", "-e"]),
+            self.shell(serial, &["service", "list"]),
+            self.shell(serial, &["dumpsys", "bluetooth_manager"]),
+            self.getprop(serial, "init.svc.nfc_hal_service"),
+            self.shell(serial, &["dumpsys", "uwb"]),
+            self.shell(serial, &["dumpsys", "telephony.registry"]),
+            self.shell(serial, &["dumpsys", "sensorservice"]),
+            self.shell(serial, &["dumpsys", "media.audio_flinger"]),
+            self.shell(serial, &["dumpsys", "media.camera"]),
+            self.shell(serial, &["dumpsys", "battery"]),
+            self.shell(serial, &["dumpsys", "location"]),
+            self.network_health(serial),
+        )?;
         let mut devices =
             radio_runtime_devices(&packages, &services, &bluetooth, &nfc_hal, &uwb, &telephony);
         devices.extend(interactive_runtime_devices(
@@ -1143,6 +1226,16 @@ struct RuntimeDeviceFlags {
     verified: bool,
 }
 
+fn has_network_link(output: &str, interface: &str) -> bool {
+    output.lines().any(|line| {
+        line.split(':')
+            .nth(1)
+            .map(str::trim)
+            .and_then(|value| value.split('@').next())
+            == Some(interface)
+    })
+}
+
 fn radio_runtime_devices(
     packages: &str,
     services: &str,
@@ -1440,6 +1533,8 @@ pub enum AdbError {
     LocationVerification { expected: String, actual: String },
     #[error("network condition verification failed: expected {expected}, actual {actual}")]
     NetworkVerification { expected: String, actual: String },
+    #[error("Android has no eth0 or eth1 data interface: {0}")]
+    NetworkInterfaceUnavailable(String),
     #[error("the verified host bundle has no Android sensor injector")]
     SensorInjectorUnavailable,
     #[error("Android sensor injector is not a regular file: {0}")]
