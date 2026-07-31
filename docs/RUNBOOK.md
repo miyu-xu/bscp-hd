@@ -195,6 +195,27 @@ Host bundle 的 `frame-producer --probe-v2 --json` 没有证明当前平台要�
 
 确认租约 port 未被其他进程占用、ADB 只连接 `127.0.0.1:<port>`、Guest adbd service/bridge 与同一 CID 对应。查看 `adb connect`、wait-for-device、boot property 和 package-manager probe 错误。HD 不尝试公网地址或系统代理。
 
+### macOS Guest 有网关但不能访问外网
+
+macOS 上的 socket_vmnet shared NAT 在 Host 使用全隧道 VPN 时，Guest 数据包可能被原样
+路由到 `utun`，VPN 无法为 `192.168.105.0/24` 回程。发布安装器必须以 root 安装 HD
+网络兼容服务；开发环境可明确执行：
+
+```bash
+sudo ./scripts/macos-network-setup.sh install
+sudo ./scripts/macos-network-setup.sh status
+```
+
+服务只在 `/var/run/socket_vmnet` 存在且 Host 默认出口是 `utunN` 时，在独立 PF anchor
+中为固定 Guest 子网增加 NAT；VPN 关闭、出口变化或 socket 消失时自动清理规则。它不
+修改 Android 内部分辨率、ADB、流量整形或 Host 的默认路由。卸载使用
+`sudo ./scripts/macos-network-setup.sh uninstall`，会移除 LaunchDaemon、helper 和 PF
+引用，并保留安装前 `/etc/pf.conf` 的 root-only 备份。
+
+`hdctl diagnostics --instance-id <UUID>` 的 `guest.network` 以 Android
+ConnectivityService 的 active default network、DNS、默认路由和 `VALIDATED` 为准。
+socket 文件存在只表示数据面可以连接，不再作为 Guest 已联网的证明。
+
 ### Home/APK/设备动作被拒绝
 
 动作要求状态为 Ready。APK 还要求上传 hash 与 Worker 重新计算一致，并在安装后从 package manager 回读包路径。蓝牙/NFC 要求对应正式 adapter 控制面；不存在时返回稳定 device adapter 错误，不会本地伪造成功。

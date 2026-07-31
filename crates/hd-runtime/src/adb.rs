@@ -19,6 +19,8 @@ const INSTALL_TIMEOUT: Duration = Duration::from_mins(5);
 const READY_TIMEOUT: Duration = Duration::from_mins(5);
 const ORIENTATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 const ORIENTATION_RETRY_DELAY: Duration = Duration::from_millis(250);
+const NETWORK_VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
+const NETWORK_VALIDATE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
 const TABLET_MIN_SMALLEST_WIDTH_DP: u32 = 600;
 const ANDROID_DENSITY_BASE: u32 = 160;
@@ -30,6 +32,34 @@ pub struct AdbClient {
     executable: PathBuf,
     aapt2: Option<PathBuf>,
     sensor_injector: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndroidNetworkHealth {
+    pub active_network: Option<String>,
+    pub interface: Option<String>,
+    pub validated: bool,
+    pub has_dns: bool,
+    pub has_default_route: bool,
+}
+
+impl AndroidNetworkHealth {
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.active_network.is_some() && self.validated && self.has_dns && self.has_default_route
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> String {
+        format!(
+            "active_network={}, interface={}, validated={}, dns={}, default_route={}",
+            self.active_network.as_deref().unwrap_or("none"),
+            self.interface.as_deref().unwrap_or("unknown"),
+            self.validated,
+            self.has_dns,
+            self.has_default_route
+        )
+    }
 }
 
 impl AdbClient {
@@ -696,6 +726,47 @@ impl AdbClient {
         Ok(())
     }
 
+    /// Reads Android `ConnectivityService`'s active default network instead of inferring Guest
+    /// reachability from the presence of a host-side socket. `VALIDATED` is produced by Android's
+    /// own DNS and HTTP/HTTPS probes, while DNS and route checks guard against incomplete DHCP.
+    pub async fn network_health(&self, serial: &str) -> Result<AndroidNetworkHealth, AdbError> {
+        let connectivity = self.shell(serial, &["dumpsys", "connectivity"]).await?;
+        Ok(parse_android_network_health(&connectivity))
+    }
+
+    /// Performs one bounded link refresh when Android's first validation happened before the
+    /// host uplink became usable. It never loops indefinitely and always restores `eth1` to up
+    /// before waiting for `ConnectivityService` to finish its native validation probes.
+    pub async fn refresh_network_validation(
+        &self,
+        serial: &str,
+    ) -> Result<AndroidNetworkHealth, AdbError> {
+        let initial = self.network_health(serial).await?;
+        if initial.is_healthy() {
+            return Ok(initial);
+        }
+        self.shell(
+            serial,
+            &["su", "0", "ip", "link", "set", "dev", "eth1", "down"],
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.shell(
+            serial,
+            &["su", "0", "ip", "link", "set", "dev", "eth1", "up"],
+        )
+        .await?;
+
+        let started = Instant::now();
+        loop {
+            tokio::time::sleep(NETWORK_VALIDATE_RETRY_DELAY).await;
+            let latest = self.network_health(serial).await?;
+            if latest.is_healthy() || started.elapsed() >= NETWORK_VALIDATE_TIMEOUT {
+                return Ok(latest);
+            }
+        }
+    }
+
     /// Uses Android 15 `SensorService`'s HAL-bypass replay mode so all five fixed profile sensors
     /// are injected into the framework even when the selected Guest uses the AOSP example HAL.
     pub async fn inject_sensor(
@@ -969,6 +1040,51 @@ fn netem_rate_kbps(output: &str) -> Option<u64> {
         }
     }
     None
+}
+
+fn parse_android_network_health(output: &str) -> AndroidNetworkHealth {
+    let active_network = output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("Active default network:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
+            .map(str::to_owned)
+    });
+    let active_line = active_network.as_ref().and_then(|network| {
+        let marker = format!("NetworkAgentInfo{{network{{{network}}}");
+        output
+            .lines()
+            .skip_while(|line| line.trim() != "Current Networks:")
+            .take_while(|line| line.trim() != "Status for known UIDs:")
+            .find(|line| line.contains(&marker))
+    });
+    let capabilities = active_line
+        .and_then(|line| line.split_once(" nc{"))
+        .map_or("", |(_, value)| value);
+    let validated = capabilities
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|token| token == "VALIDATED");
+    let has_dns = active_line.is_some_and(|line| {
+        line.split_once("DnsAddresses: [")
+            .and_then(|(_, value)| value.split_once(']'))
+            .is_some_and(|(addresses, _)| !addresses.trim().is_empty())
+    });
+    let has_default_route =
+        active_line.is_some_and(|line| line.contains("0.0.0.0/0 ->") || line.contains("::/0 ->"));
+    let interface = active_line.and_then(|line| {
+        line.split_once("InterfaceName:")
+            .and_then(|(_, value)| value.split_whitespace().next())
+            .map(|value| value.trim_matches(|character| character == ',' || character == '}'))
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    AndroidNetworkHealth {
+        active_network,
+        interface,
+        validated,
+        has_dns,
+        has_default_route,
+    }
 }
 
 fn rate_token_kbps(token: &str) -> Option<u64> {

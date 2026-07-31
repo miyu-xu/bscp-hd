@@ -29,10 +29,10 @@ use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 use crate::{
-    AdbClient, CapabilityDiscovery, CrosvmBackend, DISK_LOW_WATERMARK_BYTES, ManagedProcess,
-    NativeDiskProvisioner, RunJournalV2, TokioProcessSupervisor, available_runtime_disk_bytes,
-    enforce_run_retention, expected_frame_transport, send_device_control_request,
-    spawn_run_log_maintenance,
+    AdbClient, AdbError, AndroidNetworkHealth, CapabilityDiscovery, CrosvmBackend,
+    DISK_LOW_WATERMARK_BYTES, ManagedProcess, NativeDiskProvisioner, RunJournalV2,
+    TokioProcessSupervisor, available_runtime_disk_bytes, enforce_run_retention,
+    expected_frame_transport, send_device_control_request, spawn_run_log_maintenance,
 };
 
 const FRAME_READY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -50,6 +50,65 @@ const CROSVM_DISPLAY_PARENT_HWND_ENV: &str = "CROSVM_DISPLAY_PARENT_HWND";
 const CROSVM_DISPLAY_WIDTH_ENV: &str = "CROSVM_DISPLAY_WIDTH";
 const CROSVM_DISPLAY_HEIGHT_ENV: &str = "CROSVM_DISPLAY_HEIGHT";
 const CROSVM_COCOA_CONTEXT_ENDPOINT_ENV: &str = "CROSVM_COCOA_CONTEXT_ENDPOINT";
+
+fn log_network_validation(
+    instance_id: Uuid,
+    run_id: Uuid,
+    serial: &str,
+    result: Result<AndroidNetworkHealth, AdbError>,
+) {
+    match result {
+        Ok(health) if health.is_healthy() => {
+            tracing::info!(
+                event = "worker.network.validation.succeeded",
+                %instance_id,
+                %run_id,
+                %serial,
+                detail = %health.detail(),
+                "Android network validation succeeded"
+            );
+        }
+        Ok(health) => {
+            tracing::warn!(
+                event = "worker.network.validation.degraded",
+                error_code = "guest_network_unvalidated",
+                %instance_id,
+                %run_id,
+                %serial,
+                detail = %health.detail(),
+                "Android network remains unvalidated after one bounded link refresh"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                event = "worker.network.validation.failed",
+                error_code = "guest_network_probe_failed",
+                %instance_id,
+                %run_id,
+                %serial,
+                %error,
+                "Android network validation probe failed"
+            );
+        }
+    }
+}
+
+async fn refresh_network_validation(
+    adb: &AdbClient,
+    enabled: bool,
+    instance_id: Uuid,
+    run_id: Uuid,
+    serial: &str,
+) {
+    if enabled {
+        log_network_validation(
+            instance_id,
+            run_id,
+            serial,
+            adb.refresh_network_validation(serial).await,
+        );
+    }
+}
 
 #[cfg(target_os = "macos")]
 const BOOTCONFIG_MAGIC: &[u8] = b"#BOOTCONFIG\n";
@@ -1140,6 +1199,14 @@ impl WorkerService {
                         spec.devices.nfc,
                     )
                     .await;
+                    refresh_network_validation(
+                        &adb,
+                        spec.devices.network,
+                        self.instance_id,
+                        run_id,
+                        serial,
+                    )
+                    .await;
                     adb.keep_display_awake(serial).await.map_err(WorkerError::Adb)?;
                     adb.set_display_configuration(serial, &spec.display)
                         .await
@@ -1163,6 +1230,7 @@ impl WorkerService {
                     spec.display.clone(),
                     spec.devices.bluetooth,
                     spec.devices.nfc,
+                    spec.devices.network,
                 );
             }
             self.spawn_exit_monitor();
@@ -2418,7 +2486,14 @@ impl WorkerService {
 
     async fn diagnostics(&self) -> Vec<hd_core::DiagnosticCheckV2> {
         let status = self.status().await;
-        vec![
+        let network = {
+            let mutable = self.mutable.lock().await;
+            mutable
+                .adb_ready
+                .then(|| Some((mutable.adb.clone()?, mutable.status.adb_serial.clone()?)))
+                .flatten()
+        };
+        let mut checks = vec![
             hd_core::DiagnosticCheckV2 {
                 id: "worker.identity".to_owned(),
                 status: if process_identity_is_alive(&status.identity) {
@@ -2442,7 +2517,57 @@ impl WorkerService {
                 detail: format!("{:?}", status.observed),
                 fields: BTreeMap::new(),
             },
-        ]
+        ];
+        checks.push(match network {
+            Some((adb, serial)) => match adb.network_health(&serial).await {
+                Ok(health) => {
+                    let mut fields = BTreeMap::new();
+                    fields.insert(
+                        "active_network".to_owned(),
+                        health
+                            .active_network
+                            .clone()
+                            .unwrap_or_else(|| "none".to_owned()),
+                    );
+                    fields.insert(
+                        "interface".to_owned(),
+                        health
+                            .interface
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                    );
+                    fields.insert("validated".to_owned(), health.validated.to_string());
+                    fields.insert("dns".to_owned(), health.has_dns.to_string());
+                    fields.insert(
+                        "default_route".to_owned(),
+                        health.has_default_route.to_string(),
+                    );
+                    hd_core::DiagnosticCheckV2 {
+                        id: "guest.network".to_owned(),
+                        status: if health.is_healthy() {
+                            hd_core::DiagnosticStatusV2::Pass
+                        } else {
+                            hd_core::DiagnosticStatusV2::Fail
+                        },
+                        detail: health.detail(),
+                        fields,
+                    }
+                }
+                Err(error) => hd_core::DiagnosticCheckV2 {
+                    id: "guest.network".to_owned(),
+                    status: hd_core::DiagnosticStatusV2::Fail,
+                    detail: format!("Android connectivity probe failed: {error}"),
+                    fields: BTreeMap::new(),
+                },
+            },
+            None => hd_core::DiagnosticCheckV2 {
+                id: "guest.network".to_owned(),
+                status: hd_core::DiagnosticStatusV2::Blocked,
+                detail: "ADB is not ready; Android connectivity cannot be verified".to_owned(),
+                fields: BTreeMap::new(),
+            },
+        });
+        checks
     }
 
     fn spawn_exit_monitor(self: &Arc<Self>) {
@@ -2495,6 +2620,7 @@ impl WorkerService {
         display: DisplayConfigV2,
         bluetooth_enabled: bool,
         nfc_enabled: bool,
+        network_enabled: bool,
     ) {
         let worker = Arc::clone(self);
         tokio::spawn(async move {
@@ -2557,6 +2683,8 @@ impl WorkerService {
                 return;
             }
             adb.apply_runtime_device_policy(&serial, bluetooth_enabled, nfc_enabled)
+                .await;
+            refresh_network_validation(&adb, network_enabled, worker.instance_id, run_id, &serial)
                 .await;
             if let Err(error) = adb.keep_display_awake(&serial).await {
                 tracing::warn!(
