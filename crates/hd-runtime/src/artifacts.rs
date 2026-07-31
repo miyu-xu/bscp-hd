@@ -540,16 +540,14 @@ impl ArtifactResolver {
         validate_guest_architecture(&guest)?;
         let guest_files = role_map(&guest_root, &guest)?;
         let host_tools = role_map(&host_root, &host)?;
-        for role in [
-            "kernel",
-            "initrd",
-            "rootfs",
-            "android_fstab",
-            "sensor-injector",
-        ] {
+        for role in ["kernel", "initrd", "rootfs", "android_fstab"] {
             require_role(&guest_files, role)?;
         }
-        require_executable_roles(&guest, &["sensor-injector"])?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            require_role(&guest_files, "sensor-injector")?;
+            require_executable_roles(&guest, &["sensor-injector"])?;
+        }
         for role in ["crosvm", "adb", "aapt2", "hd-device-sim", "frame-producer"] {
             require_role(&host_tools, role)?;
         }
@@ -612,7 +610,10 @@ impl ArtifactResolver {
                 initrd: guest_files["initrd"].clone(),
                 rootfs: guest_files["rootfs"].clone(),
                 android_fstab: guest_files["android_fstab"].clone(),
-                sensor_injector: guest_files["sensor-injector"].clone(),
+                sensor_injector: guest_files
+                    .get("sensor-injector")
+                    .cloned()
+                    .unwrap_or_default(),
                 system_image: guest_files.get("system_image").cloned(),
                 vendor_image: guest_files.get("vendor_image").cloned(),
                 host_tools,

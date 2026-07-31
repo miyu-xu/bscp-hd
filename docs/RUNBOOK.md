@@ -52,7 +52,7 @@ cargo run --target x86_64-pc-windows-gnu -p xtask -- publish-bundle `
   --file crosvm=bin\crosvm.exe --executable-role crosvm
 ```
 
-Guest 使用 `--kind guest --platform android`，并逐项登记 `kernel`、`initrd`、`rootfs`、`android_fstab` 及可选 `system_image`/`vendor_image` role。Host bundle 必须登记运行时要求的全部正式工具角色；缺一项时 resolver 会拒绝启动。
+Guest 使用 `--kind guest --platform android`，并逐项登记 `kernel`、`initrd`、`rootfs`、`android_fstab` 及可选 `system_image`/`vendor_image` role。Windows/Linux 的正式 Guest bundle 还必须登记可执行的 `sensor-injector`；macOS 使用 Guest 内固定的 hvc13 Sensors HAL 桥，不要求也不会上传 HAL-bypass injector。Host bundle 必须登记运行时要求的全部正式工具角色；缺一项时 resolver 会拒绝启动。
 
 ### 导入 Android x86_64 Cuttlefish 发布包
 
