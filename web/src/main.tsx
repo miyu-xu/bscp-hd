@@ -721,19 +721,31 @@ function CapabilityState({
   loading: boolean;
 }) {
   const available = Boolean(capability?.available);
+  const runtime = capability?.runtime;
+  const state = loading
+    ? '检测中'
+    : !capability
+      ? '能力未知'
+      : !available
+        ? '当前主机未配置'
+        : !enabled
+          ? '实例未启用'
+          : !adbReady
+            ? '已配置 · 等待启动'
+            : runtime?.verified
+              ? runtime.controllable
+                ? '已验证 · 可控制'
+                : runtime.running
+                  ? '已验证 · 运行中'
+                  : '已验证 · 离线基线'
+              : runtime?.running
+                ? '运行中 · 未验证'
+                : runtime?.configured
+                  ? '已配置 · 未运行'
+                  : '未配置';
   return (
-    <span className={`capability-state ${available && enabled && adbReady ? 'available' : ''}`}>
-      {loading
-        ? '检测中'
-        : !capability
-          ? '能力未知'
-          : !available
-            ? '当前主机不支持'
-              : !enabled
-                ? '实例未启用'
-                : adbReady
-                  ? capability.backend === 'software_backed' ? '模拟可用' : '可用'
-                  : '等待 ADB'}
+    <span className={`capability-state ${runtime?.verified && enabled ? 'available' : ''}`}>
+      {state}
     </span>
   );
 }
@@ -742,10 +754,11 @@ function CapabilitySummary({ capability, loading }: { capability?: DeviceCapabil
   if (loading) return <p className="device-capability-summary">正在检测当前主机设备能力…</p>;
   if (!capability) return <p className="device-capability-summary">当前主机未返回该设备的能力信息。</p>;
   return (
-    <p className="device-capability-summary" title={capability.boundary}>
+    <p className="device-capability-summary" title={`${capability.boundary}\n${capability.runtime.detail}`}>
       <strong>{deviceBackendLabels[capability.backend]}</strong>
       <span>{capability.features.length ? capability.features.join(' · ') : '无可声明功能'}</span>
       <small>{capability.boundary}</small>
+      <small>{capability.runtime.detail}</small>
     </p>
   );
 }
@@ -790,6 +803,7 @@ function DevicesPage({
       && adbReady
       && enabled(key)
       && Boolean(capability?.available)
+      && Boolean(capability?.runtime.controllable)
       && Boolean(capability?.features.includes('runtime_control'));
   };
   const send = (action: Record<string, unknown>) => {

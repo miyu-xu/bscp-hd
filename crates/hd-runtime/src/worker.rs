@@ -29,8 +29,8 @@ use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 use crate::{
-    AdbClient, AdbError, AndroidNetworkHealth, CapabilityDiscovery, CrosvmBackend,
-    DISK_LOW_WATERMARK_BYTES, ManagedProcess, NativeDiskProvisioner, RunJournalV2,
+    AdbClient, AdbError, AndroidDeviceRuntimeHealth, AndroidNetworkHealth, CapabilityDiscovery,
+    CrosvmBackend, DISK_LOW_WATERMARK_BYTES, ManagedProcess, NativeDiskProvisioner, RunJournalV2,
     TokioProcessSupervisor, available_runtime_disk_bytes, enforce_run_retention,
     expected_frame_transport, send_device_control_request, spawn_run_log_maintenance,
 };
@@ -107,6 +107,81 @@ async fn refresh_network_validation(
             serial,
             adb.refresh_network_validation(serial).await,
         );
+    }
+}
+
+fn device_runtime_diagnostic(health: AndroidDeviceRuntimeHealth) -> hd_core::DiagnosticCheckV2 {
+    let mut fields = BTreeMap::new();
+    fields.insert("installed".to_owned(), health.installed.to_string());
+    fields.insert("configured".to_owned(), health.configured.to_string());
+    fields.insert("running".to_owned(), health.running.to_string());
+    fields.insert("controllable".to_owned(), health.controllable.to_string());
+    fields.insert("verified".to_owned(), health.verified.to_string());
+    hd_core::DiagnosticCheckV2 {
+        id: format!("device.{}", health.id),
+        status: if health.verified {
+            hd_core::DiagnosticStatusV2::Pass
+        } else if health.installed || health.configured {
+            hd_core::DiagnosticStatusV2::Warn
+        } else {
+            hd_core::DiagnosticStatusV2::Fail
+        },
+        detail: health.detail,
+        fields,
+    }
+}
+
+async fn guest_network_diagnostic(
+    network: Option<&(AdbClient, String)>,
+) -> hd_core::DiagnosticCheckV2 {
+    let Some((adb, serial)) = network else {
+        return hd_core::DiagnosticCheckV2 {
+            id: "guest.network".to_owned(),
+            status: hd_core::DiagnosticStatusV2::Blocked,
+            detail: "ADB is not ready; Android connectivity cannot be verified".to_owned(),
+            fields: BTreeMap::new(),
+        };
+    };
+    match adb.network_health(serial).await {
+        Ok(health) => {
+            let mut fields = BTreeMap::new();
+            fields.insert(
+                "active_network".to_owned(),
+                health
+                    .active_network
+                    .clone()
+                    .unwrap_or_else(|| "none".to_owned()),
+            );
+            fields.insert(
+                "interface".to_owned(),
+                health
+                    .interface
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_owned()),
+            );
+            fields.insert("validated".to_owned(), health.validated.to_string());
+            fields.insert("dns".to_owned(), health.has_dns.to_string());
+            fields.insert(
+                "default_route".to_owned(),
+                health.has_default_route.to_string(),
+            );
+            hd_core::DiagnosticCheckV2 {
+                id: "guest.network".to_owned(),
+                status: if health.is_healthy() {
+                    hd_core::DiagnosticStatusV2::Pass
+                } else {
+                    hd_core::DiagnosticStatusV2::Fail
+                },
+                detail: health.detail(),
+                fields,
+            }
+        }
+        Err(error) => hd_core::DiagnosticCheckV2 {
+            id: "guest.network".to_owned(),
+            status: hd_core::DiagnosticStatusV2::Fail,
+            detail: format!("Android connectivity probe failed: {error}"),
+            fields: BTreeMap::new(),
+        },
     }
 }
 
@@ -2518,55 +2593,24 @@ impl WorkerService {
                 fields: BTreeMap::new(),
             },
         ];
-        checks.push(match network {
-            Some((adb, serial)) => match adb.network_health(&serial).await {
-                Ok(health) => {
-                    let mut fields = BTreeMap::new();
-                    fields.insert(
-                        "active_network".to_owned(),
-                        health
-                            .active_network
-                            .clone()
-                            .unwrap_or_else(|| "none".to_owned()),
-                    );
-                    fields.insert(
-                        "interface".to_owned(),
-                        health
-                            .interface
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                    );
-                    fields.insert("validated".to_owned(), health.validated.to_string());
-                    fields.insert("dns".to_owned(), health.has_dns.to_string());
-                    fields.insert(
-                        "default_route".to_owned(),
-                        health.has_default_route.to_string(),
-                    );
-                    hd_core::DiagnosticCheckV2 {
-                        id: "guest.network".to_owned(),
-                        status: if health.is_healthy() {
-                            hd_core::DiagnosticStatusV2::Pass
-                        } else {
-                            hd_core::DiagnosticStatusV2::Fail
-                        },
-                        detail: health.detail(),
-                        fields,
-                    }
-                }
-                Err(error) => hd_core::DiagnosticCheckV2 {
-                    id: "guest.network".to_owned(),
+        checks.push(guest_network_diagnostic(network.as_ref()).await);
+        match network {
+            Some((adb, serial)) => match adb.device_runtime_health(&serial).await {
+                Ok(devices) => checks.extend(devices.into_iter().map(device_runtime_diagnostic)),
+                Err(error) => checks.push(hd_core::DiagnosticCheckV2 {
+                    id: "device.runtime_probe".to_owned(),
                     status: hd_core::DiagnosticStatusV2::Fail,
-                    detail: format!("Android connectivity probe failed: {error}"),
+                    detail: format!("Android device runtime probe failed: {error}"),
                     fields: BTreeMap::new(),
-                },
+                }),
             },
-            None => hd_core::DiagnosticCheckV2 {
-                id: "guest.network".to_owned(),
+            None => checks.push(hd_core::DiagnosticCheckV2 {
+                id: "device.runtime_probe".to_owned(),
                 status: hd_core::DiagnosticStatusV2::Blocked,
-                detail: "ADB is not ready; Android connectivity cannot be verified".to_owned(),
+                detail: "ADB is not ready; device runtime state cannot be verified".to_owned(),
                 fields: BTreeMap::new(),
-            },
-        });
+            }),
+        }
         checks
     }
 

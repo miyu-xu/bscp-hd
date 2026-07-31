@@ -860,31 +860,40 @@ struct FormalDeviceStatuses {
 fn constrain_host_device_capabilities(mut statuses: FormalDeviceStatuses) -> FormalDeviceStatuses {
     #[cfg(target_os = "macos")]
     {
+        let guest_software_surface = statuses.network.available;
         statuses.bluetooth = software_on_macos(
+            guest_software_surface,
             "Android AIDL Bluetooth HCI and framework services; host peer/RF injection is not exposed",
         );
         statuses.nfc = software_on_macos(
+            guest_software_surface,
             "Android NFC framework package and HCE surface; host NDEF/RF injection is not exposed",
         );
         statuses.uwb = software_on_macos(
+            guest_software_surface,
             "Android UWB framework and AIDL HAL baseline; host ranging injection is not exposed",
         );
         statuses.modem = software_on_macos(
+            guest_software_surface,
             "Android Radio AIDL HAL baseline with deterministic out-of-service state",
         );
         statuses.network = if crate::backend::macos_socket_vmnet_path().is_some() {
             software_on_macos(
+                guest_software_surface,
                 "Android Connectivity stack with a shared NAT uplink through socket_vmnet",
             )
         } else {
             software_on_macos(
+                false,
                 "Android Connectivity and wireless simulation stack in an offline profile",
             )
         };
         statuses.audio = software_on_macos(
+            guest_software_surface,
             "Android AIDL Audio HAL with deterministic virtual speaker and microphone endpoints",
         );
         statuses.camera = software_on_macos(
+            guest_software_surface,
             "Android virtual camera provider with deterministic internal test sources",
         );
     }
@@ -892,10 +901,17 @@ fn constrain_host_device_capabilities(mut statuses: FormalDeviceStatuses) -> For
 }
 
 #[cfg(target_os = "macos")]
-fn software_on_macos(detail: &str) -> FormalToolStatus {
+fn software_on_macos(available: bool, detail: &str) -> FormalToolStatus {
     FormalToolStatus {
-        available: true,
-        detail: format!("macOS Guest software simulation: {detail}"),
+        available,
+        detail: format!(
+            "macOS Guest software simulation: {detail}; profile artifacts {}",
+            if available {
+                "are configured"
+            } else {
+                "are incomplete"
+            }
+        ),
     }
 }
 
@@ -906,8 +922,9 @@ fn compose_device_capabilities(statuses: &FormalDeviceStatuses) -> DeviceCapabil
     let macos_network_uplink = crate::backend::macos_socket_vmnet_path().is_some();
     #[cfg(target_os = "macos")]
     for device in &mut devices {
-        device.available = true;
-        device.backend = DeviceBackendKindV2::SoftwareBacked;
+        if device.available {
+            device.backend = DeviceBackendKindV2::SoftwareBacked;
+        }
         let (boundary, features): (&str, &[&str]) = match device.id.as_str() {
             "bluetooth" => (
                 "Android AIDL Bluetooth HCI and framework software surface; no physical RF or host peer injection claim",
@@ -967,6 +984,15 @@ fn compose_device_capabilities(statuses: &FormalDeviceStatuses) -> DeviceCapabil
             .iter()
             .map(|feature| (*feature).to_owned())
             .collect();
+        device.runtime.controllable = device
+            .features
+            .iter()
+            .any(|feature| feature == "runtime_control");
+        device.runtime.detail = if device.available {
+            "profile is configured; select a running instance for runtime verification".to_owned()
+        } else {
+            "profile artifacts are incomplete".to_owned()
+        };
     }
     #[cfg(not(target_os = "macos"))]
     for device in &mut devices {
@@ -1287,6 +1313,7 @@ fn unavailable_devices(reason: &str) -> DeviceCapabilitiesV2 {
             available: false,
             boundary: reason.to_owned(),
             features: Vec::new(),
+            runtime: hd_core::DeviceRuntimeStateV2::default(),
         })
         .collect(),
     }
@@ -1299,12 +1326,25 @@ fn device(
     boundary: &str,
     features: &[&str],
 ) -> DeviceCapabilityV2 {
+    let controllable = features.contains(&"runtime_control");
     DeviceCapabilityV2 {
         id: id.to_owned(),
         backend,
         available,
         boundary: boundary.to_owned(),
         features: features.iter().map(|value| (*value).to_owned()).collect(),
+        runtime: hd_core::DeviceRuntimeStateV2 {
+            installed: available,
+            configured: available,
+            running: false,
+            controllable,
+            verified: false,
+            detail: if available {
+                "profile is configured; runtime verification requires a running instance".to_owned()
+            } else {
+                boundary.to_owned()
+            },
+        },
     }
 }
 
@@ -1354,13 +1394,13 @@ fn capability_fingerprint(probes: &[CapabilityProbeV2], devices: &DeviceCapabili
         platform: &'a str,
         architecture: &'a str,
         probes: Vec<CapabilityProbeV2>,
-        devices: &'a DeviceCapabilitiesV2,
+        devices: StableDeviceCapabilities<'a>,
     }
     let payload = serde_json::to_vec(&Fingerprint {
         platform: platform_name(),
         architecture: architecture_name(),
         probes: normalized_probes(probes, false),
-        devices,
+        devices: stable_device_capabilities(devices),
     })
     .unwrap_or_default();
     hex::encode(Sha256::digest(payload))
@@ -1372,16 +1412,48 @@ fn release_fingerprint(probes: &[CapabilityProbeV2], devices: &DeviceCapabilitie
         platform: &'a str,
         architecture: &'a str,
         probes: Vec<CapabilityProbeV2>,
-        devices: &'a DeviceCapabilitiesV2,
+        devices: StableDeviceCapabilities<'a>,
     }
     let payload = serde_json::to_vec(&Fingerprint {
         platform: platform_name(),
         architecture: architecture_name(),
         probes: normalized_probes(probes, true),
-        devices,
+        devices: stable_device_capabilities(devices),
     })
     .unwrap_or_default();
     hex::encode(Sha256::digest(payload))
+}
+
+#[derive(Serialize)]
+struct StableDeviceCapabilities<'a> {
+    profile: &'a str,
+    devices: Vec<StableDeviceCapability<'a>>,
+}
+
+#[derive(Serialize)]
+struct StableDeviceCapability<'a> {
+    id: &'a str,
+    backend: DeviceBackendKindV2,
+    available: bool,
+    boundary: &'a str,
+    features: &'a [String],
+}
+
+fn stable_device_capabilities(devices: &DeviceCapabilitiesV2) -> StableDeviceCapabilities<'_> {
+    StableDeviceCapabilities {
+        profile: &devices.profile,
+        devices: devices
+            .devices
+            .iter()
+            .map(|device| StableDeviceCapability {
+                id: &device.id,
+                backend: device.backend,
+                available: device.available,
+                boundary: &device.boundary,
+                features: &device.features,
+            })
+            .collect(),
+    }
 }
 
 fn normalized_probes(

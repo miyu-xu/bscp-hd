@@ -53,6 +53,14 @@ export interface DeviceCapability {
   available: boolean;
   boundary: string;
   features: string[];
+  runtime: {
+    installed: boolean;
+    configured: boolean;
+    running: boolean;
+    controllable: boolean;
+    verified: boolean;
+    detail: string;
+  };
 }
 
 export interface Snapshot {

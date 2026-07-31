@@ -515,12 +515,43 @@ pub enum DeviceBackendKindV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRuntimeStateV2 {
+    #[serde(default)]
+    pub installed: bool,
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
+    pub running: bool,
+    #[serde(default)]
+    pub controllable: bool,
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub detail: String,
+}
+
+impl Default for DeviceRuntimeStateV2 {
+    fn default() -> Self {
+        Self {
+            installed: false,
+            configured: false,
+            running: false,
+            controllable: false,
+            verified: false,
+            detail: "runtime state has not been probed".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceCapabilityV2 {
     pub id: String,
     pub backend: DeviceBackendKindV2,
     pub available: bool,
     pub boundary: String,
     pub features: Vec<String>,
+    #[serde(default)]
+    pub runtime: DeviceRuntimeStateV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

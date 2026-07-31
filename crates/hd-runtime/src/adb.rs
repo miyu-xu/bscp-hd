@@ -43,6 +43,17 @@ pub struct AndroidNetworkHealth {
     pub has_default_route: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndroidDeviceRuntimeHealth {
+    pub id: String,
+    pub installed: bool,
+    pub configured: bool,
+    pub running: bool,
+    pub controllable: bool,
+    pub verified: bool,
+    pub detail: String,
+}
+
 impl AndroidNetworkHealth {
     #[must_use]
     pub fn is_healthy(&self) -> bool {
@@ -767,6 +778,42 @@ impl AdbClient {
         }
     }
 
+    /// Probes the fixed Android 15 phone profile through framework/HAL readback. Passive software
+    /// surfaces are reported separately from active radios, and host-controllable devices are
+    /// explicitly identified instead of treating every installed package as usable.
+    pub async fn device_runtime_health(
+        &self,
+        serial: &str,
+    ) -> Result<Vec<AndroidDeviceRuntimeHealth>, AdbError> {
+        let packages = self
+            .shell(serial, &["pm", "list", "packages", "-e"])
+            .await?;
+        let services = self.shell(serial, &["service", "list"]).await?;
+        let bluetooth = self
+            .shell(serial, &["dumpsys", "bluetooth_manager"])
+            .await?;
+        let nfc_hal = self.getprop(serial, "init.svc.nfc_hal_service").await?;
+        let uwb = self.shell(serial, &["dumpsys", "uwb"]).await?;
+        let telephony = self
+            .shell(serial, &["dumpsys", "telephony.registry"])
+            .await?;
+        let sensors = self.shell(serial, &["dumpsys", "sensorservice"]).await?;
+        let audio = self
+            .shell(serial, &["dumpsys", "media.audio_flinger"])
+            .await?;
+        let camera = self.shell(serial, &["dumpsys", "media.camera"]).await?;
+        let battery = self.shell(serial, &["dumpsys", "battery"]).await?;
+        let location = self.shell(serial, &["dumpsys", "location"]).await?;
+        let network = self.network_health(serial).await?;
+        let mut devices =
+            radio_runtime_devices(&packages, &services, &bluetooth, &nfc_hal, &uwb, &telephony);
+        devices.extend(interactive_runtime_devices(
+            &services, &sensors, &battery, &location, &network,
+        ));
+        devices.extend(media_runtime_devices(&services, &audio, &camera));
+        Ok(devices)
+    }
+
     /// Uses Android 15 `SensorService`'s HAL-bypass replay mode so all five fixed profile sensors
     /// are injected into the framework even when the selected Guest uses the AOSP example HAL.
     pub async fn inject_sensor(
@@ -1084,6 +1131,233 @@ fn parse_android_network_health(output: &str) -> AndroidNetworkHealth {
         validated,
         has_dns,
         has_default_route,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeDeviceFlags {
+    installed: bool,
+    configured: bool,
+    running: bool,
+    controllable: bool,
+    verified: bool,
+}
+
+fn radio_runtime_devices(
+    packages: &str,
+    services: &str,
+    bluetooth: &str,
+    nfc_hal: &str,
+    uwb: &str,
+    telephony: &str,
+) -> Vec<AndroidDeviceRuntimeHealth> {
+    let bluetooth_installed = packages
+        .lines()
+        .any(|line| line.trim() == "package:com.android.bluetooth");
+    let bluetooth_configured = services
+        .contains("android.hardware.bluetooth.IBluetoothHci/default")
+        && services.contains("bluetooth_manager:");
+    let bluetooth_offline = bluetooth.contains("state: OFF")
+        && bluetooth.contains("enabled: false")
+        && bluetooth.contains("Bluetooth crashed 0 times");
+    let nfc_installed = packages
+        .lines()
+        .any(|line| line.trim() == "package:com.android.nfc");
+    let nfc_offline = nfc_hal == "stopped";
+    let uwb_configured =
+        services.contains("android.hardware.uwb.IUwb/default") && services.contains("\tuwb:");
+    let uwb_baseline =
+        uwb.contains("Device state = OFF") && uwb.contains("mCountryCode:") && uwb.contains("US");
+    let modem_configured =
+        services.contains("telephony.registry:") || services.contains("\tphone:");
+    let modem_baseline =
+        telephony.contains("OUT_OF_SERVICE") && telephony.contains("mSignalStrength=null");
+    vec![
+        runtime_device(
+            "bluetooth",
+            RuntimeDeviceFlags {
+                installed: bluetooth_installed,
+                configured: bluetooth_configured,
+                running: bluetooth_configured,
+                controllable: false,
+                verified: bluetooth_installed && bluetooth_configured && bluetooth_offline,
+            },
+            if bluetooth_offline {
+                "framework and AIDL HCI are healthy; software radio is intentionally OFF and host peer injection is unavailable"
+            } else {
+                "Bluetooth framework/HCI baseline did not match the expected offline profile"
+            },
+        ),
+        runtime_device(
+            "nfc",
+            RuntimeDeviceFlags {
+                installed: nfc_installed,
+                configured: nfc_installed,
+                running: nfc_hal == "running",
+                controllable: false,
+                verified: nfc_installed && nfc_offline,
+            },
+            if nfc_offline {
+                "framework package is enabled; NFC HAL is intentionally stopped and host tag injection is unavailable"
+            } else {
+                "NFC package or expected offline HAL state is missing"
+            },
+        ),
+        runtime_device(
+            "uwb",
+            RuntimeDeviceFlags {
+                installed: uwb_configured,
+                configured: uwb_configured,
+                running: uwb_configured,
+                controllable: false,
+                verified: uwb_configured && uwb_baseline,
+            },
+            "framework and AIDL HAL baseline are present; adapter is OFF and host ranging control is unavailable",
+        ),
+        runtime_device(
+            "modem",
+            RuntimeDeviceFlags {
+                installed: modem_configured,
+                configured: modem_configured,
+                running: modem_configured,
+                controllable: false,
+                verified: modem_configured && modem_baseline,
+            },
+            "telephony framework is present with deterministic OUT_OF_SERVICE state; calls, SMS and data attach are unavailable",
+        ),
+    ]
+}
+
+fn interactive_runtime_devices(
+    services: &str,
+    sensors: &str,
+    battery: &str,
+    location: &str,
+    network: &AndroidNetworkHealth,
+) -> Vec<AndroidDeviceRuntimeHealth> {
+    let gnss_configured = services.contains("\tlocation:") && location.contains("gps provider:");
+    let gnss_running = gnss_configured && location_provider_enabled(location, "gps");
+    let required_sensors = [
+        "Accel Sensor",
+        "Gyro Sensor",
+        "Magnetic Field Sensor",
+        "Light Sensor",
+        "Proximity Sensor",
+    ];
+    let sensors_configured = services.contains("android.hardware.sensors.ISensors/default")
+        && required_sensors.iter().all(|name| sensors.contains(name));
+    let sensors_running = sensors_configured && sensors.contains("Recent Sensor events:");
+    let power_running = battery.contains("present: true")
+        && battery.contains("level:")
+        && battery.contains("temperature:");
+    vec![
+        runtime_device(
+            "gnss",
+            RuntimeDeviceFlags {
+                installed: gnss_configured,
+                configured: gnss_configured,
+                running: gnss_running,
+                controllable: true,
+                verified: gnss_running,
+            },
+            "LocationManager gps provider is enabled and typed coordinate injection is available",
+        ),
+        runtime_device(
+            "sensors",
+            RuntimeDeviceFlags {
+                installed: sensors_configured,
+                configured: sensors_configured,
+                running: sensors_running,
+                controllable: true,
+                verified: sensors_running,
+            },
+            "required accelerometer, gyroscope, magnetometer, light and proximity sensors are registered with live events",
+        ),
+        runtime_device(
+            "network",
+            RuntimeDeviceFlags {
+                installed: network.active_network.is_some(),
+                configured: network.has_dns && network.has_default_route,
+                running: network.active_network.is_some(),
+                controllable: true,
+                verified: network.is_healthy(),
+            },
+            &network.detail(),
+        ),
+        runtime_device(
+            "power",
+            RuntimeDeviceFlags {
+                installed: power_running,
+                configured: power_running,
+                running: power_running,
+                controllable: true,
+                verified: power_running,
+            },
+            "BatteryService is running and typed battery state injection/readback is available",
+        ),
+    ]
+}
+
+fn location_provider_enabled(output: &str, provider: &str) -> bool {
+    let heading = format!("{provider} provider:");
+    output
+        .lines()
+        .skip_while(|line| line.trim() != heading)
+        .take(4)
+        .any(|line| line.trim() == "enabled=true")
+}
+
+fn media_runtime_devices(
+    services: &str,
+    audio: &str,
+    camera: &str,
+) -> Vec<AndroidDeviceRuntimeHealth> {
+    let audio_configured = services.contains("android.hardware.audio.core.IModule/default")
+        && services.contains("media.audio_flinger:");
+    let audio_running = audio_configured
+        && audio.contains("Output thread")
+        && audio.contains("AUDIO_DEVICE_OUT_SPEAKER");
+    let camera_configured = services
+        .contains("android.hardware.camera.provider.ICameraProvider/internal/0")
+        && services.contains("media.camera:");
+    let camera_running = camera_configured
+        && camera.contains("Number of normal camera devices: 2")
+        && camera.contains("Camera Provider HAL");
+    vec![
+        runtime_device(
+            "audio",
+            RuntimeDeviceFlags {
+                installed: audio_configured,
+                configured: audio_configured,
+                running: audio_running,
+                controllable: false,
+                verified: audio_running,
+            },
+            "AudioFlinger and AIDL modules expose virtual speaker/capture endpoints; physical host audio routing is unavailable",
+        ),
+        runtime_device(
+            "camera",
+            RuntimeDeviceFlags {
+                installed: camera_configured,
+                configured: camera_configured,
+                running: camera_running,
+                controllable: false,
+                verified: camera_running,
+            },
+            "camera provider exposes two public deterministic virtual cameras; physical host camera routing is unavailable",
+        ),
+    ]
+}
+
+fn runtime_device(id: &str, flags: RuntimeDeviceFlags, detail: &str) -> AndroidDeviceRuntimeHealth {
+    AndroidDeviceRuntimeHealth {
+        id: id.to_owned(),
+        installed: flags.installed,
+        configured: flags.configured,
+        running: flags.running,
+        controllable: flags.controllable,
+        verified: flags.verified,
+        detail: detail.to_owned(),
     }
 }
 

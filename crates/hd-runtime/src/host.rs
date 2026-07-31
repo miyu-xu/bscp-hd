@@ -148,8 +148,19 @@ impl HostService {
                 .get_instance(instance_id)?
                 .ok_or(HostError::InstanceNotFound(instance_id))?;
             let result = self.discovery.discover(Some(&record.spec)).await;
-            self.emit(HostEventKindV2::Capabilities(result.capabilities.clone()))?;
-            Ok(result.capabilities)
+            let mut capabilities = result.capabilities;
+            if record.adb_ready
+                && record.worker.is_some()
+                && let Ok(response) = self
+                    .call_worker(record.spec.id, WorkerCommandV2::Diagnose)
+                    .await
+                && let Ok(Some(WorkerPayloadV2::Diagnostics(checks))) =
+                    ensure_worker_success(response)
+            {
+                apply_device_runtime_checks(&mut capabilities.devices, &checks);
+            }
+            self.emit(HostEventKindV2::Capabilities(capabilities.clone()))?;
+            Ok(capabilities)
         } else {
             Ok(self.capabilities.read().await.clone())
         }
@@ -2028,6 +2039,28 @@ fn diagnostic_failure(id: &str, detail: &str) -> hd_core::DiagnosticCheckV2 {
         status: hd_core::DiagnosticStatusV2::Fail,
         detail: detail.to_owned(),
         fields: BTreeMap::new(),
+    }
+}
+
+fn apply_device_runtime_checks(
+    devices: &mut hd_core::DeviceCapabilitiesV2,
+    checks: &[hd_core::DiagnosticCheckV2],
+) {
+    for check in checks {
+        let Some(id) = check.id.strip_prefix("device.") else {
+            continue;
+        };
+        let Some(device) = devices.devices.iter_mut().find(|device| device.id == id) else {
+            continue;
+        };
+        let field = |name: &str| check.fields.get(name).is_some_and(|value| value == "true");
+        device.runtime.installed = field("installed");
+        device.runtime.configured = field("configured");
+        device.runtime.running = field("running");
+        device.runtime.controllable = field("controllable");
+        device.runtime.verified =
+            field("verified") && check.status == hd_core::DiagnosticStatusV2::Pass;
+        device.runtime.detail.clone_from(&check.detail);
     }
 }
 
