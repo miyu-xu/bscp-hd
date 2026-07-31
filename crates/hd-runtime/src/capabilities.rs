@@ -379,20 +379,27 @@ impl CapabilityDiscovery {
         probes.push(device_probe(&devices, spec));
 
         let evidence_fingerprint = release_fingerprint(&probes, &devices);
-        let certified = if fast_artifacts && spec.is_some() {
-            probes.push(supported_probe(
+        let development_bypass = fast_artifacts && spec.is_some();
+        let verified = !fast_artifacts
+            && !fast_capabilities
+            && !dev_display_copy_fallback
+            && probes.iter().all(|probe| {
+                !probe.required || matches!(probe.status, CapabilityStatusV2::Supported)
+            });
+        let certified = if development_bypass {
+            probes.push(blocked_probe(
                 "release.certification",
-                true,
-                "dev fast artifact mode skips release certification for local iteration",
+                false,
+                "release certification was not evaluated because development artifact bypass is active",
                 BTreeMap::from([(
                     "evidence_fingerprint".to_owned(),
                     evidence_fingerprint.clone(),
                 )])
                 .into_iter()
-                .chain([("mode".to_owned(), "dev_fast_artifacts".to_owned())])
+                .chain([("mode".to_owned(), "development_bypass".to_owned())])
                 .collect(),
             ));
-            true
+            false
         } else {
             let certification = certification_matches(
                 &self.paths,
@@ -439,7 +446,9 @@ impl CapabilityDiscovery {
             platform: platform_name().to_owned(),
             architecture: architecture_name().to_owned(),
             fingerprint,
+            verified,
             certified,
+            development_bypass,
             probes,
             devices,
         };

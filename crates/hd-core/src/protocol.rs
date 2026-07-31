@@ -656,7 +656,11 @@ pub struct HostCapabilitiesV2 {
     pub platform: String,
     pub architecture: String,
     pub fingerprint: String,
+    #[serde(default)]
+    pub verified: bool,
     pub certified: bool,
+    #[serde(default)]
+    pub development_bypass: bool,
     pub probes: Vec<CapabilityProbeV2>,
     pub devices: DeviceCapabilitiesV2,
 }
@@ -685,7 +689,7 @@ pub struct HostCertificationV2 {
 
 impl HostCapabilitiesV2 {
     pub fn can_start(&self) -> bool {
-        self.certified
+        (self.certified || self.development_bypass)
             && self.probes.iter().all(|probe| {
                 !probe.required || matches!(probe.status, CapabilityStatusV2::Supported)
             })
@@ -1330,7 +1334,9 @@ mod tests {
             platform: "test".to_owned(),
             architecture: "test".to_owned(),
             fingerprint: "fingerprint".to_owned(),
+            verified: false,
             certified: false,
+            development_bypass: false,
             probes: vec![CapabilityProbeV2 {
                 id: "zero_copy".to_owned(),
                 status: CapabilityStatusV2::Blocked,
@@ -1344,5 +1350,42 @@ mod tests {
             },
         };
         assert!(!capabilities.can_start());
+    }
+
+    #[test]
+    fn development_bypass_allows_start_without_claiming_certification() {
+        let capabilities = HostCapabilitiesV2 {
+            schema_version: 2,
+            generated_at: OffsetDateTime::UNIX_EPOCH,
+            platform: "test".to_owned(),
+            architecture: "test".to_owned(),
+            fingerprint: "fingerprint".to_owned(),
+            verified: false,
+            certified: false,
+            development_bypass: true,
+            probes: vec![
+                CapabilityProbeV2 {
+                    id: "runtime".to_owned(),
+                    status: CapabilityStatusV2::Supported,
+                    required: true,
+                    detail: "available".to_owned(),
+                    properties: BTreeMap::new(),
+                },
+                CapabilityProbeV2 {
+                    id: "release.certification".to_owned(),
+                    status: CapabilityStatusV2::Blocked,
+                    required: false,
+                    detail: "development bypass".to_owned(),
+                    properties: BTreeMap::new(),
+                },
+            ],
+            devices: DeviceCapabilitiesV2 {
+                profile: "phone".to_owned(),
+                devices: Vec::new(),
+            },
+        };
+        assert!(capabilities.can_start());
+        assert!(!capabilities.certified);
+        assert!(!capabilities.verified);
     }
 }
