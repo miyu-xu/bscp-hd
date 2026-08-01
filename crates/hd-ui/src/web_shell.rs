@@ -23,14 +23,14 @@ use hd_platform::{
 #[cfg(target_os = "macos")]
 use hd_platform::{install_macos_titlebar_controls, set_macos_window_content_aspect_ratio};
 use hd_runtime::HostClientV2;
+use hd_ui::ui_contract::{Page, SurfaceLayout, oriented_guest_dimensions};
 use raw_window_handle::HasWindowHandle as _;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::LogicalSize;
 use winit::event::{Event, StartCause, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::Window;
@@ -41,12 +41,6 @@ use wry::{Rect, WebView, WebViewBuilder};
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DISPLAY_RETRY: Duration = Duration::from_millis(500);
 const DISPLAY_HEARTBEAT: Duration = Duration::from_secs(5);
-#[cfg(target_os = "macos")]
-const TOP_BAR_LOGICAL: f64 = 0.0;
-#[cfg(not(target_os = "macos"))]
-const TOP_BAR_LOGICAL: f64 = 48.0;
-const SIDEBAR_LOGICAL: f64 = 260.0;
-const SURFACE_GAP_PX: u32 = 0;
 const DEFAULT_DEV_ARTIFACTS: &str =
     r"C:\workspace\bscp\bscp-vm-artifacts-20260721-aosp-all-targets";
 const FALLBACK_DEV_ARTIFACTS: &str =
@@ -91,80 +85,6 @@ enum UserEvent {
         result: Result<DisplaySessionV2, String>,
     },
     ShutdownFinished(Result<(), String>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Page {
-    Player,
-    Settings,
-    Devices,
-    Diagnostics,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SurfaceLayout {
-    width: u32,
-    height: u32,
-    top_height: u32,
-    sidebar_width: u32,
-    page: Page,
-    sidebar_collapsed: bool,
-    display_maximized: bool,
-    android_focused: bool,
-}
-
-impl SurfaceLayout {
-    fn from_window(
-        size: PhysicalSize<u32>,
-        scale: f64,
-        page: Page,
-        collapsed: bool,
-        display_maximized: bool,
-    ) -> Self {
-        let top_height = logical_to_physical(TOP_BAR_LOGICAL, scale).min(size.height);
-        let android_focused = page == Page::Player && display_maximized;
-        let hide_sidebar = collapsed || android_focused;
-        let sidebar_width = if hide_sidebar {
-            0
-        } else {
-            logical_to_physical(SIDEBAR_LOGICAL, scale).min(size.width)
-        };
-        Self {
-            width: size.width,
-            height: size.height,
-            top_height,
-            sidebar_width,
-            page,
-            sidebar_collapsed: collapsed,
-            display_maximized,
-            android_focused,
-        }
-    }
-
-    fn sidebar_visible(self) -> bool {
-        !self.sidebar_collapsed && self.sidebar_width > 0 && self.body_height() > 0
-    }
-
-    fn body_y(self) -> u32 {
-        self.top_height
-            .saturating_add(SURFACE_GAP_PX)
-            .min(self.height)
-    }
-
-    fn content_x(self) -> u32 {
-        self.sidebar_width
-            .saturating_add(SURFACE_GAP_PX)
-            .min(self.width)
-    }
-
-    fn body_height(self) -> u32 {
-        self.height.saturating_sub(self.body_y())
-    }
-
-    fn content_width(self) -> u32 {
-        self.width.saturating_sub(self.content_x())
-    }
 }
 
 struct WebSurfaces {
@@ -612,16 +532,6 @@ fn web_rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
     }
 }
 
-fn logical_to_physical(value: f64, scale: f64) -> u32 {
-    if value <= 0.0 {
-        return 0;
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    {
-        (value * scale).round().clamp(1.0, f64::from(u32::MAX)) as u32
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 fn handle_ipc(message: &str, window: &Window, shell: &mut ShellState) {
     let value: Value = match serde_json::from_str(message) {
@@ -811,19 +721,11 @@ impl ShellState {
     }
 
     fn sync_window_aspect(&mut self, window: &Window) {
-        let Some((guest_width, guest_height)) = self.selected.as_ref().map(|record| {
-            let display = &record.spec.display;
-            match display.orientation {
-                OrientationV2::Portrait | OrientationV2::ReversePortrait => (
-                    display.width.min(display.height),
-                    display.width.max(display.height),
-                ),
-                OrientationV2::Landscape | OrientationV2::ReverseLandscape => (
-                    display.width.max(display.height),
-                    display.width.min(display.height),
-                ),
-            }
-        }) else {
+        let Some((guest_width, guest_height)) = self
+            .selected
+            .as_ref()
+            .map(|record| oriented_guest_dimensions(&record.spec.display))
+        else {
             return;
         };
         let aspect = (guest_width, guest_height);

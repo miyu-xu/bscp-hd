@@ -18,6 +18,73 @@ pub struct NativeDisplayBounds {
     pub visible: bool,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MacTitlebarControlContract {
+    pub symbol: String,
+    pub tooltip: String,
+    pub message: String,
+    pub placement: String,
+}
+
+#[cfg(target_os = "macos")]
+pub fn map_macos_pointer(
+    normalized_x: f64,
+    normalized_y: f64,
+    rotation_quarters: u8,
+    guest_width: u32,
+    guest_height: u32,
+) -> (i32, i32) {
+    let x = normalized_x.clamp(0.0, 1.0);
+    let y = normalized_y.clamp(0.0, 1.0);
+    let (raw_x, raw_y) = match rotation_quarters & 3 {
+        1 => (1.0 - y, x),
+        2 => (1.0 - x, 1.0 - y),
+        3 => (y, 1.0 - x),
+        _ => (x, y),
+    };
+    let width = guest_width.max(1);
+    let height = guest_height.max(1);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    (
+        (raw_x * f64::from(width))
+            .floor()
+            .clamp(0.0, f64::from(width - 1)) as i32,
+        (raw_y * f64::from(height))
+            .floor()
+            .clamp(0.0, f64::from(height - 1)) as i32,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub extern "C" fn hd_macos_map_pointer_contract(
+    normalized_x: f64,
+    normalized_y: f64,
+    rotation_quarters: u8,
+    guest_width: u32,
+    guest_height: u32,
+    output_x: *mut i32,
+    output_y: *mut i32,
+) {
+    let (x, y) = map_macos_pointer(
+        normalized_x,
+        normalized_y,
+        rotation_quarters,
+        guest_width,
+        guest_height,
+    );
+    // SAFETY: AppKit passes pointers to stack-owned i32 outputs.
+    unsafe {
+        if let Some(output) = output_x.as_mut() {
+            *output = x;
+        }
+        if let Some(output) = output_y.as_mut() {
+            *output = y;
+        }
+    }
+}
+
 /// Volatile, platform-owned display container used by gfxstream/crosvm.
 ///
 /// Implementations never persist the native handle. The UI owns this object for exactly as long
@@ -302,6 +369,11 @@ mod macos {
             context: *mut c_void,
             callback: MacTitlebarCallback,
         ) -> bool;
+        fn hd_macos_titlebar_control_count() -> usize;
+        fn hd_macos_titlebar_control_symbol(index: usize) -> *const c_char;
+        fn hd_macos_titlebar_control_tooltip(index: usize) -> *const c_char;
+        fn hd_macos_titlebar_control_message(index: usize) -> *const c_char;
+        fn hd_macos_titlebar_control_placement(index: usize) -> *const c_char;
     }
 
     pub type MacTitlebarCallback = extern "C" fn(*mut c_void, *const c_char);
@@ -496,6 +568,48 @@ mod macos {
         }
     }
 
+    pub(super) fn titlebar_control_contracts()
+    -> Result<Vec<super::MacTitlebarControlContract>, PlatformError> {
+        // SAFETY: the Objective-C bridge returns process-lifetime static UTF-8 strings.
+        let count = unsafe { hd_macos_titlebar_control_count() };
+        let mut controls = Vec::with_capacity(count);
+        for index in 0..count {
+            let field = |pointer: *const c_char, name: &str| -> Result<String, PlatformError> {
+                if pointer.is_null() {
+                    return Err(PlatformError::Process(format!(
+                        "macOS titlebar contract {index} has null {name}"
+                    )));
+                }
+                // SAFETY: pointers come from static NUL-terminated bridge strings.
+                unsafe { CStr::from_ptr(pointer) }
+                    .to_str()
+                    .map(str::to_owned)
+                    .map_err(|error| {
+                        PlatformError::Process(format!(
+                            "macOS titlebar contract {index} has invalid {name}: {error}"
+                        ))
+                    })
+            };
+            // SAFETY: every accessor accepts indices below the count returned above.
+            controls.push(super::MacTitlebarControlContract {
+                symbol: field(unsafe { hd_macos_titlebar_control_symbol(index) }, "symbol")?,
+                tooltip: field(
+                    unsafe { hd_macos_titlebar_control_tooltip(index) },
+                    "tooltip",
+                )?,
+                message: field(
+                    unsafe { hd_macos_titlebar_control_message(index) },
+                    "message",
+                )?,
+                placement: field(
+                    unsafe { hd_macos_titlebar_control_placement(index) },
+                    "placement",
+                )?,
+            });
+        }
+        Ok(controls)
+    }
+
     pub(super) fn choose_apk_file() -> Result<Option<PathBuf>, PlatformError> {
         let mut output = [0 as c_char; 4096];
         // SAFETY: the fixed buffer remains writable for the duration of the synchronous AppKit
@@ -549,4 +663,10 @@ pub fn install_macos_titlebar_controls(
     callback: MacTitlebarCallback,
 ) -> Result<(), PlatformError> {
     macos::install_titlebar_controls(parent, context, callback)
+}
+
+#[cfg(target_os = "macos")]
+pub fn macos_titlebar_control_contracts() -> Result<Vec<MacTitlebarControlContract>, PlatformError>
+{
+    macos::titlebar_control_contracts()
 }

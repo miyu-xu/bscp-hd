@@ -26,6 +26,10 @@ pub use native_display_host::center_macos_traffic_lights;
 pub use native_display_host::install_macos_titlebar_controls;
 #[cfg(target_os = "macos")]
 pub use native_display_host::set_macos_window_content_aspect_ratio;
+#[cfg(target_os = "macos")]
+pub use native_display_host::{
+    MacTitlebarControlContract, macos_titlebar_control_contracts, map_macos_pointer,
+};
 pub use native_display_host::{
     NativeDisplayBounds, NativeDisplayHost, choose_apk_file, create_native_display_host,
 };

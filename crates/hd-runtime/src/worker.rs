@@ -29,8 +29,10 @@ use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 use crate::{
-    AdbClient, CapabilityDiscovery, CrosvmBackend, ManagedProcess, NativeDiskProvisioner,
-    RunJournalV2, TokioProcessSupervisor, expected_frame_transport, send_device_control_request,
+    AdbClient, CapabilityDiscovery, CrosvmBackend, DISK_LOW_WATERMARK_BYTES, ManagedProcess,
+    NativeDiskProvisioner, RunJournalV2, TokioProcessSupervisor, available_runtime_disk_bytes,
+    enforce_run_retention, expected_frame_transport, send_device_control_request,
+    spawn_run_log_maintenance,
 };
 
 const FRAME_READY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -757,6 +759,39 @@ impl WorkerService {
             }
         }
         let trace_id = Uuid::new_v4();
+        let retention_paths = self.paths.clone();
+        let retention_instance_id = spec.id;
+        let retention = tokio::task::spawn_blocking(move || {
+            enforce_run_retention(&retention_paths, retention_instance_id)
+        })
+        .await
+        .map_err(|error| WorkerError::Task(format!("join run retention task: {error}")))??;
+        for pruned in &retention.pruned {
+            tracing::info!(
+                event = "runtime.run.pruned",
+                instance_id = %self.instance_id,
+                run_id = %pruned.run_id,
+                bytes = pruned.bytes,
+                retained_count = retention.retained_count,
+                retained_bytes = retention.retained_bytes,
+                "pruned finalized run under the runtime retention policy"
+            );
+        }
+        let available_disk_bytes = available_runtime_disk_bytes(&self.paths)?;
+        if available_disk_bytes < DISK_LOW_WATERMARK_BYTES {
+            tracing::error!(
+                event = "runtime.disk.low_watermark",
+                error_code = "disk_low_watermark",
+                instance_id = %self.instance_id,
+                available_disk_bytes,
+                required_disk_bytes = DISK_LOW_WATERMARK_BYTES,
+                "runtime data volume is below the start low-watermark"
+            );
+            return Err(WorkerError::DiskLowWatermark {
+                available: available_disk_bytes,
+                required: DISK_LOW_WATERMARK_BYTES,
+            });
+        }
         let run_dir = self.paths.run_dir(self.instance_id, run_id);
         let journal = Arc::new(RunJournalV2::create(
             &run_dir,
@@ -764,6 +799,7 @@ impl WorkerService {
             run_id,
             trace_id,
         )?);
+        spawn_run_log_maintenance(run_dir.clone());
         let started_at = OffsetDateTime::now_utc();
         let initial_manifest = RunManifestV2 {
             schema_version: 2,
@@ -2255,20 +2291,50 @@ impl WorkerService {
                     adb.inject_sensor(&serial, &injection).await?;
                 }
             }
-            InstanceActionV2::BluetoothPeer { action } => {
+            InstanceActionV2::BluetoothPeer { action: _action } => {
+                #[cfg(target_os = "macos")]
+                {
+                    tracing::warn!(
+                        event = "worker.device.action.unsupported",
+                        error_code = "device_action_unsupported",
+                        instance_id = %self.instance_id,
+                        device = "bluetooth",
+                        action = "bluetooth_peer",
+                        "macOS Bluetooth exposes the Android software surface without host peer injection"
+                    );
+                    return Err(WorkerError::DeviceActionUnsupported(
+                        "bluetooth host peer injection is unavailable on macOS",
+                    ));
+                }
+                #[cfg(not(target_os = "macos"))]
                 self.call_device_component(
                     "rootcanal-adapter",
                     DeviceControlCommandV2::Action {
-                        action: InstanceActionV2::BluetoothPeer { action },
+                        action: InstanceActionV2::BluetoothPeer { action: _action },
                     },
                 )
                 .await?;
             }
-            InstanceActionV2::NfcTag { action } => {
+            InstanceActionV2::NfcTag { action: _action } => {
+                #[cfg(target_os = "macos")]
+                {
+                    tracing::warn!(
+                        event = "worker.device.action.unsupported",
+                        error_code = "device_action_unsupported",
+                        instance_id = %self.instance_id,
+                        device = "nfc",
+                        action = "nfc_tag",
+                        "macOS NFC exposes the Android software surface without host tag injection"
+                    );
+                    return Err(WorkerError::DeviceActionUnsupported(
+                        "NFC host tag injection is unavailable on macOS",
+                    ));
+                }
+                #[cfg(not(target_os = "macos"))]
                 self.call_device_component(
                     "casimir-adapter",
                     DeviceControlCommandV2::Action {
-                        action: InstanceActionV2::NfcTag { action },
+                        action: InstanceActionV2::NfcTag { action: _action },
                     },
                 )
                 .await?;
@@ -2723,11 +2789,7 @@ struct RuntimeEndpoints {
 
 fn enabled_device_components(spec: &InstanceSpecV2) -> Vec<&'static str> {
     let mut components = Vec::new();
-    if spec.devices.gnss
-        || spec.devices.sensors
-        || spec.devices.power
-        || (spec.devices.network && !cfg!(target_os = "macos"))
-    {
+    if spec.devices.gnss || spec.devices.sensors || spec.devices.power || spec.devices.network {
         components.push("hd-device-sim");
     }
     #[cfg(not(target_os = "macos"))]
@@ -3297,8 +3359,14 @@ pub enum WorkerError {
     GuestExited(Option<i32>),
     #[error("device endpoint is unavailable for role {0}")]
     DeviceEndpoint(String),
+    #[error("device action is unsupported by this host: {0}")]
+    DeviceActionUnsupported(&'static str),
     #[error("device request was rejected: {0}")]
     DeviceRejected(String),
+    #[error(
+        "runtime disk is below the start low-watermark: {available} bytes available, {required} required"
+    )]
+    DiskLowWatermark { available: u64, required: u64 },
     #[error("display session failed: {0}")]
     DisplaySession(String),
     #[error("APK digest mismatch: expected {expected}, actual {actual}")]
@@ -3326,6 +3394,8 @@ pub enum WorkerError {
     Adb(#[from] crate::AdbError),
     #[error(transparent)]
     DeviceIpc(#[from] crate::DeviceIpcError),
+    #[error(transparent)]
+    Storage(#[from] crate::RuntimeStorageError),
     #[error("JSON operation failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("{operation} failed for {path}: {source}")]
@@ -3375,7 +3445,9 @@ impl WorkerError {
             Self::ComponentCleanup(_) => "component_cleanup",
             Self::GuestExited(_) => "guest_exited",
             Self::DeviceEndpoint(_) => "device_endpoint",
+            Self::DeviceActionUnsupported(_) => "device_action_unsupported",
             Self::DeviceRejected(_) => "device_rejected",
+            Self::DiskLowWatermark { .. } => "disk_low_watermark",
             Self::DisplaySession(_) => "display_session",
             Self::UploadDigestMismatch { .. } => "upload_digest_mismatch",
             Self::EndpointTooLong(_) => "endpoint_too_long",
@@ -3388,6 +3460,7 @@ impl WorkerError {
             Self::Artifacts(_) => "artifacts",
             Self::Adb(_) => "adb",
             Self::DeviceIpc(_) => "device_ipc",
+            Self::Storage(_) => "runtime_storage",
             Self::Json(_) => "json",
             Self::Io { .. } => "io",
         }
@@ -3404,6 +3477,30 @@ impl WorkerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_only_configuration_starts_the_device_simulator() {
+        let mut spec = InstanceSpecV2::default();
+        spec.devices.bluetooth = false;
+        spec.devices.nfc = false;
+        spec.devices.uwb = false;
+        spec.devices.modem = false;
+        spec.devices.gnss = false;
+        spec.devices.sensors = false;
+        spec.devices.audio = false;
+        spec.devices.camera = false;
+        spec.devices.power = false;
+        spec.devices.network = true;
+        assert_eq!(enabled_device_components(&spec), vec!["hd-device-sim"]);
+    }
+
+    #[test]
+    fn unsupported_device_action_has_a_stable_api_code() {
+        assert_eq!(
+            WorkerError::DeviceActionUnsupported("contract").code(),
+            "device_action_unsupported"
+        );
+    }
 
     #[test]
     fn a_foreign_lease_owner_is_rejected() {

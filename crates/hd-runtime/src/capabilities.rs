@@ -930,22 +930,23 @@ fn compose_device_capabilities(statuses: &FormalDeviceStatuses) -> DeviceCapabil
                 &["location", "runtime_control"],
             ),
             "sensors" => (
-                "Android Guest software Sensors HAL with deterministic accelerometer, gyroscope, magnetometer, light and proximity sources",
+                "Android Guest software Sensors HAL with deterministic host runtime injection for accelerometer, gyroscope, magnetometer, light and proximity",
                 &[
                     "accelerometer",
                     "gyroscope",
                     "magnetometer",
                     "light",
                     "proximity",
+                    "runtime_control",
                 ],
             ),
             "network" if macos_network_uplink => (
-                "Android Connectivity stack with a shared NAT uplink through socket_vmnet; no Wi-Fi RF or port-forward claim",
-                &["connectivity_stack", "shared_nat_uplink"],
+                "Android Connectivity stack with a shared NAT uplink through socket_vmnet and deterministic runtime traffic shaping; no Wi-Fi RF or port-forward claim",
+                &["connectivity_stack", "shared_nat_uplink", "runtime_control"],
             ),
             "network" => (
-                "Android Connectivity and wireless simulation stack in an offline profile; no host uplink or runtime traffic shaping claim",
-                &["connectivity_stack", "offline_profile"],
+                "Android Connectivity stack in an offline profile with deterministic runtime traffic shaping; no host uplink or Wi-Fi RF claim",
+                &["connectivity_stack", "offline_profile", "runtime_control"],
             ),
             "audio" => (
                 "Android AIDL Audio HAL with deterministic virtual speaker and microphone endpoints; no physical host-device audio claim",

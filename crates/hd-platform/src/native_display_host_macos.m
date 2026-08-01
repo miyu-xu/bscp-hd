@@ -46,6 +46,67 @@ typedef struct {
 typedef void (*HDTitlebarCallback)(void* context, const char* message);
 static char HDTitlebarButtonMessageKey;
 
+extern void hd_macos_map_pointer_contract(double normalized_x,
+                                           double normalized_y,
+                                           uint8_t rotation_quarters,
+                                           uint32_t guest_width,
+                                           uint32_t guest_height,
+                                           int32_t* output_x,
+                                           int32_t* output_y);
+
+typedef struct {
+    const char* symbol;
+    const char* fallback;
+    const char* tooltip;
+    const char* message;
+    const char* placement;
+} HDTitlebarControlContract;
+
+static const HDTitlebarControlContract HDTitlebarControlContracts[] = {
+    {"sidebar.left", "☰", "展开/折叠侧栏",
+     "{\"command\":\"toggle_sidebar\"}", "left"},
+    {"power", "⏻", "电源",
+     "{\"command\":\"key\",\"key\":\"power\"}", "right"},
+    {"speaker.wave.1", "−", "音量减",
+     "{\"command\":\"key\",\"key\":\"volume_down\"}", "right"},
+    {"speaker.wave.3", "+", "音量加",
+     "{\"command\":\"key\",\"key\":\"volume_up\"}", "right"},
+    {"rotate.right", "↻", "旋转",
+     "{\"command\":\"rotate\"}", "right"},
+    {"camera", "▣", "截图",
+     "{\"command\":\"screenshot\"}", "right"},
+    {"rectangle.stack", "▢", "最近任务",
+     "{\"command\":\"key\",\"key\":\"recent\"}", "right"},
+    {"house", "⌂", "主页",
+     "{\"command\":\"key\",\"key\":\"home\"}", "right"},
+    {"chevron.left", "‹", "返回",
+     "{\"command\":\"key\",\"key\":\"back\"}", "right"},
+};
+
+size_t hd_macos_titlebar_control_count(void) {
+    return sizeof(HDTitlebarControlContracts) / sizeof(HDTitlebarControlContracts[0]);
+}
+
+const char* hd_macos_titlebar_control_symbol(size_t index) {
+    return index < hd_macos_titlebar_control_count()
+        ? HDTitlebarControlContracts[index].symbol : NULL;
+}
+
+const char* hd_macos_titlebar_control_tooltip(size_t index) {
+    return index < hd_macos_titlebar_control_count()
+        ? HDTitlebarControlContracts[index].tooltip : NULL;
+}
+
+const char* hd_macos_titlebar_control_message(size_t index) {
+    return index < hd_macos_titlebar_control_count()
+        ? HDTitlebarControlContracts[index].message : NULL;
+}
+
+const char* hd_macos_titlebar_control_placement(size_t index) {
+    return index < hd_macos_titlebar_control_count()
+        ? HDTitlebarControlContracts[index].placement : NULL;
+}
+
 static bool hd_read_full(int fd, void* buffer, size_t length) {
     uint8_t* cursor = buffer;
     while (length != 0) {
@@ -168,36 +229,17 @@ static bool hd_read_full(int fd, void* buffer, size_t length) {
     double x = point.x - renderX;
     double y = point.y - renderY;
     double normalizedX = MAX(0.0, MIN(1.0, x / width));
-    // HDNativeDisplayView is flipped, so y already grows down from the upper-left.
-    // Keep the complementary value used by the established 90/270-degree mappings;
-    // the unrotated paths convert it back below.
-    double normalizedY = MAX(0.0, MIN(1.0, 1.0 - (y / height)));
-    double rawX = normalizedX;
-    // HDNativeDisplayView is flipped, so convertPoint already reports Y from
-    // the upper-left. Undo the legacy AppKit normalization for unrotated input.
-    double rawY = 1.0 - normalizedY;
-    switch (self.displayRotation & 3) {
-        case 1:
-            rawX = normalizedY;
-            rawY = normalizedX;
-            break;
-        case 2:
-            rawX = 1.0 - normalizedX;
-            rawY = normalizedY;
-            break;
-        case 3:
-            rawX = 1.0 - normalizedY;
-            rawY = 1.0 - normalizedX;
-            break;
-        default:
-            break;
-    }
+    // HDNativeDisplayView is flipped, so normalized Y grows down from the upper-left.
+    double normalizedY = MAX(0.0, MIN(1.0, y / height));
+    int32_t guestX = 0;
+    int32_t guestY = 0;
+    hd_macos_map_pointer_contract(normalizedX, normalizedY,
+                                  self.displayRotation, guestWidth, guestHeight,
+                                  &guestX, &guestY);
     HDInputEvent input = {
         .kind = kind,
-        .x = (int32_t)MAX(0.0, MIN((double)guestWidth - 1.0,
-                                   rawX * guestWidth)),
-        .y = (int32_t)MAX(0.0, MIN((double)guestHeight - 1.0,
-                                   rawY * guestHeight)),
+        .x = guestX,
+        .y = guestY,
     };
     [self sendInput:input];
 }
@@ -271,6 +313,17 @@ static NSButton* hd_titlebar_button(NSString* symbol,
     [button.widthAnchor constraintEqualToConstant:28.0].active = YES;
     [button.heightAnchor constraintEqualToConstant:28.0].active = YES;
     return button;
+}
+
+static NSButton* hd_titlebar_contract_button(size_t index,
+                                             HDTitlebarControls* target) {
+    const HDTitlebarControlContract* control = &HDTitlebarControlContracts[index];
+    return hd_titlebar_button(
+        [NSString stringWithUTF8String:control->symbol],
+        [NSString stringWithUTF8String:control->fallback],
+        [NSString stringWithUTF8String:control->tooltip],
+        [NSString stringWithUTF8String:control->message],
+        target);
 }
 
 static NSView* hd_titlebar_separator(void) {
@@ -706,9 +759,7 @@ bool hd_macos_install_titlebar_controls(void* parent_view,
     leftStack.alignment = NSLayoutAttributeCenterY;
     leftStack.spacing = 5.0;
     leftStack.edgeInsets = NSEdgeInsetsMake(0, 6, 0, 6);
-    [leftStack addArrangedSubview:
-        hd_titlebar_button(@"sidebar.left", @"☰", @"展开/折叠侧栏",
-                           @"{\"command\":\"toggle_sidebar\"}", target)];
+    [leftStack addArrangedSubview:hd_titlebar_contract_button(0, target)];
 
     NSView* leftContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 48, 32)];
     leftStack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -734,27 +785,11 @@ bool hd_macos_install_titlebar_controls(void* parent_view,
     rightStack.spacing = 5.0;
     rightStack.edgeInsets = NSEdgeInsetsMake(0, 6, 0, 6);
 
-    NSArray<NSView*>* rightControls = @[
-        hd_titlebar_button(@"power", @"⏻", @"电源",
-                           @"{\"command\":\"key\",\"key\":\"power\"}", target),
-        hd_titlebar_button(@"speaker.wave.1", @"−", @"音量减",
-                           @"{\"command\":\"key\",\"key\":\"volume_down\"}", target),
-        hd_titlebar_button(@"speaker.wave.3", @"+", @"音量加",
-                           @"{\"command\":\"key\",\"key\":\"volume_up\"}", target),
-        hd_titlebar_button(@"rotate.right", @"↻", @"旋转",
-                           @"{\"command\":\"rotate\"}", target),
-        hd_titlebar_button(@"camera", @"▣", @"截图",
-                           @"{\"command\":\"screenshot\"}", target),
-        hd_titlebar_separator(),
-        hd_titlebar_button(@"rectangle.stack", @"▢", @"最近任务",
-                           @"{\"command\":\"key\",\"key\":\"recent\"}", target),
-        hd_titlebar_button(@"house", @"⌂", @"主页",
-                           @"{\"command\":\"key\",\"key\":\"home\"}", target),
-        hd_titlebar_button(@"chevron.left", @"‹", @"返回",
-                           @"{\"command\":\"key\",\"key\":\"back\"}", target),
-    ];
-    for (NSView* control in rightControls) {
-        [rightStack addArrangedSubview:control];
+    for (size_t index = 1; index < hd_macos_titlebar_control_count(); index++) {
+        if (index == 6) {
+            [rightStack addArrangedSubview:hd_titlebar_separator()];
+        }
+        [rightStack addArrangedSubview:hd_titlebar_contract_button(index, target)];
     }
 
     NSView* rightContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 284, 32)];

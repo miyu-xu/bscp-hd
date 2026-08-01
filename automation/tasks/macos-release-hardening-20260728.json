@@ -1,0 +1,115 @@
+{
+  "schema_version": 2,
+  "task_id": "macos-release-hardening-20260728",
+  "objective": "冻结当前 macOS Android 15 可运行基线，补齐设备能力、原生窗口/UI 交互、日志与磁盘治理，并以最新代码重跑发布门禁。",
+  "status": "in_progress",
+  "scope": {
+    "repositories": [
+      "hd",
+      "external/crosvm",
+      "hardware/google/gfxstream",
+      "frameworks/native",
+      "bscp-root",
+      ".repo/manifests"
+    ],
+    "owned_paths": [
+      "hd/",
+      "external/crosvm/",
+      "hardware/google/gfxstream/",
+      "frameworks/native/",
+      ".repo/manifests/"
+    ],
+    "excluded_paths": [
+      "Windows 本地仓库",
+      "用户既有未提交且与 macOS Android 15 交付无关的改动",
+      "当前运行实例的数据盘和日志"
+    ]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "preserve_user_changes",
+    "do_not_push",
+    "do_not_interrupt_current_guest_without_need",
+    "zero_copy_or_block",
+    "production_paths_are_real_or_blocked"
+  ],
+  "acceptance": [
+    {
+      "id": "MAC-FREEZE-001",
+      "criterion": "交付所需源码均形成可审计本地提交，并生成记录各仓库固定提交 SHA 的清单。",
+      "evidence": [
+        "artifact:macos-source-lock.json",
+        "artifact:pinned-manifest.xml"
+      ]
+    },
+    {
+      "id": "MAC-DEVICE-002",
+      "criterion": "macOS 设备能力、UI 可操作状态和 Worker action 后端逐项一致；不能控制的设备返回明确 unsupported，不伪装成功。",
+      "evidence": [
+        "gate:device-profile-conformance",
+        "event:worker.device.action.unsupported",
+        "artifact:device-capabilities.json"
+      ]
+    },
+    {
+      "id": "MAC-UI-003",
+      "criterion": "原生标题栏、侧边栏、窗口缩放、旋转、显示区域、鼠标映射及所有按钮具备自动交互矩阵和稳定结果。",
+      "evidence": [
+        "gate:macos-ui-interaction",
+        "artifact:macos-ui-interaction.json"
+      ]
+    },
+    {
+      "id": "MAC-STORAGE-004",
+      "criterion": "运行日志有有界轮转，已完成 run 有保留策略，启动前有磁盘低水位阻断；当前运行 run 永不被清理。",
+      "evidence": [
+        "gate:runtime-storage-smoke",
+        "event:runtime.log.rotated",
+        "event:runtime.run.pruned",
+        "event:runtime.disk.low_watermark"
+      ]
+    },
+    {
+      "id": "MAC-GATES-005",
+      "criterion": "最新固定基线通过 HD 质量、真实 Android 15、严格零拷贝、设备和 UI 门禁；不满足项明确 blocked。",
+      "evidence": [
+        "gate:hd-quality",
+        "gate:macos-real-guest",
+        "gate:macos-zero-copy",
+        "gate:device-profile-conformance",
+        "gate:macos-ui-interaction"
+      ]
+    }
+  ],
+  "required_gates": [
+    "hd-quality",
+    "runtime-storage-smoke",
+    "macos-real-guest",
+    "macos-zero-copy",
+    "device-profile-conformance",
+    "macos-ui-interaction"
+  ],
+  "evidence_state": {
+    "code_present": false,
+    "tests_authored": false,
+    "contract_smoke_verified": false,
+    "real_guest_verified": false
+  },
+  "direction_decisions": [
+    {
+      "id": "D-MAC-CURRENT-GUEST",
+      "decision": "实现和静态门禁期间保持当前有画面的 Android 15 实例运行，仅在部署最新二进制进行真实门禁时安排一次受控重启。",
+      "owner": "human",
+      "rationale": "避免破坏当前已恢复的稳定画面，同时保留最终验证真实性。"
+    },
+    {
+      "id": "D-MAC-NO-FALLBACK",
+      "decision": "macOS 显示只接受新 gfxstream 严格零拷贝路径，不使用 SwiftShader、readback 或软件 blit。",
+      "owner": "human",
+      "rationale": "用户明确要求零拷贝和新 gfxstream。"
+    }
+  ],
+  "blockers": [],
+  "human_decisions_needed": [],
+  "next_iteration": "完成设备能力修正、UI 交互 gate、存储治理和源码冻结后，部署最新 macOS 二进制并重跑全部必过门禁。"
+}
