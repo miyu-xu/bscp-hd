@@ -175,6 +175,12 @@ mod macos {
                 && !SHELL_SOURCE.contains("if restart {\n            self.release_display();"),
             "settings restart must preserve the Player-owned native display session"
         );
+        ensure!(
+            SHELL_SOURCE.contains("set_macos_titlebar_fps")
+                && SHELL_SOURCE.contains("record.spec.display.show_host_fps")
+                && SHELL_SOURCE.contains("record.host_fps_milli"),
+            "Host FPS setting must drive the native titlebar indicator"
+        );
 
         let evidence = json!({
             "schema_version": 1,
@@ -190,6 +196,7 @@ mod macos {
             },
             "pointer_matrix": pointer_results,
             "native_titlebar": controls,
+            "native_titlebar_fps": true,
             "web_contract_count": required_web_contracts.len(),
         });
         let bytes = serde_json::to_vec_pretty(&evidence)?;

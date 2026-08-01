@@ -45,6 +45,7 @@ typedef struct {
 
 typedef void (*HDTitlebarCallback)(void* context, const char* message);
 static char HDTitlebarButtonMessageKey;
+static char HDTitlebarFpsLabelKey;
 
 extern void hd_macos_map_pointer_contract(double normalized_x,
                                            double normalized_y,
@@ -781,11 +782,22 @@ bool hd_macos_install_titlebar_controls(void* parent_view,
     // Keep the accessory at its intrinsic width. A fixed 400pt container forces
     // AppKit to squeeze or wrap titlebar accessories in a portrait emulator
     // window even though the controls themselves need less than 280pt.
-    NSStackView* rightStack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 311, 32)];
+    NSStackView* rightStack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 351, 32)];
     rightStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     rightStack.alignment = NSLayoutAttributeCenterY;
-    rightStack.spacing = 5.0;
-    rightStack.edgeInsets = NSEdgeInsetsMake(0, 6, 0, 6);
+    rightStack.spacing = 4.0;
+    rightStack.edgeInsets = NSEdgeInsetsMake(0, 4, 0, 4);
+
+    NSTextField* fpsLabel = [NSTextField labelWithString:@"— FPS"];
+    fpsLabel.font = [NSFont monospacedDigitSystemFontOfSize:10.5
+                                                    weight:NSFontWeightMedium];
+    fpsLabel.textColor = NSColor.secondaryLabelColor;
+    fpsLabel.alignment = NSTextAlignmentRight;
+    fpsLabel.toolTip = @"Android 实时渲染帧率";
+    fpsLabel.hidden = YES;
+    fpsLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [fpsLabel.widthAnchor constraintEqualToConstant:50.0].active = YES;
+    [rightStack addArrangedSubview:fpsLabel];
 
     for (size_t index = 1; index < hd_macos_titlebar_control_count(); index++) {
         if (index == 7) {
@@ -794,7 +806,7 @@ bool hd_macos_install_titlebar_controls(void* parent_view,
         [rightStack addArrangedSubview:hd_titlebar_contract_button(index, target)];
     }
 
-    NSView* rightContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 317, 32)];
+    NSView* rightContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 357, 32)];
     rightStack.translatesAutoresizingMaskIntoConstraints = NO;
     [rightContainer addSubview:rightStack];
     [NSLayoutConstraint activateConstraints:@[
@@ -822,5 +834,32 @@ bool hd_macos_install_titlebar_controls(void* parent_view,
     objc_setAssociatedObject(window, "HDTitlebarControlsControllers",
                              @[leftController, rightController],
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(window, &HDTitlebarFpsLabelKey, fpsLabel,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return true;
+}
+
+bool hd_macos_set_titlebar_fps(void* parent_view,
+                               bool visible,
+                               uint32_t fps_milli) {
+    if (parent_view == NULL || ![NSThread isMainThread]) {
+        return false;
+    }
+    NSView* parent = (__bridge NSView*)parent_view;
+    NSWindow* window = parent.window;
+    if (window == nil) {
+        return false;
+    }
+    id value = objc_getAssociatedObject(window, &HDTitlebarFpsLabelKey);
+    if (![value isKindOfClass:[NSTextField class]]) {
+        return false;
+    }
+    NSTextField* label = (NSTextField*)value;
+    label.hidden = !visible;
+    if (visible) {
+        label.stringValue = fps_milli == 0
+            ? @"— FPS"
+            : [NSString stringWithFormat:@"%.1f FPS", (double)fps_milli / 1000.0];
+    }
     return true;
 }

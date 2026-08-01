@@ -25,6 +25,8 @@ pub use native_display_host::center_macos_traffic_lights;
 #[cfg(target_os = "macos")]
 pub use native_display_host::install_macos_titlebar_controls;
 #[cfg(target_os = "macos")]
+pub use native_display_host::set_macos_titlebar_fps;
+#[cfg(target_os = "macos")]
 pub use native_display_host::set_macos_window_content_aspect_ratio;
 #[cfg(target_os = "macos")]
 pub use native_display_host::{

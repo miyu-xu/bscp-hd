@@ -998,6 +998,20 @@ impl WorkerService {
             self.transition(ObservedStateV2::LaunchingGuest, None)
                 .await?;
             let mut process_environment = launch.environment.clone();
+            #[cfg(target_os = "macos")]
+            {
+                process_environment.insert(
+                    "HD_FRAME_METRICS_PATH".to_owned(),
+                    run_dir
+                        .join("frame-metrics-v2.json")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                process_environment.insert(
+                    "HD_FRAME_GENERATION".to_owned(),
+                    frame_generation.to_string(),
+                );
+            }
             if let Some(display) = &initial_display {
                 inject_initial_display_environment(&mut process_environment, display);
             }

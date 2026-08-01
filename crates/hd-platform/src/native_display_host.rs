@@ -369,6 +369,11 @@ mod macos {
             context: *mut c_void,
             callback: MacTitlebarCallback,
         ) -> bool;
+        fn hd_macos_set_titlebar_fps(
+            parent_view: *mut c_void,
+            visible: bool,
+            fps_milli: u32,
+        ) -> bool;
         fn hd_macos_titlebar_control_count() -> usize;
         fn hd_macos_titlebar_control_symbol(index: usize) -> *const c_char;
         fn hd_macos_titlebar_control_tooltip(index: usize) -> *const c_char;
@@ -568,6 +573,28 @@ mod macos {
         }
     }
 
+    pub(super) fn set_titlebar_fps(
+        parent: RawWindowHandle,
+        visible: bool,
+        fps_milli: u32,
+    ) -> Result<(), PlatformError> {
+        let RawWindowHandle::AppKit(handle) = parent else {
+            return Err(PlatformError::Unsupported(
+                "macOS titlebar FPS requires an AppKit parent view",
+            ));
+        };
+        // SAFETY: winit owns the NSView and this function is called from the AppKit UI thread.
+        let succeeded =
+            unsafe { hd_macos_set_titlebar_fps(handle.ns_view.as_ptr(), visible, fps_milli) };
+        if succeeded {
+            Ok(())
+        } else {
+            Err(PlatformError::Process(
+                "update macOS titlebar FPS failed".to_owned(),
+            ))
+        }
+    }
+
     pub(super) fn titlebar_control_contracts()
     -> Result<Vec<super::MacTitlebarControlContract>, PlatformError> {
         // SAFETY: the Objective-C bridge returns process-lifetime static UTF-8 strings.
@@ -663,6 +690,15 @@ pub fn install_macos_titlebar_controls(
     callback: MacTitlebarCallback,
 ) -> Result<(), PlatformError> {
     macos::install_titlebar_controls(parent, context, callback)
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_macos_titlebar_fps(
+    parent: RawWindowHandle,
+    visible: bool,
+    fps_milli: u32,
+) -> Result<(), PlatformError> {
+    macos::set_titlebar_fps(parent, visible, fps_milli)
 }
 
 #[cfg(target_os = "macos")]

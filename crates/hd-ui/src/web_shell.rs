@@ -21,7 +21,9 @@ use hd_platform::{
     current_process_identity,
 };
 #[cfg(target_os = "macos")]
-use hd_platform::{install_macos_titlebar_controls, set_macos_window_content_aspect_ratio};
+use hd_platform::{
+    install_macos_titlebar_controls, set_macos_titlebar_fps, set_macos_window_content_aspect_ratio,
+};
 use hd_runtime::HostClientV2;
 use hd_ui::ui_contract::{Page, SurfaceLayout, oriented_guest_dimensions};
 use raw_window_handle::HasWindowHandle as _;
@@ -192,6 +194,8 @@ struct ShellState {
     window_aspect: Option<(u32, u32)>,
     android_focused: bool,
     sidebar_visible: bool,
+    #[cfg(target_os = "macos")]
+    last_titlebar_fps: Option<(bool, u32)>,
     page: Page,
     apk_path: Option<PathBuf>,
     include_guest_logs: bool,
@@ -305,6 +309,8 @@ pub(crate) fn run() -> Result<()> {
         window_aspect: None,
         android_focused: false,
         sidebar_visible: false,
+        #[cfg(target_os = "macos")]
+        last_titlebar_fps: None,
         page: Page::Player,
         apk_path: None,
         include_guest_logs: true,
@@ -354,6 +360,7 @@ pub(crate) fn run() -> Result<()> {
                 match event {
                     UserEvent::Tick => {
                         shell.poll();
+                        shell.sync_titlebar_fps(&window);
                         shell.flush_web_state(&webviews);
                         return;
                     }
@@ -859,6 +866,39 @@ impl ShellState {
         webviews.broadcast(&json!({ "type": "busy", "payload": self.command_in_flight }));
         webviews.broadcast(&json!({ "type": "notice", "payload": self.status }));
         self.ui_dirty = false;
+    }
+
+    fn sync_titlebar_fps(&mut self, window: &Window) {
+        #[cfg(target_os = "macos")]
+        {
+            let visible = self
+                .selected
+                .as_ref()
+                .is_some_and(|record| record.spec.display.show_host_fps);
+            let fps_milli = self
+                .selected
+                .as_ref()
+                .and_then(|record| record.host_fps_milli)
+                .unwrap_or(0);
+            let state = (visible, fps_milli);
+            if self.last_titlebar_fps == Some(state) {
+                return;
+            }
+            let result = window
+                .window_handle()
+                .map_err(|error| error.to_string())
+                .and_then(|handle| {
+                    set_macos_titlebar_fps(handle.as_raw(), visible, fps_milli)
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = result {
+                warn!(%error, "update macOS titlebar FPS failed");
+                return;
+            }
+            self.last_titlebar_fps = Some(state);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = window;
     }
 
     fn poll(&mut self) {
