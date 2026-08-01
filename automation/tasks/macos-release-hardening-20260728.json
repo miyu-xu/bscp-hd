@@ -112,9 +112,9 @@
   "blockers": [
     {
       "id": "MAC-ZERO-COPY-TELEMETRY",
-      "description": "原生 CA remote-layer、Metal gfxstream 启动参数以及零 CPU readback/software blit 已验证，但直通路径当前未上报 produced/imported/presented 正向帧计数，严格发布门禁仍缺少正向遥测证据。",
+      "description": "gfxstream 在真实 eglSwapBuffers 成功点发布 produced/imported/presented、FPS、CPU readback 和 software blit 指标；真实 Android 15 已验证正向帧计数且两个软件回退指标为零。",
       "scope": "current_task",
-      "state": "open"
+      "state": "resolved"
     },
     {
       "id": "MAC-UI-PHYSICAL-POINTER",
@@ -124,5 +124,5 @@
     }
   ],
   "human_decisions_needed": [],
-  "next_iteration": "为原生直通显示补充正向帧生命周期遥测，并在具备 GUI 自动化权限的本机会话执行物理点击矩阵；其余冻结、设备、UI 合同、存储和真实 Android 15 门禁已完成。"
+  "next_iteration": "在具备 GUI 自动化权限的本机会话执行物理点击矩阵；源码冻结、设备、UI 合同、存储、真实 Android 15 和严格零拷贝遥测门禁已完成。"
 }
