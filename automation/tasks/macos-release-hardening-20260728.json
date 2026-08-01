@@ -111,12 +111,16 @@
   ],
   "blockers": [
     {
-      "gate": "macos-zero-copy",
-      "reason": "原生 CA remote-layer、Metal gfxstream 启动参数以及零 CPU readback/software blit 已验证，但直通路径当前未上报 produced/imported/presented 正向帧计数，严格发布门禁仍缺少正向遥测证据。"
+      "id": "MAC-ZERO-COPY-TELEMETRY",
+      "description": "原生 CA remote-layer、Metal gfxstream 启动参数以及零 CPU readback/software blit 已验证，但直通路径当前未上报 produced/imported/presented 正向帧计数，严格发布门禁仍缺少正向遥测证据。",
+      "scope": "current_task",
+      "state": "open"
     },
     {
-      "gate": "macos-ui-physical-pointer",
-      "reason": "共享坐标映射和四旋转交互矩阵已通过；SSH 会话注入的全局 CGEvent 未进入前台 GUI 会话，自动化尚不能替代本机物理点击取证。"
+      "id": "MAC-UI-PHYSICAL-POINTER",
+      "description": "共享坐标映射和四旋转交互矩阵已通过；SSH 会话注入的全局 CGEvent 未进入前台 GUI 会话，自动化尚不能替代本机物理点击取证。",
+      "scope": "external",
+      "state": "open"
     }
   ],
   "human_decisions_needed": [],
