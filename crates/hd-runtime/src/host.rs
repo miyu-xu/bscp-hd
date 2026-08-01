@@ -2302,6 +2302,9 @@ impl HostError {
     }
 
     pub fn api_error(&self) -> ApiErrorV2 {
+        if let Self::WorkerRejected(error) = self {
+            return error.clone();
+        }
         ApiErrorV2::new(self.code(), self.to_string()).retryable(matches!(
             self,
             Self::Busy(_)
@@ -2309,5 +2312,20 @@ impl HostError {
                 | Self::WorkerShutdownTimeout(_)
                 | Self::Ipc(_)
         ))
+    }
+}
+
+#[cfg(test)]
+mod host_error_tests {
+    use super::*;
+
+    #[test]
+    fn worker_rejection_preserves_the_typed_api_error() {
+        let expected = ApiErrorV2::new(
+            "device_action_unsupported",
+            "the selected host cannot perform this device action",
+        );
+        let actual = HostError::WorkerRejected(expected.clone()).api_error();
+        assert_eq!(actual, expected);
     }
 }
