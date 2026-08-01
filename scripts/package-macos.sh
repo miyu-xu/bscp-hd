@@ -208,9 +208,6 @@ mv "$APP" "$OUTPUT"
 trap - EXIT HUP INT TERM
 cleanup
 
-CHECKSUMS="$OUTPUT_PARENT/$(basename -- "$OUTPUT").sha256"
-find "$OUTPUT" -type f -exec shasum -a 256 {} + | sort -k 2 > "$CHECKSUMS"
-
 if [ -n "$NOTARY_PROFILE" ]; then
   ARCHIVE="$OUTPUT_PARENT/HD-macos-arm64-notarization.zip"
   ditto -c -k --keepParent "$OUTPUT" "$ARCHIVE"
@@ -219,6 +216,9 @@ if [ -n "$NOTARY_PROFILE" ]; then
   spctl --assess --type execute --verbose=4 "$OUTPUT"
   codesign --verify --deep --strict --verbose=2 "$OUTPUT"
 fi
+
+CHECKSUMS="$OUTPUT_PARENT/$(basename -- "$OUTPUT").sha256"
+find "$OUTPUT" -type f -exec shasum -a 256 {} + | sort -k 2 > "$CHECKSUMS"
 
 echo "app=$OUTPUT"
 echo "checksums=$CHECKSUMS"
