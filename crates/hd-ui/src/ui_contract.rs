@@ -30,6 +30,14 @@ pub struct SurfaceLayout {
     pub android_focused: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AspectFitRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 impl SurfaceLayout {
     pub fn from_window(
         size: PhysicalSize<u32>,
@@ -85,6 +93,47 @@ impl SurfaceLayout {
     /// Android always occupies the full content. The sidebar overlays it and never resizes it.
     pub const fn android_bounds(self) -> (u32, u32, u32, u32) {
         (0, 0, self.width, self.height)
+    }
+}
+
+/// Centers content inside an available rectangle without changing its aspect ratio.
+///
+/// The returned dimensions are integral physical pixels, so one axis may differ from
+/// the mathematical result by less than one pixel.
+pub fn aspect_fit_rect(
+    available_width: u32,
+    available_height: u32,
+    content_width: u32,
+    content_height: u32,
+) -> AspectFitRect {
+    let available_width = available_width.max(1);
+    let available_height = available_height.max(1);
+    let content_width = content_width.max(1);
+    let content_height = content_height.max(1);
+    let available_width_64 = u64::from(available_width);
+    let available_height_64 = u64::from(available_height);
+    let content_width_64 = u64::from(content_width);
+    let content_height_64 = u64::from(content_height);
+
+    let (width, height) =
+        if available_width_64 * content_height_64 <= available_height_64 * content_width_64 {
+            let height = (available_width_64 * content_height_64 / content_width_64)
+                .max(1)
+                .min(available_height_64);
+            (available_width_64, height)
+        } else {
+            let width = (available_height_64 * content_width_64 / content_height_64)
+                .max(1)
+                .min(available_width_64);
+            (width, available_height_64)
+        };
+    let width = u32::try_from(width).unwrap_or(available_width);
+    let height = u32::try_from(height).unwrap_or(available_height);
+    AspectFitRect {
+        x: available_width.saturating_sub(width) / 2,
+        y: available_height.saturating_sub(height) / 2,
+        width,
+        height,
     }
 }
 

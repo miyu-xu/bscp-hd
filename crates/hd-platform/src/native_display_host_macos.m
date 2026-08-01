@@ -46,6 +46,7 @@ typedef struct {
 typedef void (*HDTitlebarCallback)(void* context, const char* message);
 static char HDTitlebarButtonMessageKey;
 static char HDTitlebarFpsLabelKey;
+static char HDTitlebarExpansionObserversKey;
 
 extern void hd_macos_map_pointer_contract(double normalized_x,
                                            double normalized_y,
@@ -372,6 +373,8 @@ static NSView* hd_titlebar_separator(void) {
     self.lockFD = -1;
     self.listenFD = -1;
     self.clientFD = -1;
+    parent.wantsLayer = YES;
+    parent.layer.backgroundColor = NSColor.blackColor.CGColor;
 
     HDNativeDisplayView* view =
         [[HDNativeDisplayView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1)];
@@ -532,40 +535,44 @@ static NSView* hd_titlebar_separator(void) {
     BOOL swapsAxes = (rotation & 1) != 0;
     CGFloat orientedWidth = swapsAxes ? guestHeight : guestWidth;
     CGFloat orientedHeight = swapsAxes ? guestWidth : guestHeight;
-    CGFloat scaleX = viewWidth / orientedWidth;
-    CGFloat scaleY = viewHeight / orientedHeight;
+    CGFloat renderScale = MIN(viewWidth / orientedWidth, viewHeight / orientedHeight);
+    CGFloat renderWidth = orientedWidth * renderScale;
+    CGFloat renderHeight = orientedHeight * renderScale;
+    CGFloat renderX = (viewWidth - renderWidth) / 2.0;
+    CGFloat renderY = (viewHeight - renderHeight) / 2.0;
     CGAffineTransform transform;
     switch (rotation) {
         case 1:
-            transform = CGAffineTransformMake(0.0, -scaleY, scaleX, 0.0, 0.0, 0.0);
+            transform =
+                CGAffineTransformMake(0.0, -renderScale, renderScale, 0.0, 0.0, 0.0);
             break;
         case 2:
-            transform = CGAffineTransformMake(-scaleX, 0.0, 0.0, -scaleY, 0.0, 0.0);
+            transform =
+                CGAffineTransformMake(-renderScale, 0.0, 0.0, -renderScale, 0.0, 0.0);
             break;
         case 3:
-            transform = CGAffineTransformMake(0.0, scaleY, -scaleX, 0.0, 0.0, 0.0);
+            transform =
+                CGAffineTransformMake(0.0, renderScale, -renderScale, 0.0, 0.0, 0.0);
             break;
         default:
-            transform = CGAffineTransformMakeScale(scaleX, scaleY);
+            transform = CGAffineTransformMakeScale(renderScale, renderScale);
             break;
     }
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     self.containerLayer.frame = bounds;
-    // The Android surface always owns the complete window content area. Window
-    // aspect-ratio constraints keep scaleX and scaleY equal during interactive
-    // resize; using both values also avoids transient black bars while AppKit is
-    // delivering intermediate layout frames. The guest drawable stays unchanged.
+    // Preserve the Android surface aspect ratio even while AppKit is delivering
+    // intermediate resize frames. Any sub-pixel remainder stays black.
     self.layerHost.anchorPoint = CGPointMake(0.5, 0.5);
     self.layerHost.bounds = CGRectMake(0, 0, guestWidth, guestHeight);
     self.layerHost.position = CGPointMake(viewWidth / 2.0, viewHeight / 2.0);
     self.layerHost.affineTransform = transform;
     self.layerHost.contentsScale = self.parentView.window.backingScaleFactor ?: 1.0;
     [CATransaction commit];
-    self.displayView.renderX = 0.0;
-    self.displayView.renderY = 0.0;
-    self.displayView.renderWidth = viewWidth;
-    self.displayView.renderHeight = viewHeight;
+    self.displayView.renderX = renderX;
+    self.displayView.renderY = renderY;
+    self.displayView.renderWidth = renderWidth;
+    self.displayView.renderHeight = renderHeight;
 }
 
 - (void)shutdown {
@@ -829,12 +836,35 @@ bool hd_macos_install_titlebar_controls(void* parent_view,
     [window addTitlebarAccessoryViewController:leftController];
     [window addTitlebarAccessoryViewController:rightController];
 
+    NSNotificationCenter* notifications = NSNotificationCenter.defaultCenter;
+    NSArray* previousObservers =
+        objc_getAssociatedObject(window, &HDTitlebarExpansionObserversKey);
+    for (id observer in previousObservers) {
+        [notifications removeObserver:observer];
+    }
+    id enteredFullScreen =
+        [notifications addObserverForName:NSWindowDidEnterFullScreenNotification
+                                   object:window
+                                    queue:NSOperationQueue.mainQueue
+                               usingBlock:^(__unused NSNotification* notification) {
+        callback(context, "{\"command\":\"window_expansion\",\"expanded\":true}");
+    }];
+    id exitedFullScreen =
+        [notifications addObserverForName:NSWindowDidExitFullScreenNotification
+                                   object:window
+                                    queue:NSOperationQueue.mainQueue
+                               usingBlock:^(__unused NSNotification* notification) {
+        callback(context, "{\"command\":\"window_expansion\",\"expanded\":false}");
+    }];
     objc_setAssociatedObject(window, "HDTitlebarControlsTarget", target,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(window, "HDTitlebarControlsControllers",
                              @[leftController, rightController],
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(window, &HDTitlebarFpsLabelKey, fpsLabel,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(window, &HDTitlebarExpansionObserversKey,
+                             @[enteredFullScreen, exitedFullScreen],
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return true;
 }

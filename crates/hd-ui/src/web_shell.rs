@@ -25,7 +25,7 @@ use hd_platform::{
     install_macos_titlebar_controls, set_macos_titlebar_fps, set_macos_window_content_aspect_ratio,
 };
 use hd_runtime::HostClientV2;
-use hd_ui::ui_contract::{Page, SurfaceLayout, oriented_guest_dimensions};
+use hd_ui::ui_contract::{Page, SurfaceLayout, aspect_fit_rect, oriented_guest_dimensions};
 use raw_window_handle::HasWindowHandle as _;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
@@ -190,8 +190,10 @@ struct ShellState {
     auto_start_selected: bool,
     closing: bool,
     display_maximized: bool,
+    window_expanded: bool,
     sidebar_collapsed: bool,
     window_aspect: Option<(u32, u32)>,
+    last_native_bounds: Option<NativeDisplayBounds>,
     android_focused: bool,
     sidebar_visible: bool,
     #[cfg(target_os = "macos")]
@@ -305,8 +307,10 @@ pub(crate) fn run() -> Result<()> {
         auto_start_selected: true,
         closing: false,
         display_maximized: false,
+        window_expanded: false,
         sidebar_collapsed: true,
         window_aspect: None,
+        last_native_bounds: None,
         android_focused: false,
         sidebar_visible: false,
         #[cfg(target_os = "macos")]
@@ -517,7 +521,17 @@ extern "C" fn native_titlebar_callback(context: *mut c_void, message: *const c_c
             CStr::from_ptr(message).to_string_lossy().into_owned(),
         )
     };
-    let _ = proxy.send_event(UserEvent::Ipc(message));
+    info!(
+        event = "ui.native_titlebar.callback",
+        command = %message,
+        "native titlebar command received"
+    );
+    if proxy.send_event(UserEvent::Ipc(message)).is_err() {
+        warn!(
+            event = "ui.native_titlebar.callback.rejected",
+            "native titlebar command could not enter the UI event loop"
+        );
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -668,6 +682,20 @@ fn handle_ipc(message: &str, window: &Window, shell: &mut ShellState) {
         "focus_display" => {
             let _ = shell.native_display.focus_guest();
         }
+        "window_expansion" => {
+            if let Some(expanded) = value.get("expanded").and_then(Value::as_bool)
+                && shell.window_expanded != expanded
+            {
+                info!(
+                    event = "ui.window.expansion.changed",
+                    previous = shell.window_expanded,
+                    expanded,
+                    "root window expansion state changed"
+                );
+                shell.window_expanded = expanded;
+                shell.ui_dirty = true;
+            }
+        }
         "diagnostics" => {
             shell.include_guest_logs = value
                 .get("include_guest_logs")
@@ -735,6 +763,9 @@ impl ShellState {
         else {
             return;
         };
+        if self.window_expanded {
+            return;
+        }
         let aspect = (guest_width, guest_height);
         if self.window_aspect == Some(aspect) {
             return;
@@ -800,33 +831,75 @@ impl ShellState {
         }
         let available_width = layout.width;
         let available_height = layout.height;
-        let rotation_quarters = self.selected.as_ref().map_or(0, |record| {
-            record.spec.display.orientation.android_rotation()
-        });
+        let (rotation_quarters, guest_dimensions) =
+            self.selected.as_ref().map_or((0, None), |record| {
+                (
+                    record.spec.display.orientation.android_rotation(),
+                    Some(oriented_guest_dimensions(&record.spec.display)),
+                )
+            });
+        let fitted = if self.window_expanded {
+            guest_dimensions.map_or_else(
+                || {
+                    aspect_fit_rect(
+                        available_width,
+                        available_height,
+                        available_width,
+                        available_height,
+                    )
+                },
+                |(guest_width, guest_height)| {
+                    aspect_fit_rect(available_width, available_height, guest_width, guest_height)
+                },
+            )
+        } else {
+            aspect_fit_rect(
+                available_width,
+                available_height,
+                available_width,
+                available_height,
+            )
+        };
         let bounds = NativeDisplayBounds {
-            x_px: 0,
-            y_px: 0,
-            width_px: available_width,
-            height_px: available_height,
+            x_px: i32::try_from(fitted.x).unwrap_or(i32::MAX),
+            y_px: i32::try_from(fitted.y).unwrap_or(i32::MAX),
+            width_px: fitted.width,
+            height_px: fitted.height,
             rotation_quarters,
             visible: true,
         };
+        let layout_changed = self.last_native_bounds != Some(bounds);
         if let Err(error) = self.native_display.set_bounds(bounds) {
             self.notice(format!("原生显示区域定位失败：{error}"));
             return;
         }
+        if layout_changed {
+            info!(
+                event = "ui.display.layout.changed",
+                expanded = self.window_expanded,
+                available_width,
+                available_height,
+                render_x = bounds.x_px,
+                render_y = bounds.y_px,
+                render_width = bounds.width_px,
+                render_height = bounds.height_px,
+                rotation_quarters,
+                "native Android display layout changed"
+            );
+            self.last_native_bounds = Some(bounds);
+        }
         let dpi = physical_dimension(96.0 * scale, 960).clamp(72, 960);
         let changed = self.viewport.as_ref().is_none_or(|viewport| {
-            viewport.width_px != available_width
-                || viewport.height_px != available_height
+            viewport.width_px != fitted.width
+                || viewport.height_px != fitted.height
                 || viewport.dpi != dpi
                 || !viewport.visible
         });
         if changed {
             self.viewport_revision = self.viewport_revision.saturating_add(1);
             self.viewport = Some(DisplayViewportV2 {
-                width_px: available_width,
-                height_px: available_height,
+                width_px: fitted.width,
+                height_px: fitted.height,
                 dpi,
                 visible: true,
                 revision: self.viewport_revision,

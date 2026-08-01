@@ -16,12 +16,14 @@ mod macos {
     use anyhow::{Context as _, Result, ensure};
     use hd_core::{InstanceSpecV2, OrientationV2};
     use hd_platform::{macos_titlebar_control_contracts, map_macos_pointer};
-    use hd_ui::ui_contract::{Page, SurfaceLayout, oriented_guest_dimensions};
+    use hd_ui::ui_contract::{Page, SurfaceLayout, aspect_fit_rect, oriented_guest_dimensions};
     use serde_json::json;
     use winit::dpi::PhysicalSize;
 
     const WEB_SOURCE: &str = include_str!("../../../../web/src/main.tsx");
     const SHELL_SOURCE: &str = include_str!("../web_shell.rs");
+    const MACOS_BRIDGE_SOURCE: &str =
+        include_str!("../../../hd-platform/src/native_display_host_macos.m");
 
     #[allow(clippy::too_many_lines)]
     pub fn run() -> Result<()> {
@@ -60,6 +62,22 @@ mod macos {
         ensure!(
             landscape == (1920, 1080),
             "landscape aspect contract changed"
+        );
+        let portrait_fullscreen = aspect_fit_rect(1680, 1050, portrait.0, portrait.1);
+        let landscape_fullscreen = aspect_fit_rect(1680, 1050, landscape.0, landscape.1);
+        ensure!(
+            portrait_fullscreen.x == 545
+                && portrait_fullscreen.y == 0
+                && portrait_fullscreen.width == 590
+                && portrait_fullscreen.height == 1050,
+            "portrait fullscreen must be centered with side bars: {portrait_fullscreen:?}"
+        );
+        ensure!(
+            landscape_fullscreen.x == 0
+                && landscape_fullscreen.y == 52
+                && landscape_fullscreen.width == 1680
+                && landscape_fullscreen.height == 945,
+            "landscape fullscreen must be centered with top and bottom bars: {landscape_fullscreen:?}"
         );
 
         let pointer_cases = [
@@ -181,6 +199,25 @@ mod macos {
                 && SHELL_SOURCE.contains("record.host_fps_milli"),
             "Host FPS setting must drive the native titlebar indicator"
         );
+        ensure!(
+            SHELL_SOURCE.contains("\"window_expansion\" =>")
+                && SHELL_SOURCE.contains("aspect_fit_rect(")
+                && SHELL_SOURCE.contains("window_expanded"),
+            "fullscreen must use the native expansion event and aspect-fit the Android child"
+        );
+        ensure!(
+            MACOS_BRIDGE_SOURCE.contains("NSWindowDidEnterFullScreenNotification")
+                && MACOS_BRIDGE_SOURCE.contains("NSWindowDidExitFullScreenNotification")
+                && MACOS_BRIDGE_SOURCE.contains("\\\"command\\\":\\\"window_expansion\\\"")
+                && MACOS_BRIDGE_SOURCE.contains("MIN(viewWidth / orientedWidth")
+                && MACOS_BRIDGE_SOURCE.contains("NSColor.blackColor.CGColor"),
+            "macOS bridge must report fullscreen state and render uniformly over black"
+        );
+        ensure!(
+            !SHELL_SOURCE.contains("MaximizeOrientationFinished")
+                && !SHELL_SOURCE.contains("maximize_restore_orientation"),
+            "fullscreen must not rotate Android or maintain a rotation restore state"
+        );
 
         let evidence = json!({
             "schema_version": 1,
@@ -193,10 +230,13 @@ mod macos {
                 "android_bounds": collapsed.android_bounds(),
                 "portrait": portrait,
                 "landscape": landscape,
+                "portrait_fullscreen": portrait_fullscreen,
+                "landscape_fullscreen": landscape_fullscreen,
             },
             "pointer_matrix": pointer_results,
             "native_titlebar": controls,
             "native_titlebar_fps": true,
+            "fullscreen_aspect_fit": true,
             "web_contract_count": required_web_contracts.len(),
         });
         let bytes = serde_json::to_vec_pretty(&evidence)?;
