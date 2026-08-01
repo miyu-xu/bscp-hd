@@ -193,9 +193,11 @@ impl HostService {
             return Err(HostError::InstanceMismatch);
         }
         let current = self.get_instance(id)?;
-        if current.status.observed.is_active() {
+        if current.status.observed.is_active()
+            && active_spec_change_requires_restart(&current.spec, &request.spec)
+        {
             return Err(HostError::Busy(
-                "stop the instance before changing its specification",
+                "stop the instance before changing restart-sensitive specification fields",
             ));
         }
         let record = self
@@ -1954,6 +1956,18 @@ fn should_restart_after_failure(record: &InstanceRecordV2) -> bool {
         && matches!(record.spec.restart_policy, RestartPolicyV2::OnFailure)
 }
 
+fn active_spec_change_requires_restart(
+    current: &hd_core::InstanceSpecV2,
+    next: &hd_core::InstanceSpecV2,
+) -> bool {
+    let mut allowed = current.clone();
+    allowed.name.clone_from(&next.name);
+    allowed.restart_policy = next.restart_policy;
+    allowed.labels.clone_from(&next.labels);
+    allowed.display.show_host_fps = next.display.show_host_fps;
+    allowed != *next
+}
+
 const fn should_wait_for_native_display_session(
     native_display_direct: bool,
     has_live_display_session: bool,
@@ -1963,13 +1977,31 @@ const fn should_wait_for_native_display_session(
 
 #[cfg(test)]
 mod native_display_restart_tests {
-    use super::should_wait_for_native_display_session;
+    use hd_core::InstanceSpecV2;
+
+    use super::{active_spec_change_requires_restart, should_wait_for_native_display_session};
 
     #[test]
     fn macos_zero_copy_restart_waits_for_player_session() {
         assert!(should_wait_for_native_display_session(true, false));
         assert!(!should_wait_for_native_display_session(true, true));
         assert!(!should_wait_for_native_display_session(false, false));
+    }
+
+    #[test]
+    fn active_instance_accepts_host_only_setting_changes() {
+        let current = InstanceSpecV2::default();
+        let mut host_only = current.clone();
+        host_only.name = "Renamed Android".to_owned();
+        host_only.display.show_host_fps = true;
+        host_only
+            .labels
+            .insert("group".to_owned(), "demo".to_owned());
+        assert!(!active_spec_change_requires_restart(&current, &host_only));
+
+        let mut guest_change = host_only;
+        guest_change.memory_mib += 1024;
+        assert!(active_spec_change_requires_restart(&current, &guest_change));
     }
 }
 

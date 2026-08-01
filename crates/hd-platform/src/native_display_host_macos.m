@@ -75,6 +75,8 @@ static const HDTitlebarControlContract HDTitlebarControlContracts[] = {
      "{\"command\":\"rotate\"}", "right"},
     {"camera", "▣", "截图",
      "{\"command\":\"screenshot\"}", "right"},
+    {"shippingbox.and.arrow.backward", "↓", "安装 APK",
+     "{\"command\":\"choose_install_apk\"}", "right"},
     {"rectangle.stack", "▢", "最近任务",
      "{\"command\":\"key\",\"key\":\"recent\"}", "right"},
     {"house", "⌂", "主页",
@@ -779,20 +781,20 @@ bool hd_macos_install_titlebar_controls(void* parent_view,
     // Keep the accessory at its intrinsic width. A fixed 400pt container forces
     // AppKit to squeeze or wrap titlebar accessories in a portrait emulator
     // window even though the controls themselves need less than 280pt.
-    NSStackView* rightStack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 278, 32)];
+    NSStackView* rightStack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 311, 32)];
     rightStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     rightStack.alignment = NSLayoutAttributeCenterY;
     rightStack.spacing = 5.0;
     rightStack.edgeInsets = NSEdgeInsetsMake(0, 6, 0, 6);
 
     for (size_t index = 1; index < hd_macos_titlebar_control_count(); index++) {
-        if (index == 6) {
+        if (index == 7) {
             [rightStack addArrangedSubview:hd_titlebar_separator()];
         }
         [rightStack addArrangedSubview:hd_titlebar_contract_button(index, target)];
     }
 
-    NSView* rightContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 284, 32)];
+    NSView* rightContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 317, 32)];
     rightStack.translatesAutoresizingMaskIntoConstraints = NO;
     [rightContainer addSubview:rightStack];
     [NSLayoutConstraint activateConstraints:@[

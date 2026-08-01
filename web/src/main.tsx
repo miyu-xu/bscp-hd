@@ -43,6 +43,18 @@ function isActive(record: InstanceRecord | null) {
   return Boolean(record && activeStates.has(record.status.observed));
 }
 
+function requiresAndroidRestart(current: InstanceSpec, next: InstanceSpec) {
+  const currentDisplay = { ...current.display, show_host_fps: false };
+  const nextDisplay = { ...next.display, show_host_fps: false };
+  return current.cpu_count !== next.cpu_count
+    || current.memory_mib !== next.memory_mib
+    || JSON.stringify(currentDisplay) !== JSON.stringify(nextDisplay)
+    || JSON.stringify(current.adb) !== JSON.stringify(next.adb)
+    || JSON.stringify(current.artifacts) !== JSON.stringify(next.artifacts)
+    || JSON.stringify(current.boot) !== JSON.stringify(next.boot)
+    || JSON.stringify(current.devices) !== JSON.stringify(next.devices);
+}
+
 function androidActionsReady(record: InstanceRecord | null) {
   return Boolean(record && record.status.observed === 'ready' && record.adb_ready);
 }
@@ -442,11 +454,12 @@ function SettingsPage({
   const dirty = JSON.stringify(draft) !== JSON.stringify(record.spec);
   const active = isActive(record);
   const valid = Object.keys(errors).length === 0;
-  const restartSafe = !active || record.adb_ready;
+  const restartRequired = active && requiresAndroidRestart(record.spec, draft);
+  const restartSafe = !restartRequired || record.adb_ready;
   const canSave = dirty && valid && !busy && restartSafe;
   const save = () => {
     if (!canSave) return;
-    if (active) setConfirmRestart(true);
+    if (restartRequired) setConfirmRestart(true);
     else onSave(draft, false);
   };
   const applyPreset = (index: number) => {
@@ -471,7 +484,7 @@ function SettingsPage({
           title={!restartSafe ? 'ADB 未就绪；为保护实例数据，运行中不能保存并重启' : undefined}
           onClick={save}
         >
-          {busy ? '正在保存…' : active ? '保存并重启' : '保存更改'}
+          {busy ? '正在保存…' : restartRequired ? '保存并重启' : '保存更改'}
         </button>
       </header>
       <div className="settings-body">
@@ -488,12 +501,12 @@ function SettingsPage({
           ))}
         </nav>
         <div className="settings-content">
-          {active && !record.adb_ready && (
+          {restartRequired && !record.adb_ready && (
             <div className="inline-callout warning">
               ADB 控制尚未就绪。为避免强制关机损坏实例数据，运行中不能保存并重启。
             </div>
           )}
-          {dirty && active && record.adb_ready && (
+          {dirty && restartRequired && record.adb_ready && (
             <div className="inline-callout warning">
               当前实例正在运行。保存后 HD 将安全停止并重新启动 Android。
             </div>

@@ -86,8 +86,8 @@ mod macos {
 
         let controls = macos_titlebar_control_contracts()?;
         ensure!(
-            controls.len() == 9,
-            "native titlebar must expose exactly nine HD controls"
+            controls.len() == 10,
+            "native titlebar must expose exactly ten HD controls"
         );
         ensure!(
             controls.first().is_some_and(|control| {
@@ -100,6 +100,12 @@ mod macos {
                 control.placement == "right" && control.message.contains("\"power\"")
             }),
             "power must be the first right-side HD titlebar control"
+        );
+        ensure!(
+            controls.get(6).is_some_and(|control| {
+                control.placement == "right" && control.message.contains("\"choose_install_apk\"")
+            }),
+            "install APK must be directly available from the native titlebar"
         );
         let mut messages = BTreeSet::new();
         for control in &controls {
@@ -125,6 +131,10 @@ mod macos {
             ("cancel_create", "aria-label=\"取消新建\""),
             ("sidebar_blur_close", "post({ command: 'close_sidebar' })"),
             ("install_apk", "'choose_install_apk'"),
+            (
+                "hot_settings_save",
+                "requiresAndroidRestart(record.spec, draft)",
+            ),
             ("rotate", "action('rotate')"),
             ("screenshot", "action('screenshot')"),
             ("diagnostics", "command: 'diagnostics'"),
@@ -160,6 +170,11 @@ mod macos {
                 "missing shell handler {handler}"
             );
         }
+        ensure!(
+            SHELL_SOURCE.contains("let restarting = was_active && restart;")
+                && !SHELL_SOURCE.contains("if restart {\n            self.release_display();"),
+            "settings restart must preserve the Player-owned native display session"
+        );
 
         let evidence = json!({
             "schema_version": 1,

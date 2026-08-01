@@ -1072,21 +1072,14 @@ impl ShellState {
         }
         let id = record.spec.id;
         let was_active = record.status.observed.is_active();
-        if was_active && !restart {
-            self.notice("当前实例正在运行；请使用“保存并重启”应用规格更改".to_owned());
-            return;
-        }
-        if restart {
-            self.release_display();
-            self.last_session_viewport = None;
-        }
+        let restarting = was_active && restart;
         self.command_in_flight = true;
         self.ui_dirty = true;
         let client = self.client.clone();
         let proxy = self.proxy.clone();
         self.runtime.spawn(async move {
             let result = async {
-                if was_active {
+                if restarting {
                     let operation = client
                         .create_operation(
                             id,
@@ -1117,7 +1110,7 @@ impl ShellState {
                     .await
                     .map_err(|error| error.to_string())?;
 
-                if was_active {
+                if restarting {
                     let operation = client
                         .create_operation(
                             id,
@@ -1140,7 +1133,7 @@ impl ShellState {
             .await;
             let _ = proxy.send_event(UserEvent::Saved {
                 result,
-                restarted: was_active,
+                restarted: restarting,
             });
         });
     }
@@ -1153,9 +1146,17 @@ impl ShellState {
                 self.capabilities = None;
                 self.capabilities_for = None;
                 self.request_capabilities();
-                self.last_display_attempt = Instant::now()
-                    .checked_sub(DISPLAY_RETRY)
-                    .unwrap_or_else(Instant::now);
+                if restarted {
+                    // Keep the Player-owned display session alive across the graceful restart.
+                    // The Host passes this session to the replacement crosvm process before
+                    // gfxstream creates its CAMetalLayer. Force an immediate heartbeat so the
+                    // shell observes the new frame generation without exposing crosvm's fallback
+                    // top-level window or leaving the Player black.
+                    self.last_session_viewport = None;
+                    self.last_display_attempt = Instant::now()
+                        .checked_sub(DISPLAY_RETRY)
+                        .unwrap_or_else(Instant::now);
+                }
                 self.notice(if restarted {
                     "设置已保存，Android 已重新启动".to_owned()
                 } else {
