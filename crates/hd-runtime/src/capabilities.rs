@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hd_core::{
@@ -14,6 +15,7 @@ use hd_platform::{
     executable_name, hypervisor_available as native_hypervisor_available,
     platform_baseline as native_platform_baseline, platform_name, resume_managed_process,
 };
+use parking_lot::RwLock as ParkingRwLock;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -31,6 +33,14 @@ pub struct CapabilityDiscovery {
     paths: DataPaths,
     default_crosvm: PathBuf,
     default_adb: PathBuf,
+    verified_bundles: Arc<ParkingRwLock<Vec<VerifiedBundleCacheEntry>>>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedBundleCacheEntry {
+    selection: ArtifactSelectionV2,
+    trust_sha256: String,
+    bundles: ResolvedBundleSetV2,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +60,7 @@ impl CapabilityDiscovery {
             paths,
             default_crosvm,
             default_adb,
+            verified_bundles: Arc::new(ParkingRwLock::new(Vec::new())),
         }
     }
 
@@ -76,6 +87,27 @@ impl CapabilityDiscovery {
 
     #[allow(clippy::too_many_lines)]
     pub async fn discover(&self, spec: Option<&InstanceSpecV2>) -> CapabilityDiscoveryResultV2 {
+        self.discover_inner(spec, false).await
+    }
+
+    /// Reuses only bundle sets that were fully signature- and content-verified earlier in this
+    /// process. Dynamic resource, executable, certification and device probes still run on every
+    /// request. Lifecycle starts use [`Self::discover`] and therefore always hash the selected
+    /// artifacts again before authorizing a VM.
+    #[allow(clippy::too_many_lines)]
+    pub async fn discover_cached(
+        &self,
+        spec: Option<&InstanceSpecV2>,
+    ) -> CapabilityDiscoveryResultV2 {
+        self.discover_inner(spec, true).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn discover_inner(
+        &self,
+        spec: Option<&InstanceSpecV2>,
+        allow_verified_bundle_cache: bool,
+    ) -> CapabilityDiscoveryResultV2 {
         let fast_artifacts = crate::dev::fast_artifacts_enabled();
         let fast_capabilities = crate::dev::fast_capabilities_enabled();
         let dev_display_copy_fallback = crate::dev::allow_display_copy_fallback_enabled();
@@ -87,6 +119,9 @@ impl CapabilityDiscovery {
 
         let trust_path = self.paths.root.join("trusted-keys-v2.json");
         let trust = ArtifactTrustStore::load(&trust_path);
+        let trust_sha256 = std::fs::read(&trust_path)
+            .ok()
+            .map(|bytes| hex::encode(Sha256::digest(bytes)));
         probes.push(match &trust {
             Ok(_) => supported_probe(
                 "artifact.trust",
@@ -118,7 +153,16 @@ impl CapabilityDiscovery {
             (Some(instance), Ok(trust)) => match &instance.artifacts {
                 Some(selection) => {
                     let resolver = ArtifactResolver::new((*trust).clone());
-                    match resolve_bundles(resolver, selection.clone(), fast_artifacts).await {
+                    match resolve_bundles(
+                        resolver,
+                        selection.clone(),
+                        fast_artifacts,
+                        allow_verified_bundle_cache,
+                        trust_sha256.as_deref(),
+                        &self.verified_bundles,
+                    )
+                    .await
+                    {
                         Ok(bundle_set) => {
                             crosvm = bundle_set
                                 .artifacts
@@ -468,8 +512,22 @@ async fn resolve_bundles(
     resolver: ArtifactResolver,
     selection: ArtifactSelectionV2,
     fast_artifacts: bool,
+    allow_verified_cache: bool,
+    trust_sha256: Option<&str>,
+    verified_bundles: &ParkingRwLock<Vec<VerifiedBundleCacheEntry>>,
 ) -> Result<ResolvedBundleSetV2, String> {
-    tokio::task::spawn_blocking(move || {
+    if allow_verified_cache
+        && !fast_artifacts
+        && let Some(trust_sha256) = trust_sha256
+        && let Some(entry) = verified_bundles.read().iter().find(|entry| {
+            entry.selection == selection && entry.trust_sha256.as_str() == trust_sha256
+        })
+    {
+        return Ok(entry.bundles.clone());
+    }
+
+    let cache_key = selection.clone();
+    let bundle_set = tokio::task::spawn_blocking(move || {
         if fast_artifacts {
             resolver.resolve_fast_dev(&selection)
         } else {
@@ -478,7 +536,21 @@ async fn resolve_bundles(
     })
     .await
     .map_err(|error| format!("artifact resolver task failed: {error}"))?
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if !fast_artifacts && let Some(trust_sha256) = trust_sha256 {
+        let mut cache = verified_bundles.write();
+        if let Some(entry) = cache.iter_mut().find(|entry| entry.selection == cache_key) {
+            trust_sha256.clone_into(&mut entry.trust_sha256);
+            entry.bundles = bundle_set.clone();
+        } else {
+            cache.push(VerifiedBundleCacheEntry {
+                selection: cache_key,
+                trust_sha256: trust_sha256.to_owned(),
+                bundles: bundle_set.clone(),
+            });
+        }
+    }
+    Ok(bundle_set)
 }
 
 async fn tool_probe(

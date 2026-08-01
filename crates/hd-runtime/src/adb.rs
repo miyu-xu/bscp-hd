@@ -1328,8 +1328,11 @@ fn interactive_runtime_devices(
     location: &str,
     network: &AndroidNetworkHealth,
 ) -> Vec<AndroidDeviceRuntimeHealth> {
-    let gnss_configured = services.contains("\tlocation:") && location.contains("gps provider:");
-    let gnss_running = gnss_configured && location_provider_enabled(location, "gps");
+    // `dumpsys location` is the authoritative LocationManager view. During Android boot,
+    // `service list` can briefly lag behind an already registered GPS provider and caused the UI
+    // to report GNSS as unsupported even though injection was ready.
+    let gnss_configured = location.contains("gps provider:");
+    let gnss_running = location_provider_enabled(location, "gps");
     let required_sensors = [
         "Accel Sensor",
         "Gyro Sensor",
@@ -1353,7 +1356,11 @@ fn interactive_runtime_devices(
                 controllable: true,
                 verified: gnss_running,
             },
-            "LocationManager gps provider is enabled and typed coordinate injection is available",
+            if gnss_running {
+                "LocationManager gps provider is enabled and typed coordinate injection is available"
+            } else {
+                "LocationManager gps provider has not reached its enabled state"
+            },
         ),
         runtime_device(
             "sensors",

@@ -143,11 +143,22 @@ impl HostService {
         instance_id: Option<Uuid>,
     ) -> Result<HostCapabilitiesV2, HostError> {
         if let Some(instance_id) = instance_id {
+            // Share the lifecycle lock so concurrent UI refreshes collapse into one discovery and
+            // a refresh racing a start reuses the strict result produced by that start.
+            let operation_lock = {
+                let mut locks = self.instance_operations.lock().await;
+                Arc::clone(
+                    locks
+                        .entry(instance_id)
+                        .or_insert_with(|| Arc::new(Mutex::new(()))),
+                )
+            };
+            let _guard = operation_lock.lock().await;
             let record = self
                 .store
                 .get_instance(instance_id)?
                 .ok_or(HostError::InstanceNotFound(instance_id))?;
-            let result = self.discovery.discover(Some(&record.spec)).await;
+            let result = self.discovery.discover_cached(Some(&record.spec)).await;
             let mut capabilities = result.capabilities;
             if record.adb_ready
                 && record.worker.is_some()
