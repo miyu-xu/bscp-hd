@@ -2226,17 +2226,27 @@ async fn worker_process_smoke(worker_executable: &Path) -> Result<Vec<serde_json
         "worker descriptor identity mismatch"
     );
     let ping_id = Uuid::new_v4();
-    let ping = send_worker_request(
-        &endpoint,
-        &WorkerRequestV2 {
-            protocol_version: WORKER_PROTOCOL_VERSION,
-            request_id: ping_id,
-            instance_id,
-            bearer_token: secret.clone(),
-            command: WorkerCommandV2::Ping,
-        },
-    )
-    .await?;
+    let ping_started = Instant::now();
+    let ping = loop {
+        match send_worker_request(
+            &endpoint,
+            &WorkerRequestV2 {
+                protocol_version: WORKER_PROTOCOL_VERSION,
+                request_id: ping_id,
+                instance_id,
+                bearer_token: secret.clone(),
+                command: WorkerCommandV2::Ping,
+            },
+        )
+        .await
+        {
+            Ok(response) => break response,
+            Err(_) if ping_started.elapsed() < Duration::from_secs(10) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     let Some(WorkerPayloadV2::Pong(status)) = ping.payload else {
         bail!("detached worker ping returned an unexpected payload");
     };
