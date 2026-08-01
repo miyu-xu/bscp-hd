@@ -33,6 +33,7 @@ export interface InstanceSummary {
   id: string;
   name: string;
   status: InstanceStatus;
+  adb_ready: boolean;
   frame_generation: number;
   host_fps_milli: number | null;
 }
@@ -41,8 +42,17 @@ export interface InstanceRecord {
   spec: InstanceSpec;
   status: InstanceStatus;
   adb_serial: string | null;
+  adb_ready: boolean;
   frame_generation: number;
   host_fps_milli: number | null;
+}
+
+export interface DeviceCapability {
+  id: string;
+  backend: 'official_component' | 'simulated' | 'software_backed' | 'unsupported';
+  available: boolean;
+  boundary: string;
+  features: string[];
 }
 
 export interface Snapshot {
@@ -50,4 +60,6 @@ export interface Snapshot {
   selected: InstanceRecord | null;
   status: string;
   artifact_hint: string | null;
+  device_capabilities: DeviceCapability[];
+  device_capabilities_loading: boolean;
 }

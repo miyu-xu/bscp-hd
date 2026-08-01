@@ -1,4 +1,5 @@
 #![allow(unsafe_code)]
+#![cfg_attr(not(windows), allow(clippy::unused_async))]
 
 #[cfg(not(windows))]
 use std::collections::BTreeMap;
@@ -6,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use clap::Parser;
+#[cfg(windows)]
 use hd_core::FormalComponentLaunchV2;
 #[cfg(not(windows))]
 use hd_core::FrameTransportKindV2;

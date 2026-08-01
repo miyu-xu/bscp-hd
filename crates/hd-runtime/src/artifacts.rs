@@ -118,17 +118,27 @@ pub fn prepare_direct_dev_artifact_store(
     }
     let guest_root = required_env_path("HD_DEV_GUEST_BUNDLE_ROOT")?;
     let host_root = required_env_path("HD_DEV_HOST_TOOLS_ROOT")?;
+    #[cfg(target_os = "macos")]
+    let gfxstream_backend = macos_dev_gfxstream_backend(&host_root);
     let rootfs = std::env::var_os("HD_DEV_GUEST_ROOTFS")
         .map_or_else(|| guest_root.join("aggregate_android.img"), PathBuf::from);
     let sensor = std::env::var_os("HD_DEV_SENSOR_INJECTOR")
-        .map_or_else(|| host_root.join("hd-sensor-injector"), PathBuf::from);
+        .map(PathBuf::from)
+        .or_else(|| {
+            let path = host_root.join("hd-sensor-injector");
+            path.is_file().then_some(path)
+        });
     let adb = required_env_path("HD_DEV_ADB")?;
+    #[cfg(windows)]
     let aapt2 = required_env_path("HD_DEV_AAPT2")?;
+    #[cfg(target_os = "macos")]
+    let aapt2 = std::env::var_os("HD_DEV_AAPT2").map(PathBuf::from);
+    #[cfg(windows)]
     let adb_root = adb.parent().ok_or_else(|| {
         ArtifactError::Manifest(format!("ADB path has no parent: {}", adb.display()))
     })?;
 
-    let guest_specs = [
+    let mut guest_specs = vec![
         (
             "kernel",
             PathBuf::from("kernel"),
@@ -153,14 +163,17 @@ pub fn prepare_direct_dev_artifact_store(
             guest_root.join("android_fstab.dt"),
             false,
         ),
-        (
+    ];
+    if let Some(sensor) = sensor {
+        guest_specs.push((
             "sensor-injector",
             PathBuf::from("hd-sensor-injector"),
             sensor,
             true,
-        ),
-    ];
-    let host_specs = [
+        ));
+    }
+    #[cfg(windows)]
+    let host_specs = vec![
         ("crosvm", "crosvm.exe", host_root.join("crosvm.exe"), true),
         ("adb", "adb.exe", adb.clone(), true),
         ("aapt2", "aapt2.exe", aapt2, true),
@@ -273,6 +286,71 @@ pub fn prepare_direct_dev_artifact_store(
             false,
         ),
     ];
+    #[cfg(target_os = "macos")]
+    let mut host_specs = vec![
+        ("crosvm", "crosvm", host_root.join("crosvm"), true),
+        ("adb", "adb", adb.clone(), true),
+        (
+            "hd-device-sim",
+            "hd-device-sim",
+            host_root.join("hd-device-sim"),
+            true,
+        ),
+        (
+            "frame-producer",
+            "hd-frame-producer",
+            host_root.join("hd-frame-producer"),
+            true,
+        ),
+        (
+            "adb-bridge",
+            "hd-adb-bridge",
+            host_root.join("hd-adb-bridge"),
+            true,
+        ),
+        (
+            "rootcanal-adapter",
+            "hd-rootcanal-adapter-disabled",
+            host_root.join("hd-rootcanal-adapter-disabled"),
+            true,
+        ),
+        (
+            "casimir-adapter",
+            "hd-casimir-adapter",
+            host_root.join("hd-casimir-adapter"),
+            true,
+        ),
+        (
+            "modem-adapter",
+            "hd-modem-adapter",
+            host_root.join("hd-modem-adapter"),
+            true,
+        ),
+        (
+            "uwb-adapter",
+            "hd-uwb-adapter",
+            host_root.join("hd-uwb-adapter"),
+            true,
+        ),
+        (
+            "gfxstream-backend",
+            "libgfxstream_backend.dylib",
+            gfxstream_backend,
+            false,
+        ),
+        (
+            "crosvm-runtime-audio",
+            "crosvm-runtime-audio-disabled",
+            host_root.join("crosvm-runtime-audio-disabled"),
+            false,
+        ),
+    ];
+    #[cfg(target_os = "macos")]
+    if let Some(aapt2) = aapt2 {
+        host_specs.push(("aapt2", "aapt2", aapt2, true));
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let host_specs = Vec::<(&str, &str, PathBuf, bool)>::new();
     let guest_files = guest_specs
         .into_iter()
         .map(|(role, relative, actual, executable)| {
@@ -360,6 +438,22 @@ fn required_env_path(name: &'static str) -> Result<PathBuf, ArtifactError> {
             "{name} is required for direct development artifacts"
         ))
     })
+}
+
+#[cfg(target_os = "macos")]
+fn default_macos_dev_gfxstream_backend(host_root: &Path) -> PathBuf {
+    host_root
+        .parent()
+        .unwrap_or(host_root)
+        .join("lib/libgfxstream_backend.dylib")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dev_gfxstream_backend(host_root: &Path) -> PathBuf {
+    std::env::var_os("HD_DEV_GFXSTREAM_BACKEND").map_or_else(
+        || default_macos_dev_gfxstream_backend(host_root),
+        PathBuf::from,
+    )
 }
 
 fn dev_artifact_file(
@@ -559,8 +653,20 @@ impl ArtifactResolver {
             guest_files.insert("sensor-injector".to_owned(), PathBuf::from(path));
         }
         let mut host_tools = role_map(&host_file_root, &host)?;
+        #[cfg(target_os = "macos")]
+        {
+            // Development builds stage executables in dist/macos/bin and dylibs in
+            // dist/macos/lib. The manifest stays flat for publishable bundles, so
+            // point the fast-development resolver at the dylib that was actually
+            // validated above instead of accepting a stale copy next to crosvm.
+            let gfxstream_backend = macos_dev_gfxstream_backend(&host_file_root);
+            if gfxstream_backend.is_file() {
+                host_tools.insert("gfxstream-backend".to_owned(), gfxstream_backend);
+            }
+        }
         if let Some(path) = std::env::var_os("HD_DEV_ADB") {
             let path = PathBuf::from(path);
+            #[cfg(windows)]
             if let Some(parent) = path.parent() {
                 host_tools.insert("adb-winapi".to_owned(), parent.join("AdbWinApi.dll"));
                 host_tools.insert("adb-winusb".to_owned(), parent.join("AdbWinUsbApi.dll"));
@@ -572,16 +678,10 @@ impl ArtifactResolver {
         }
         require_dev_files(&guest_files, "guest")?;
         require_dev_files(&host_tools, "host tool")?;
-        for role in [
-            "kernel",
-            "initrd",
-            "rootfs",
-            "android_fstab",
-            "sensor-injector",
-        ] {
+        for role in ["kernel", "initrd", "rootfs", "android_fstab"] {
             require_role(&guest_files, role)?;
         }
-        for role in ["crosvm", "adb", "aapt2", "hd-device-sim", "frame-producer"] {
+        for role in ["crosvm", "adb", "hd-device-sim", "frame-producer"] {
             require_role(&host_tools, role)?;
         }
         require_windows_runtime_roles(&host_tools)?;
@@ -594,21 +694,21 @@ impl ArtifactResolver {
         ] {
             require_role(&host_tools, role)?;
         }
-        require_executable_roles(
-            &host,
-            &[
-                "crosvm",
-                "adb",
-                "aapt2",
-                "hd-device-sim",
-                "frame-producer",
-                "adb-bridge",
-                "rootcanal-adapter",
-                "casimir-adapter",
-                "modem-adapter",
-                "uwb-adapter",
-            ],
-        )?;
+        let mut executable_roles = vec![
+            "crosvm",
+            "adb",
+            "hd-device-sim",
+            "frame-producer",
+            "adb-bridge",
+            "rootcanal-adapter",
+            "casimir-adapter",
+            "modem-adapter",
+            "uwb-adapter",
+        ];
+        if host_tools.contains_key("aapt2") {
+            executable_roles.push("aapt2");
+        }
+        require_executable_roles(&host, &executable_roles)?;
         require_capabilities(
             &guest,
             &[
@@ -643,7 +743,10 @@ impl ArtifactResolver {
                 initrd: guest_files["initrd"].clone(),
                 rootfs: guest_files["rootfs"].clone(),
                 android_fstab: guest_files["android_fstab"].clone(),
-                sensor_injector: guest_files["sensor-injector"].clone(),
+                sensor_injector: guest_files
+                    .get("sensor-injector")
+                    .cloned()
+                    .unwrap_or_default(),
                 system_image: guest_files.get("system_image").cloned(),
                 vendor_image: guest_files.get("vendor_image").cloned(),
                 host_tools,
@@ -1157,4 +1260,18 @@ pub enum ArtifactError {
     },
     #[error(transparent)]
     Platform(#[from] hd_platform::PlatformError),
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::default_macos_dev_gfxstream_backend;
+    use std::path::Path;
+
+    #[test]
+    fn macos_fast_dev_gfxstream_defaults_to_the_sibling_lib_directory() {
+        assert_eq!(
+            default_macos_dev_gfxstream_backend(Path::new("/workspace/out/dist/macos/bin")),
+            Path::new("/workspace/out/dist/macos/lib/libgfxstream_backend.dylib")
+        );
+    }
 }

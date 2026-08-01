@@ -1,5 +1,8 @@
-#![cfg_attr(windows, allow(unsafe_code))]
+#![cfg_attr(any(windows, target_os = "macos"), allow(unsafe_code))]
 
+use std::path::PathBuf;
+
+use hd_core::{NativeDisplayTargetV2, WorkerIdentityV2};
 use raw_window_handle::RawWindowHandle;
 
 use crate::PlatformError;
@@ -10,6 +13,8 @@ pub struct NativeDisplayBounds {
     pub y_px: i32,
     pub width_px: u32,
     pub height_px: u32,
+    /// Clockwise Android display rotation in quarter turns from its natural orientation.
+    pub rotation_quarters: u8,
     pub visible: bool,
 }
 
@@ -20,6 +25,7 @@ pub struct NativeDisplayBounds {
 /// display session.
 pub trait NativeDisplayHost: std::fmt::Debug {
     fn handle(&self) -> u64;
+    fn target(&self, owner: WorkerIdentityV2) -> NativeDisplayTargetV2;
     fn set_bounds(&mut self, bounds: NativeDisplayBounds) -> Result<(), PlatformError>;
     fn hide(&mut self) -> Result<(), PlatformError>;
     fn focus_guest(&self) -> Result<(), PlatformError>;
@@ -34,11 +40,28 @@ pub fn create_native_display_host(
         WindowsNativeDisplayHost::new(parent)
             .map(|host| Box::new(host) as Box<dyn NativeDisplayHost>)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        MacNativeDisplayHost::new(parent).map(|host| Box::new(host) as Box<dyn NativeDisplayHost>)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = parent;
         Err(PlatformError::Unsupported(
-            "NativeDisplayHost is currently implemented only on Windows",
+            "NativeDisplayHost is not implemented for this platform",
+        ))
+    }
+}
+
+pub fn choose_apk_file() -> Result<Option<PathBuf>, PlatformError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::choose_apk_file()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(PlatformError::Unsupported(
+            "native APK file selection is not implemented for this platform",
         ))
     }
 }
@@ -142,6 +165,13 @@ impl NativeDisplayHost for WindowsNativeDisplayHost {
         self.hwnd as usize as u64
     }
 
+    fn target(&self, owner: WorkerIdentityV2) -> NativeDisplayTargetV2 {
+        NativeDisplayTargetV2::WindowsHwnd {
+            hwnd: self.handle(),
+            owner,
+        }
+    }
+
     fn set_bounds(&mut self, bounds: NativeDisplayBounds) -> Result<(), PlatformError> {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             HWND_BOTTOM, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SetWindowPos,
@@ -229,4 +259,274 @@ fn wide(value: &str) -> Vec<u16> {
         .encode_wide()
         .chain(Some(0))
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::ffi::{CStr, CString, c_char, c_void};
+    use std::path::PathBuf;
+
+    use hd_core::{NativeDisplayTargetV2, WorkerIdentityV2};
+    use raw_window_handle::RawWindowHandle;
+
+    use super::{NativeDisplayBounds, NativeDisplayHost};
+    use crate::PlatformError;
+
+    unsafe extern "C" {
+        fn hd_macos_native_display_create(
+            parent_view: *mut c_void,
+            endpoint: *const c_char,
+        ) -> *mut c_void;
+        fn hd_macos_native_display_destroy(host: *mut c_void);
+        fn hd_macos_native_display_set_bounds(
+            host: *mut c_void,
+            x_px: i32,
+            y_px: i32,
+            width_px: u32,
+            height_px: u32,
+            rotation_quarters: u8,
+            visible: bool,
+        ) -> bool;
+        fn hd_macos_native_display_hide(host: *mut c_void) -> bool;
+        fn hd_macos_native_display_focus(host: *mut c_void) -> bool;
+        fn hd_macos_native_display_root_is_minimized(host: *mut c_void) -> bool;
+        fn hd_macos_choose_apk_file(output: *mut c_char, capacity: usize) -> i32;
+        fn hd_macos_center_traffic_lights(parent_view: *mut c_void, titlebar_height: f64) -> bool;
+        fn hd_macos_set_window_content_aspect_ratio(
+            parent_view: *mut c_void,
+            width: f64,
+            height: f64,
+        ) -> bool;
+        fn hd_macos_install_titlebar_controls(
+            parent_view: *mut c_void,
+            context: *mut c_void,
+            callback: MacTitlebarCallback,
+        ) -> bool;
+    }
+
+    pub type MacTitlebarCallback = extern "C" fn(*mut c_void, *const c_char);
+
+    pub(super) struct MacNativeDisplayHost {
+        raw: *mut c_void,
+        endpoint: PathBuf,
+    }
+
+    impl std::fmt::Debug for MacNativeDisplayHost {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("MacNativeDisplayHost")
+                .field("endpoint", &self.endpoint)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl MacNativeDisplayHost {
+        pub(super) fn new(parent: RawWindowHandle) -> Result<Self, PlatformError> {
+            let RawWindowHandle::AppKit(handle) = parent else {
+                return Err(PlatformError::Unsupported(
+                    "macOS NativeDisplayHost requires an AppKit parent view",
+                ));
+            };
+            let user_scope = crate::current_user_scope()?;
+            let endpoint = std::env::temp_dir().join(format!("bscp-hd-ca-{user_scope}.sock"));
+            let endpoint_c = CString::new(endpoint.to_string_lossy().as_bytes()).map_err(|_| {
+                PlatformError::Process("macOS display endpoint contains NUL".to_owned())
+            })?;
+            // SAFETY: winit owns the parent NSView for the lifetime of this host. The bridge
+            // retains its own host object and copies the endpoint string.
+            let raw = unsafe {
+                hd_macos_native_display_create(handle.ns_view.as_ptr(), endpoint_c.as_ptr())
+            };
+            if raw.is_null() {
+                return Err(PlatformError::Process(
+                    "create macOS CoreAnimation display host failed".to_owned(),
+                ));
+            }
+            Ok(Self { raw, endpoint })
+        }
+
+        fn call(operation: &'static str, succeeded: bool) -> Result<(), PlatformError> {
+            if succeeded {
+                Ok(())
+            } else {
+                Err(PlatformError::Process(format!(
+                    "macOS NativeDisplayHost {operation} failed"
+                )))
+            }
+        }
+    }
+
+    impl NativeDisplayHost for MacNativeDisplayHost {
+        fn handle(&self) -> u64 {
+            self.raw as usize as u64
+        }
+
+        fn target(&self, owner: WorkerIdentityV2) -> NativeDisplayTargetV2 {
+            NativeDisplayTargetV2::MacCaContext {
+                endpoint: self.endpoint.to_string_lossy().into_owned(),
+                owner,
+            }
+        }
+
+        fn set_bounds(&mut self, bounds: NativeDisplayBounds) -> Result<(), PlatformError> {
+            // SAFETY: raw is retained until Drop and UI calls occur on the AppKit thread.
+            let succeeded = unsafe {
+                hd_macos_native_display_set_bounds(
+                    self.raw,
+                    bounds.x_px,
+                    bounds.y_px,
+                    bounds.width_px,
+                    bounds.height_px,
+                    bounds.rotation_quarters,
+                    bounds.visible,
+                )
+            };
+            Self::call("set bounds", succeeded)
+        }
+
+        fn hide(&mut self) -> Result<(), PlatformError> {
+            // SAFETY: raw is retained until Drop and UI calls occur on the AppKit thread.
+            let succeeded = unsafe { hd_macos_native_display_hide(self.raw) };
+            Self::call("hide", succeeded)
+        }
+
+        fn focus_guest(&self) -> Result<(), PlatformError> {
+            // SAFETY: raw is retained until Drop and UI calls occur on the AppKit thread.
+            let succeeded = unsafe { hd_macos_native_display_focus(self.raw) };
+            Self::call("focus", succeeded)
+        }
+
+        fn root_is_minimized(&self) -> bool {
+            // SAFETY: raw is retained until Drop and UI calls occur on the AppKit thread.
+            unsafe { hd_macos_native_display_root_is_minimized(self.raw) }
+        }
+    }
+
+    impl Drop for MacNativeDisplayHost {
+        fn drop(&mut self) {
+            // SAFETY: raw was returned retained and is released exactly once here.
+            unsafe { hd_macos_native_display_destroy(self.raw) };
+        }
+    }
+
+    pub(super) fn center_traffic_lights(
+        parent: RawWindowHandle,
+        titlebar_height: f64,
+    ) -> Result<(), PlatformError> {
+        let RawWindowHandle::AppKit(handle) = parent else {
+            return Err(PlatformError::Unsupported(
+                "macOS traffic lights require an AppKit parent view",
+            ));
+        };
+        // SAFETY: winit owns the parent NSView; callers run from the AppKit event thread.
+        let succeeded =
+            unsafe { hd_macos_center_traffic_lights(handle.ns_view.as_ptr(), titlebar_height) };
+        if succeeded {
+            Ok(())
+        } else {
+            Err(PlatformError::Process(
+                "center macOS traffic lights failed".to_owned(),
+            ))
+        }
+    }
+
+    pub(super) fn set_window_content_aspect_ratio(
+        parent: RawWindowHandle,
+        width: f64,
+        height: f64,
+    ) -> Result<(), PlatformError> {
+        let RawWindowHandle::AppKit(handle) = parent else {
+            return Err(PlatformError::Unsupported(
+                "macOS content aspect ratio requires an AppKit parent view",
+            ));
+        };
+        // SAFETY: winit owns the parent NSView and this runs on the AppKit event thread.
+        let succeeded = unsafe {
+            hd_macos_set_window_content_aspect_ratio(handle.ns_view.as_ptr(), width, height)
+        };
+        if succeeded {
+            Ok(())
+        } else {
+            Err(PlatformError::Process(
+                "set macOS window content aspect ratio failed".to_owned(),
+            ))
+        }
+    }
+
+    pub(super) fn install_titlebar_controls(
+        parent: RawWindowHandle,
+        context: *mut c_void,
+        callback: MacTitlebarCallback,
+    ) -> Result<(), PlatformError> {
+        let RawWindowHandle::AppKit(handle) = parent else {
+            return Err(PlatformError::Unsupported(
+                "macOS titlebar controls require an AppKit parent view",
+            ));
+        };
+        // SAFETY: winit owns the parent NSView; callbacks only enqueue UI messages.
+        let succeeded = unsafe {
+            hd_macos_install_titlebar_controls(handle.ns_view.as_ptr(), context, callback)
+        };
+        if succeeded {
+            Ok(())
+        } else {
+            Err(PlatformError::Process(
+                "install macOS titlebar controls failed".to_owned(),
+            ))
+        }
+    }
+
+    pub(super) fn choose_apk_file() -> Result<Option<PathBuf>, PlatformError> {
+        let mut output = [0 as c_char; 4096];
+        // SAFETY: the fixed buffer remains writable for the duration of the synchronous AppKit
+        // panel. The bridge always NUL-terminates a selected path and runs on the UI thread.
+        let result = unsafe { hd_macos_choose_apk_file(output.as_mut_ptr(), output.len()) };
+        match result {
+            1 => {
+                // SAFETY: a successful bridge call guarantees a NUL-terminated UTF-8 filesystem
+                // representation inside `output`.
+                let path = unsafe { CStr::from_ptr(output.as_ptr()) }
+                    .to_str()
+                    .map_err(|error| {
+                        PlatformError::Process(format!(
+                            "selected APK path is not valid UTF-8: {error}"
+                        ))
+                    })?;
+                Ok(Some(PathBuf::from(path)))
+            }
+            0 => Ok(None),
+            _ => Err(PlatformError::Process(
+                "macOS APK file selection failed".to_owned(),
+            )),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+use macos::{MacNativeDisplayHost, MacTitlebarCallback};
+
+#[cfg(target_os = "macos")]
+pub fn center_macos_traffic_lights(
+    parent: RawWindowHandle,
+    titlebar_height: f64,
+) -> Result<(), PlatformError> {
+    macos::center_traffic_lights(parent, titlebar_height)
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_macos_window_content_aspect_ratio(
+    parent: RawWindowHandle,
+    width: f64,
+    height: f64,
+) -> Result<(), PlatformError> {
+    macos::set_window_content_aspect_ratio(parent, width, height)
+}
+
+#[cfg(target_os = "macos")]
+pub fn install_macos_titlebar_controls(
+    parent: RawWindowHandle,
+    context: *mut std::ffi::c_void,
+    callback: MacTitlebarCallback,
+) -> Result<(), PlatformError> {
+    macos::install_titlebar_controls(parent, context, callback)
 }

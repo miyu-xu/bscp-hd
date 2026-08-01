@@ -21,5 +21,5 @@ pub(crate) fn allow_adb_offline_boot_ready_enabled() -> bool {
 }
 
 pub(crate) const fn native_display_direct_enabled() -> bool {
-    cfg!(windows)
+    cfg!(any(windows, target_os = "macos"))
 }

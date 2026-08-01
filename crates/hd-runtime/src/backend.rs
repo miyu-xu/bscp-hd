@@ -38,6 +38,20 @@ fn guest_kernel_arguments(spec: &InstanceSpecV2) -> Vec<String> {
         "androidboot.hardware.gltransport=virtio-gpu-asg".to_owned(),
         "androidboot.opengles.version=196609".to_owned(),
     ]);
+    #[cfg(target_os = "macos")]
+    arguments.extend([
+        // Keep both GLES and Vulkan on the gfxstream hardware path. Guest EGL uses the
+        // emulator encoder while host ANGLE presents through MoltenVK; CPU Vulkan is disabled.
+        "androidboot.cpuvulkan.version=0".to_owned(),
+        "androidboot.hardware.gralloc=minigbm".to_owned(),
+        "androidboot.hardware.hwcomposer=ranchu".to_owned(),
+        "androidboot.hardware.hwcomposer.display_finder_mode=drm".to_owned(),
+        "androidboot.hardware.hwcomposer.display_framebuffer_format=rgba".to_owned(),
+        "androidboot.hardware.egl=emulation".to_owned(),
+        "androidboot.hardware.vulkan=ranchu".to_owned(),
+        "androidboot.hardware.gltransport=virtio-gpu-asg".to_owned(),
+        "androidboot.opengles.version=196609".to_owned(),
+    ]);
     if spec.devices.uwb {
         arguments.push("androidboot.uwbcountrycode=US".to_owned());
     }
@@ -75,6 +89,23 @@ impl CrosvmBackend {
 
     pub fn executable(&self) -> &Path {
         &self.executable
+    }
+
+    fn backend_display_size(display: &DisplayConfigV2) -> (u32, u32) {
+        #[cfg(target_os = "macos")]
+        {
+            // Cocoa exports the guest's natural portrait CALayer and the native host rotates that
+            // layer to match Android's WMS orientation. Resizing crosvm to the oriented dimensions
+            // would rotate the source a second time and desynchronize the virtio touch axes.
+            (
+                display.width.min(display.height),
+                display.width.max(display.height),
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            display.oriented_size()
+        }
     }
 
     /// On Unix crosvm connects to the input socket during VM construction, so the worker must
@@ -115,9 +146,15 @@ impl CrosvmBackend {
     }
 
     fn gpu_argument(display: &DisplayConfigV2) -> String {
-        let (width, height) = display.oriented_size();
+        let (width, height) = Self::backend_display_size(display);
+        let renderer_uses_gles = cfg!(target_os = "macos");
+        let native_wsi = if cfg!(target_os = "macos") {
+            ""
+        } else {
+            ",wsi=vk"
+        };
         let base = format!(
-            "backend=gfxstream,max-num-displays=1,audio-device-mode=one-global,displays=[[mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh},hidden=true]],context-types=gfxstream-vulkan:gfxstream-composer,angle=true,gles=false,vulkan=true,wsi=vk",
+            "backend=gfxstream,max-num-displays=1,audio-device-mode=one-global,displays=[[mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh},hidden=true]],context-types=gfxstream-vulkan:gfxstream-composer,angle=true,gles={renderer_uses_gles},vulkan=true{native_wsi}",
             dpi = display.dpi,
             refresh = display.refresh_rate_hz,
         );
@@ -136,7 +173,7 @@ impl CrosvmBackend {
     }
 
     fn display_argument(display: &DisplayConfigV2) -> String {
-        let (width, height) = display.oriented_size();
+        let (width, height) = Self::backend_display_size(display);
         format!(
             "mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh}",
             dpi = display.dpi,
@@ -159,7 +196,7 @@ impl CrosvmBackend {
             return Ok(format!("{prefix},type=file,path={output},input={input}"));
             #[cfg(unix)]
             {
-                return Ok(format!("{prefix},type=unix,path={output},input={input}"));
+                return Ok(format!("{prefix},type=file,path={output},input={input}"));
             }
         }
         if let Some(path) = fallback_output {
@@ -237,8 +274,17 @@ impl VmBackend for CrosvmBackend {
             spec.memory_mib.to_string(),
             "--cpus".to_owned(),
             spec.cpu_count.to_string(),
-            "--no-balloon".to_owned(),
-            "--no-usb".to_owned(),
+        ];
+        #[cfg(windows)]
+        arguments.extend(["--no-balloon".to_owned(), "--no-usb".to_owned()]);
+        #[cfg(target_os = "macos")]
+        arguments.extend([
+            "--disable-sandbox".to_owned(),
+            // The macOS Cocoa display bridge converts native mouse gestures into virtio
+            // multitouch reports. Enable its paired input device so Android receives them.
+            "--display-window-mouse".to_owned(),
+        ]);
+        arguments.extend([
             "--socket".to_owned(),
             context.control_endpoint.clone(),
             "--input".to_owned(),
@@ -248,9 +294,9 @@ impl VmBackend for CrosvmBackend {
             ),
             "--gpu".to_owned(),
             Self::gpu_argument(&spec.display),
-        ];
+        ]);
 
-        if spec.devices.network {
+        if spec.devices.network && !cfg!(target_os = "macos") {
             arguments.extend([
                 "--net".to_owned(),
                 format!(
@@ -269,7 +315,7 @@ impl VmBackend for CrosvmBackend {
             ]);
         }
 
-        if spec.devices.audio {
+        if spec.devices.audio && !cfg!(target_os = "macos") {
             arguments.extend([
                 "--virtio-snd".to_owned(),
                 "capture=true,backend=null,num_output_devices=1,num_input_devices=1,num_output_streams=1,num_input_streams=1"
@@ -402,6 +448,18 @@ impl VmBackend for CrosvmBackend {
                 "HD_FRAME_BROKER_V2".to_owned(),
                 context.frame_endpoint.clone(),
             );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            environment.insert("CROSVM_COCOA_DISPLAY".to_owned(), "1".to_owned());
+            // Present the gfxstream CAMetalLayer through CAContext/CALayerHost. This is the
+            // macOS zero-copy path; no virtio-gpu framebuffer readback is enabled.
+            environment.insert("ANGLE_DEFAULT_PLATFORM".to_owned(), "metal".to_owned());
+            if let Some(gfxstream) = context.artifacts.host_tools.get("gfxstream-backend")
+                && let Some(search_path) = macos_gfxstream_library_search_path(gfxstream)
+            {
+                environment.insert("DYLD_LIBRARY_PATH".to_owned(), search_path);
+            }
         }
         #[cfg(windows)]
         {
@@ -612,6 +670,16 @@ impl VmBackend for CrosvmBackend {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_gfxstream_library_search_path(gfxstream: &Path) -> Option<String> {
+    let library_directory = gfxstream.parent()?;
+    let distribution_root = library_directory.parent()?;
+    let angle_directory = distribution_root.join("gfx").join("angle");
+    std::env::join_paths([library_directory.to_path_buf(), angle_directory])
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 fn safe_key_value_path(value: &str) -> Result<String, PlatformError> {
     if value.is_empty()
         || value
@@ -669,6 +737,7 @@ mod tests {
         assert!(safe_key_value_path("c:/guest,image.img").is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_guest_graphics_contract_requires_hardware_angle() {
         let mut spec = InstanceSpecV2::default();
@@ -691,5 +760,45 @@ mod tests {
                 "Windows HD must require the hardware Guest ANGLE contract: {required}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_guest_graphics_contract_disables_cpu_rendering() {
+        let arguments = guest_kernel_arguments(&InstanceSpecV2::default());
+
+        for required in [
+            "androidboot.cpuvulkan.version=0",
+            "androidboot.hardware.egl=emulation",
+            "androidboot.hardware.gltransport=virtio-gpu-asg",
+            "androidboot.hardware.vulkan=ranchu",
+        ] {
+            assert!(
+                arguments.iter().any(|argument| argument == required),
+                "macOS HD must keep guest graphics on gfxstream hardware: {required}"
+            );
+        }
+
+        let gpu = CrosvmBackend::gpu_argument(&InstanceSpecV2::default().display);
+        assert!(gpu.contains("gles=true"));
+        assert!(!gpu.contains("wsi=vk"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_gfxstream_search_path_includes_angle_runtime() {
+        let search_path = macos_gfxstream_library_search_path(Path::new(
+            "/bundle/lib/libgfxstream_backend.dylib",
+        ))
+        .expect("bundle layout should produce a search path");
+        let entries = std::env::split_paths(&search_path).collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            [
+                PathBuf::from("/bundle/lib"),
+                PathBuf::from("/bundle/gfx/angle")
+            ]
+        );
     }
 }

@@ -20,7 +20,15 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-pub use native_display_host::{NativeDisplayBounds, NativeDisplayHost, create_native_display_host};
+#[cfg(target_os = "macos")]
+pub use native_display_host::center_macos_traffic_lights;
+#[cfg(target_os = "macos")]
+pub use native_display_host::install_macos_titlebar_controls;
+#[cfg(target_os = "macos")]
+pub use native_display_host::set_macos_window_content_aspect_ratio;
+pub use native_display_host::{
+    NativeDisplayBounds, NativeDisplayHost, choose_apk_file, create_native_display_host,
+};
 
 pub const HD_DATA_DIR_ENV: &str = "HD_DATA_DIR";
 
@@ -56,11 +64,16 @@ pub fn attach_native_display(
     {
         windows::attach_native_display(child_pid, target, viewport)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (child_pid, viewport);
+        validate_macos_native_target(target)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (child_pid, target, viewport);
         Err(PlatformError::Unsupported(
-            "native display embedding is currently implemented only on Windows",
+            "native display embedding is not implemented for this platform",
         ))
     }
 }
@@ -77,11 +90,16 @@ pub fn prepare_native_display(
     {
         windows::prepare_native_display(child_pid, target, viewport)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (child_pid, viewport);
+        validate_macos_native_target(target)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (child_pid, target, viewport);
         Err(PlatformError::Unsupported(
-            "native display preparation is currently implemented only on Windows",
+            "native display preparation is not implemented for this platform",
         ))
     }
 }
@@ -95,11 +113,16 @@ pub fn resize_native_display(
     {
         windows::resize_native_display(child_pid, target, viewport)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (child_pid, viewport);
+        validate_macos_native_target(target)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (child_pid, target, viewport);
         Err(PlatformError::Unsupported(
-            "native display embedding is currently implemented only on Windows",
+            "native display embedding is not implemented for this platform",
         ))
     }
 }
@@ -109,11 +132,16 @@ pub fn set_native_display_visibility(child_pid: u32, visible: bool) -> Result<()
     {
         windows::set_native_display_visibility(child_pid, visible)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (child_pid, visible);
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (child_pid, visible);
         Err(PlatformError::Unsupported(
-            "native display embedding is currently implemented only on Windows",
+            "native display embedding is not implemented for this platform",
         ))
     }
 }
@@ -123,13 +151,39 @@ pub fn detach_native_display(child_pid: u32) -> Result<(), PlatformError> {
     {
         windows::detach_native_display(child_pid)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = child_pid;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = child_pid;
         Err(PlatformError::Unsupported(
-            "native display embedding is currently implemented only on Windows",
+            "native display embedding is not implemented for this platform",
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_native_target(target: &NativeDisplayTargetV2) -> Result<(), PlatformError> {
+    let NativeDisplayTargetV2::MacCaContext { endpoint, owner } = target else {
+        return Err(PlatformError::Identity(
+            "macOS display requires a CoreAnimation context endpoint".to_owned(),
+        ));
+    };
+    let endpoint = Path::new(endpoint);
+    if !endpoint.is_absolute() || endpoint.as_os_str().is_empty() {
+        return Err(PlatformError::Identity(
+            "macOS display endpoint is not an absolute local path".to_owned(),
+        ));
+    }
+    if !process_identity_is_alive(owner) {
+        return Err(PlatformError::Identity(
+            "macOS display owner is not alive".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,6 +655,11 @@ pub fn current_user_scope() -> Result<String, PlatformError> {
     }
 }
 
+#[cfg(unix)]
+pub fn ensure_open_file_limit(minimum: u64) -> Result<(), PlatformError> {
+    unix::ensure_open_file_limit(minimum)
+}
+
 pub fn current_process_identity(nonce: Uuid) -> Result<WorkerIdentityV2, PlatformError> {
     let pid = std::process::id();
     Ok(WorkerIdentityV2 {
@@ -731,7 +790,8 @@ pub fn configure_managed_command(command: &mut Command) -> Result<(), PlatformEr
     }
     #[cfg(unix)]
     {
-        unix::configure_managed(command)
+        unix::configure_managed(command);
+        Ok(())
     }
 }
 
@@ -748,7 +808,8 @@ pub fn configure_transient_command(command: &mut Command) -> Result<(), Platform
     }
     #[cfg(unix)]
     {
-        unix::configure_managed(command)
+        unix::configure_managed(command);
+        Ok(())
     }
 }
 

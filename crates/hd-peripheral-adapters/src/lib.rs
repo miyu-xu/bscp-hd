@@ -1,25 +1,39 @@
 #![allow(unsafe_code)]
+#![cfg_attr(not(windows), allow(clippy::unused_async))]
 
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::sync::Arc;
+#[cfg(windows)]
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail, ensure};
+#[cfg(any(windows, test))]
+use anyhow::ensure;
+use anyhow::{Context as _, Result, bail};
 use clap::Parser;
+#[cfg(windows)]
 use hd_core::{
-    ApiErrorV2, COMPONENT_PROTOCOL_VERSION, DeviceControlCommandV2, DeviceControlRequestV2,
-    DeviceControlResponseV2, DeviceControlTokenV2, DeviceSerialEndpointV2,
-    FormalComponentConfigurationV2, FormalComponentLaunchV2, FormalComponentProbeV2,
-    FormalComponentReadyV2,
+    ApiErrorV2, DeviceControlCommandV2, DeviceControlRequestV2, DeviceControlResponseV2,
+    DeviceControlTokenV2, DeviceSerialEndpointV2, FormalComponentConfigurationV2,
+    FormalComponentLaunchV2, FormalComponentReadyV2,
 };
+use hd_core::{COMPONENT_PROTOCOL_VERSION, FormalComponentProbeV2};
+#[cfg(windows)]
 use sha2::{Digest as _, Sha256};
+#[cfg(windows)]
 use subtle::ConstantTimeEq as _;
+#[cfg(windows)]
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+#[cfg(windows)]
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
+#[cfg(windows)]
 const MAX_GUEST_MESSAGE_BYTES: usize = 64 * 1024;
+#[cfg(windows)]
 const PIPE_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(windows)]
 const MODEM_VSOCK_PORT: u32 = 9697;
+#[cfg(windows)]
 const VSOCK_PIPE_HEADER_BYTES: usize = 8;
 
 #[derive(Debug, Parser)]
@@ -37,10 +51,12 @@ struct Arguments {
 #[derive(Debug)]
 struct AdapterProfile {
     component: &'static str,
+    #[cfg(windows)]
     guest_role: &'static str,
     features: &'static [&'static str],
 }
 
+#[cfg(windows)]
 #[derive(Debug)]
 struct FormalContext {
     launch: FormalComponentLaunchV2,
@@ -78,6 +94,7 @@ fn profile(component: &str) -> Result<AdapterProfile> {
     let profile = match component {
         "uwb-adapter" => AdapterProfile {
             component: "uwb-adapter",
+            #[cfg(windows)]
             guest_role: "uwb",
             features: &[
                 "guest-serial-v2",
@@ -87,6 +104,7 @@ fn profile(component: &str) -> Result<AdapterProfile> {
         },
         "modem-adapter" => AdapterProfile {
             component: "modem-adapter",
+            #[cfg(windows)]
             guest_role: "modem",
             features: &[
                 "guest-vsock-v2",
@@ -96,16 +114,19 @@ fn profile(component: &str) -> Result<AdapterProfile> {
         },
         "network-adapter" => AdapterProfile {
             component: "network-adapter",
+            #[cfg(windows)]
             guest_role: "network-control",
             features: &["guest-serial-v2", "network-control-v2", "virtio-net-v2"],
         },
         "audio-adapter" => AdapterProfile {
             component: "audio-adapter",
+            #[cfg(windows)]
             guest_role: "audio-control",
             features: &["guest-serial-v2", "audio-control-v2", "virtio-snd-v2"],
         },
         "camera-adapter" => AdapterProfile {
             component: "camera-adapter",
+            #[cfg(windows)]
             guest_role: "camera-control",
             features: &["guest-serial-v2", "camera-control-v2", "guest-camera-v2"],
         },
@@ -133,10 +154,19 @@ fn probe(profile: &AdapterProfile) -> FormalComponentProbeV2 {
 }
 
 async fn serve_formal(profile: &AdapterProfile, launch_path: &Path) -> Result<()> {
-    ensure!(
-        cfg!(windows),
-        "peripheral adapters currently require Windows"
-    );
+    #[cfg(windows)]
+    {
+        serve_formal_windows(profile, launch_path).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (profile, launch_path);
+        bail!("peripheral adapters currently require Windows")
+    }
+}
+
+#[cfg(windows)]
+async fn serve_formal_windows(profile: &AdapterProfile, launch_path: &Path) -> Result<()> {
     let launch_bytes = hd_platform::read_regular_nofollow_limited(launch_path, 64 * 1024)
         .context("read peripheral adapter launch")?;
     let launch: FormalComponentLaunchV2 =
@@ -202,6 +232,7 @@ async fn serve_formal(profile: &AdapterProfile, launch_path: &Path) -> Result<()
     }
 }
 
+#[cfg(windows)]
 async fn serve_modem_vsock(guest_cid: u32) -> Result<()> {
     #[cfg(windows)]
     {
@@ -242,6 +273,7 @@ async fn serve_modem_vsock(guest_cid: u32) -> Result<()> {
     }
 }
 
+#[cfg(windows)]
 async fn serve_modem_vsock_connection<T>(pipe: &mut T) -> Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -276,6 +308,7 @@ where
     }
 }
 
+#[cfg(any(windows, test))]
 fn take_modem_responses(pending: &mut Vec<u8>) -> Vec<u8> {
     let Some(last_delimiter) = pending
         .iter()
@@ -291,6 +324,7 @@ fn take_modem_responses(pending: &mut Vec<u8>) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(any(windows, test))]
 fn modem_response(command: &[u8]) -> Vec<u8> {
     let command = String::from_utf8_lossy(command).trim().to_ascii_uppercase();
     let response = if command.contains("AT+COPS=3,0;") && command.matches("+COPS?").count() == 3 {
@@ -331,6 +365,7 @@ fn modem_response(command: &[u8]) -> Vec<u8> {
     response.as_bytes().to_vec()
 }
 
+#[cfg(windows)]
 async fn serve_guest_channel(component: &str, endpoint: DeviceSerialEndpointV2) -> Result<()> {
     #[cfg(windows)]
     {
@@ -408,6 +443,7 @@ fn is_pipe_disconnect(error: &std::io::Error) -> bool {
     ) || matches!(error.raw_os_error(), Some(109 | 232 | 233))
 }
 
+#[cfg(windows)]
 fn take_uci_frame(pending: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
     if pending.len() < 4 {
         return Ok(None);
@@ -431,6 +467,7 @@ fn take_uci_frame(pending: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
     Ok(Some(pending.drain(..frame_len).collect()))
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug)]
 struct UwbSession {
     token: [u8; 4],
@@ -439,6 +476,7 @@ struct UwbSession {
     ranging_count: u32,
 }
 
+#[cfg(any(windows, test))]
 impl Default for UwbSession {
     fn default() -> Self {
         Self {
@@ -450,6 +488,7 @@ impl Default for UwbSession {
     }
 }
 
+#[cfg(any(windows, test))]
 fn uci_control_packet(
     message_type: u8,
     group_id: u8,
@@ -466,12 +505,14 @@ fn uci_control_packet(
     Ok(packet)
 }
 
+#[cfg(any(windows, test))]
 fn uwb_session_status_notification(session: &UwbSession) -> Result<Vec<u8>> {
     let mut payload = session.token.to_vec();
     payload.extend_from_slice(&[session.state, 0x00]);
     uci_control_packet(0x03, 0x01, 0x02, &payload)
 }
 
+#[cfg(any(windows, test))]
 fn uwb_short_range_notification(session: &mut UwbSession) -> Result<Vec<u8>> {
     session.sequence_number = session.sequence_number.wrapping_add(1);
     session.ranging_count = session.ranging_count.wrapping_add(1);
@@ -497,6 +538,7 @@ fn uwb_short_range_notification(session: &mut UwbSession) -> Result<Vec<u8>> {
     uci_control_packet(0x03, 0x02, 0x00, &payload)
 }
 
+#[cfg(any(windows, test))]
 fn uwb_capabilities_payload() -> Result<Vec<u8>> {
     // Android 15's GenericDecoder v2 power-stats prefix plus the exact FiRa v2 capability
     // profile exercised by AOSP FiraDecoderTest. Do not advertise CCC, radar, or vendor ranging
@@ -542,6 +584,7 @@ fn uwb_capabilities_payload() -> Result<Vec<u8>> {
     Ok(payload)
 }
 
+#[cfg(any(windows, test))]
 fn uwb_response(session: &mut UwbSession, request: &[u8]) -> Result<Vec<u8>> {
     ensure!(request.len() >= 4, "UCI request is shorter than its header");
     let message_type = (request[0] >> 5) & 0x07;
@@ -625,6 +668,7 @@ fn uwb_response(session: &mut UwbSession, request: &[u8]) -> Result<Vec<u8>> {
     Ok(response)
 }
 
+#[cfg(windows)]
 async fn open_pipe_with_retry<F>(
     mut open: F,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient>
@@ -644,6 +688,7 @@ where
     }
 }
 
+#[cfg(windows)]
 fn guest_response(component: &str, request: &[u8]) -> Vec<u8> {
     debug_assert_ne!(component, "modem-adapter");
     let request_id = hex::encode(Sha256::digest(request));
@@ -653,6 +698,7 @@ fn guest_response(component: &str, request: &[u8]) -> Vec<u8> {
     .into_bytes()
 }
 
+#[cfg(windows)]
 fn publish_ready(context: &FormalContext, launch_bytes: &[u8]) -> Result<()> {
     let ready = FormalComponentReadyV2 {
         protocol_version: COMPONENT_PROTOCOL_VERSION,
@@ -670,6 +716,7 @@ fn publish_ready(context: &FormalContext, launch_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 async fn run_control_server(context: Arc<FormalContext>, launch_bytes: &[u8]) -> Result<()> {
     #[cfg(windows)]
     {

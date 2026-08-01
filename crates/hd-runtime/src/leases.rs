@@ -331,9 +331,11 @@ pub fn worker_endpoint(instance_id: Uuid) -> Result<String, LeaseError> {
     }
     #[cfg(unix)]
     {
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+        #[cfg(target_os = "macos")]
+        let runtime = PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let runtime =
+            std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
         Ok(runtime
             .join(format!(
                 "bscp-hd-worker-{}-{instance_id}.sock",

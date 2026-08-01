@@ -3,7 +3,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use hd_core::{
-    AdbConfigV2, BatteryStateV2, KeyActionV2, NetworkConditionV2, OrientationV2, SensorInjectionV2,
+    AdbConfigV2, BatteryStateV2, DisplayConfigV2, KeyActionV2, LocationV2, NetworkConditionV2,
+    SensorInjectionV2,
 };
 use thiserror::Error;
 use tokio::io::AsyncReadExt as _;
@@ -19,6 +20,8 @@ const READY_TIMEOUT: Duration = Duration::from_mins(5);
 const ORIENTATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 const ORIENTATION_RETRY_DELAY: Duration = Duration::from_millis(250);
 const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
+const TABLET_MIN_SMALLEST_WIDTH_DP: u32 = 600;
+const ANDROID_DENSITY_BASE: u32 = 160;
 
 /// Bounded ADB adapter. Callers can select only the fixed operations below; arbitrary shell
 /// strings are intentionally not exposed by the production API.
@@ -255,11 +258,21 @@ impl AdbClient {
         if !apk.is_file() {
             return Err(AdbError::InvalidApk(apk.to_owned()));
         }
-        let package_name = self.package_name(apk).await?;
+        let package_name = if self.aapt2.is_some() {
+            Some(self.package_name(apk).await?)
+        } else {
+            None
+        };
+        let install_label = package_name.clone().unwrap_or_else(|| {
+            apk.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("APK")
+                .to_owned()
+        });
         tracing::info!(
             event = "adb.install.started",
             %serial,
-            package = %package_name,
+            package = %install_label,
             "installing APK"
         );
         self.run(
@@ -274,52 +287,80 @@ impl AdbClient {
             INSTALL_TIMEOUT,
         )
         .await?;
-        let installed = self
-            .shell(serial, &["cmd", "package", "path", &package_name])
-            .await?;
-        if !installed.lines().any(|line| line.starts_with("package:")) {
-            return Err(AdbError::InstallVerification(package_name));
+        if let Some(package_name) = &package_name {
+            let installed = self
+                .shell(serial, &["cmd", "package", "path", package_name])
+                .await?;
+            if !installed.lines().any(|line| line.starts_with("package:")) {
+                return Err(AdbError::InstallVerification(package_name.clone()));
+            }
         }
         tracing::info!(
             event = "adb.install.succeeded",
             %serial,
-            package = %package_name,
-            "APK installation verified"
+            package = %install_label,
+            metadata_verified = package_name.is_some(),
+            "APK installation completed"
         );
-        Ok(package_name)
+        Ok(install_label)
     }
 
-    pub async fn set_orientation(
+    pub async fn set_display_configuration(
         &self,
         serial: &str,
-        orientation: OrientationV2,
+        display: &DisplayConfigV2,
     ) -> Result<(), AdbError> {
-        let expected = orientation.android_rotation().to_string();
+        let effective_density = if display.orientation.is_portrait() {
+            display.dpi
+        } else {
+            // Android selects phone-landscape resources when the natural short edge remains below
+            // 600dp, placing the navigation bar on the side. A landscape emulator is expected to
+            // behave like a tablet, so cap the effective density just enough to cross the standard
+            // tablet resource threshold without changing the guest's pixel resolution.
+            let short_edge_px = display.width.min(display.height);
+            let tablet_density =
+                short_edge_px.saturating_mul(ANDROID_DENSITY_BASE) / TABLET_MIN_SMALLEST_WIDTH_DP;
+            display.dpi.min(tablet_density)
+        };
+        let effective_density = effective_density.to_string();
+        self.shell(serial, &["wm", "density", &effective_density])
+            .await?;
+
+        let expected_rotation = display.orientation.android_rotation();
+        let expected = expected_rotation.to_string();
         self.shell(
             serial,
             &["settings", "put", "system", "accelerometer_rotation", "0"],
         )
         .await?;
+        self.shell(serial, &["wm", "fixed-to-user-rotation", "enabled"])
+            .await?;
 
-        // Writing user_rotation directly races WindowManager's boot-time rotation policy.  Use
-        // its supported shell surface to establish a rotation lock, then wait for the backing
-        // setting to converge.  Reasserting the lock is intentional: Android can finish applying
-        // the initial sensor policy just after ADB becomes Ready and otherwise overwrite the first
-        // request (observed during repeated cold starts).
+        // Launcher and other foreground apps can request SCREEN_ORIENTATION_NOSENSOR. Android 15
+        // records a user rotation lock in that state but leaves the display at ROTATION_0 unless
+        // fixed-to-user-rotation is enabled. Verify DisplayRotation itself rather than the backing
+        // setting so Host never resizes the emulator window around an unrotated Android frame.
         let deadline = Instant::now() + ORIENTATION_VERIFY_TIMEOUT;
         loop {
             self.shell(serial, &["wm", "user-rotation", "lock", &expected])
                 .await?;
-            let actual = self
-                .shell(serial, &["settings", "get", "system", "user_rotation"])
-                .await?;
-            if actual.trim() == expected {
+            let window_state = self.shell(serial, &["dumpsys", "window"]).await?;
+            let actual_rotation = window_state.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("mRotation=")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse::<u8>().ok())
+            });
+            if actual_rotation == Some(expected_rotation) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(AdbError::OrientationVerification {
                     expected,
-                    actual: actual.trim().to_owned(),
+                    actual: actual_rotation.map_or_else(
+                        || "not reported by WindowManager".to_owned(),
+                        |rotation| rotation.to_string(),
+                    ),
                 });
             }
             tokio::time::sleep(ORIENTATION_RETRY_DELAY).await;
@@ -337,6 +378,139 @@ impl AdbClient {
         };
         self.shell(serial, &["input", "keyevent", key_code]).await?;
         Ok(())
+    }
+
+    /// Keeps the virtual phone display visible after boot. Android's default phone power policy
+    /// can dim or turn off the virtual display shortly after Launcher appears, which is perceived
+    /// as a native-rendering black screen even when the guest and ADB transport are healthy.
+    pub async fn keep_display_awake(&self, serial: &str) -> Result<(), AdbError> {
+        validate_serial(serial)?;
+        for arguments in [
+            [
+                "settings",
+                "put",
+                "system",
+                "screen_off_timeout",
+                "2147483647",
+            ],
+            ["settings", "put", "secure", "screensaver_enabled", "0"],
+            [
+                "settings",
+                "put",
+                "global",
+                "stay_on_while_plugged_in",
+                "15",
+            ],
+        ] {
+            self.shell(serial, &arguments).await?;
+        }
+        for arguments in [
+            &["svc", "power", "stayon", "true"][..],
+            &["input", "keyevent", "KEYCODE_WAKEUP"],
+            &["wm", "dismiss-keyguard"],
+            &["input", "keyevent", "KEYCODE_HOME"],
+        ] {
+            self.shell(serial, arguments).await?;
+        }
+        Ok(())
+    }
+
+    /// Reconciles Android services with the instance's fixed device inventory after boot.
+    ///
+    /// These commands are deliberately fixed rather than caller-provided. In particular, an
+    /// Android 15 cuttlefish NFC service without its virtio backend blocks in its persistent
+    /// process and is restarted by `ActivityManager` even after `disable-user` or `force-stop`.
+    /// Remove it for user 0 when NFC is absent; `install-existing` restores the system package
+    /// when NFC is enabled again. Also stop the boot-time full logcat stream: diagnostics can
+    /// collect a bounded log through ADB without continuously driving the virtio console or
+    /// growing a per-run file.
+    pub async fn apply_runtime_device_policy(
+        &self,
+        serial: &str,
+        bluetooth_enabled: bool,
+        nfc_enabled: bool,
+    ) {
+        if validate_serial(serial).is_err() {
+            return;
+        }
+
+        let mut commands: Vec<(&str, Vec<&str>)> = Vec::new();
+        if bluetooth_enabled {
+            commands.push((
+                "enable Bluetooth package",
+                vec!["pm", "enable", "--user", "0", "com.android.bluetooth"],
+            ));
+            if cfg!(target_os = "macos") {
+                commands.push((
+                    "keep software Bluetooth radio disabled",
+                    vec!["settings", "put", "global", "bluetooth_on", "0"],
+                ));
+            } else {
+                commands.push(("enable Bluetooth", vec!["svc", "bluetooth", "enable"]));
+            }
+        } else {
+            commands.push((
+                "persist Bluetooth disabled",
+                vec!["settings", "put", "global", "bluetooth_on", "0"],
+            ));
+            commands.push(("disable Bluetooth", vec!["svc", "bluetooth", "disable"]));
+        }
+
+        if nfc_enabled {
+            commands.push((
+                "restore NFC package",
+                vec![
+                    "cmd",
+                    "package",
+                    "install-existing",
+                    "--user",
+                    "0",
+                    "com.android.nfc",
+                ],
+            ));
+            commands.push((
+                "enable NFC package",
+                vec!["pm", "enable", "--user", "0", "com.android.nfc"],
+            ));
+            if cfg!(target_os = "macos") {
+                commands.push((
+                    "stop inactive NFC HAL",
+                    vec!["su", "0", "stop", "nfc_hal_service"],
+                ));
+            } else {
+                commands.push(("start NFC HAL", vec!["su", "0", "start", "nfc_hal_service"]));
+                commands.push(("enable NFC", vec!["cmd", "nfc", "enable-nfc"]));
+            }
+        } else {
+            commands.push((
+                "remove NFC package for user",
+                vec!["pm", "uninstall", "--user", "0", "com.android.nfc"],
+            ));
+            commands.push(("stop NFC HAL", vec!["su", "0", "stop", "nfc_hal_service"]));
+        }
+        commands.push((
+            "stop unbounded boot log stream",
+            vec!["su", "0", "stop", "seriallogging"],
+        ));
+
+        for (operation, arguments) in commands {
+            if let Err(error) = self.shell(serial, &arguments).await {
+                tracing::warn!(
+                    event = "adb.runtime_device_policy.command_failed",
+                    %serial,
+                    %operation,
+                    %error,
+                    "guest runtime device policy command failed"
+                );
+            }
+        }
+        tracing::info!(
+            event = "adb.runtime_device_policy.applied",
+            %serial,
+            bluetooth_enabled,
+            nfc_enabled,
+            "guest runtime device policy reconciled"
+        );
     }
 
     /// Applies the fixed Android battery simulation surface and verifies every requested field.
@@ -376,6 +550,67 @@ impl AdbClient {
                 ),
                 actual,
             });
+        }
+        Ok(())
+    }
+
+    /// Applies a typed mock provider location through Android 15's LocationManager shell API.
+    /// This is the macOS fallback when the Guest fixed-location serial bridge is unavailable.
+    pub async fn set_location(&self, serial: &str, location: &LocationV2) -> Result<(), AdbError> {
+        let latitude = f64::from(location.latitude_e7) / 10_000_000.0;
+        let longitude = f64::from(location.longitude_e7) / 10_000_000.0;
+        let coordinates = format!("{latitude:.7},{longitude:.7}");
+        let accuracy = format!("{:.3}", f64::from(location.accuracy_mm) / 1_000.0);
+        self.shell(
+            serial,
+            &[
+                "su",
+                "0",
+                "cmd",
+                "location",
+                "providers",
+                "add-test-provider",
+                "hd",
+                "--supportsAltitude",
+            ],
+        )
+        .await?;
+        self.shell(
+            serial,
+            &[
+                "su",
+                "0",
+                "cmd",
+                "location",
+                "providers",
+                "set-test-provider-enabled",
+                "hd",
+                "true",
+            ],
+        )
+        .await?;
+        self.shell(
+            serial,
+            &[
+                "su",
+                "0",
+                "cmd",
+                "location",
+                "providers",
+                "set-test-provider-location",
+                "hd",
+                "--location",
+                &coordinates,
+                "--accuracy",
+                &accuracy,
+            ],
+        )
+        .await?;
+
+        let actual = self.shell(serial, &["dumpsys", "location"]).await?;
+        let expected = format!("last mock location=Location[hd {latitude:.6},{longitude:.6}");
+        if !actual.contains(&expected) {
+            return Err(AdbError::LocationVerification { expected, actual });
         }
         Ok(())
     }
@@ -724,10 +959,9 @@ fn rate_token_kbps(token: &str) -> Option<u64> {
         (number, 1_u64)
     } else if let Some(number) = normalized.strip_suffix("mbit") {
         (number, 1_000_u64)
-    } else if let Some(number) = normalized.strip_suffix("gbit") {
-        (number, 1_000_000_u64)
     } else {
-        return None;
+        let number = normalized.strip_suffix("gbit")?;
+        (number, 1_000_000_u64)
     };
     let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
     if whole.is_empty()
@@ -794,6 +1028,8 @@ pub enum AdbError {
     OrientationVerification { expected: String, actual: String },
     #[error("battery verification failed: expected {expected}, actual {actual}")]
     BatteryVerification { expected: String, actual: String },
+    #[error("location verification failed: expected {expected}, actual {actual}")]
+    LocationVerification { expected: String, actual: String },
     #[error("network condition verification failed: expected {expected}, actual {actual}")]
     NetworkVerification { expected: String, actual: String },
     #[error("the verified host bundle has no Android sensor injector")]

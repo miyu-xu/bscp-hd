@@ -80,7 +80,12 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             }
         };
         if let Err(error) = resume_managed_process(pid) {
-            // Dropping the kill-on-close containment terminates the still-suspended process tree.
+            // Dropping the Windows kill-on-close containment terminates the suspended tree.
+            tracing::debug!(
+                containment_pid = containment.process_id(),
+                "releasing failed process containment"
+            );
+            #[cfg(windows)]
             drop(containment);
             let _ = child.start_kill();
             let _ = child.wait().await;

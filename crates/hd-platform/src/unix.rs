@@ -48,11 +48,11 @@ pub(crate) fn platform_baseline() -> NativeCapabilityProbe {
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
         NativeCapabilityProbe {
-            supported: major == 15 && cfg!(target_arch = "aarch64"),
+            supported: major >= 15 && cfg!(target_arch = "aarch64"),
             detail: format!("macOS {version}"),
             properties: std::collections::BTreeMap::from([
                 ("version".to_owned(), version),
-                ("required".to_owned(), "macOS 15 Apple Silicon".to_owned()),
+                ("required".to_owned(), "macOS 15+ Apple Silicon".to_owned()),
             ]),
         }
     }
@@ -154,6 +154,43 @@ pub(crate) fn memory_capacity() -> Result<(u64, u64, &'static str), PlatformErro
 pub(crate) fn current_user_scope() -> String {
     // SAFETY: geteuid has no preconditions and retains no pointer.
     unsafe { libc::geteuid() }.to_string()
+}
+
+pub(crate) fn ensure_open_file_limit(minimum: u64) -> Result<(), PlatformError> {
+    #[cfg(target_pointer_width = "64")]
+    let requested: libc::rlim_t = minimum;
+    #[cfg(not(target_pointer_width = "64"))]
+    let requested: libc::rlim_t = minimum
+        .try_into()
+        .map_err(|error| PlatformError::Process(format!("open-file limit overflow: {error}")))?;
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: limit points to writable storage for one rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return Err(PlatformError::Process(format!(
+            "query open-file limit: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: getrlimit succeeded and initialized the value.
+    let mut limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur >= requested {
+        return Ok(());
+    }
+    if limit.rlim_max < requested {
+        return Err(PlatformError::Process(format!(
+            "open-file hard limit {} is below required {minimum}",
+            limit.rlim_max
+        )));
+    }
+    limit.rlim_cur = requested;
+    // SAFETY: limit contains values returned by getrlimit with only rlim_cur raised to rlim_max.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+        return Err(PlatformError::Process(format!(
+            "raise open-file limit to {minimum}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn process_start_marker(pid: u32) -> Result<String, PlatformError> {
@@ -531,11 +568,27 @@ impl UnixContainment {
     }
 }
 
+impl Drop for UnixContainment {
+    fn drop(&mut self) {
+        let Ok(process_group) = i32::try_from(self.process_id) else {
+            return;
+        };
+        // SAFETY: managed children are created as process-group leaders. Verify that the PID
+        // still names that group before sending SIGKILL, and ignore an already-exited group.
+        unsafe {
+            if libc::getpgid(process_group) == process_group {
+                let _ = libc::killpg(process_group, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 pub(crate) const fn contain_process(pid: u32) -> UnixContainment {
     UnixContainment { process_id: pid }
 }
 
-pub(crate) fn configure_managed(command: &mut Command) -> Result<(), PlatformError> {
+pub(crate) fn configure_managed(command: &mut Command) {
+    command.process_group(0);
     // SAFETY: the closure only invokes process-control syscalls before exec and captures no
     // allocation-backed state.
     unsafe {
@@ -563,7 +616,6 @@ pub(crate) fn configure_managed(command: &mut Command) -> Result<(), PlatformErr
             Ok(())
         });
     }
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]

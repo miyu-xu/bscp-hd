@@ -38,5 +38,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1"
+
 [lints]
 workspace = true

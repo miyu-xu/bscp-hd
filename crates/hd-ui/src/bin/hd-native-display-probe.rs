@@ -77,13 +77,11 @@ mod windows {
             y_px: 0,
             width_px: physical.width,
             height_px: physical.height,
+            rotation_quarters: 0,
             visible: true,
         })?;
         let mut viewport = display_viewport(physical, window.scale_factor(), 1);
-        let target = NativeDisplayTargetV2::WindowsHwnd {
-            hwnd: native_display.handle(),
-            owner: current_process_identity(Uuid::new_v4())?,
-        };
+        let target = native_display.target(current_process_identity(Uuid::new_v4())?);
         let mut session = runtime.block_on(client.acquire_display_session(
             cli.instance_id,
             target,
@@ -136,6 +134,7 @@ mod windows {
                         y_px: 0,
                         width_px: size.width,
                         height_px: size.height,
+                        rotation_quarters: 0,
                         visible: true,
                     });
                     revision = revision.saturating_add(1);

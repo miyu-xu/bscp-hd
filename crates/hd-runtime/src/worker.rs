@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Seek as _, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,12 +10,12 @@ use fs2::FileExt as _;
 use hd_core::{
     AdbModeV2, ApiErrorV2, COMPONENT_PROTOCOL_VERSION, DEVICE_GUEST_ENDPOINT_ROLES_V2,
     DeviceControlCommandV2, DeviceControlRequestV2, DeviceControlTokenV2, DeviceSerialEndpointV2,
-    DisplayViewportV2, FRAME_PROTOCOL_VERSION, FormalComponentConfigurationV2,
+    DisplayConfigV2, DisplayViewportV2, FRAME_PROTOCOL_VERSION, FormalComponentConfigurationV2,
     FormalComponentLaunchV2, FormalComponentReadyV2, FrameMetricsV2, FrameReadyMarkerV2,
-    InstanceActionV2, InstanceSpecV2, LaunchPlanV2, LeaseKindV2, LeaseV2, NativeDisplayTargetV2,
-    ObservedStateV2, PreparedNativeDisplayV2, RunManifestV2, RunResultV2, ScreenshotRecordV2,
-    StopModeV2, WORKER_PROTOCOL_VERSION, WorkerCommandV2, WorkerDescriptorV2, WorkerIdentityV2,
-    WorkerPayloadV2, WorkerRequestV2, WorkerResponseV2, WorkerStatusV2,
+    InstanceActionV2, InstanceSpecV2, KeyActionV2, LaunchPlanV2, LeaseKindV2, LeaseV2,
+    NativeDisplayTargetV2, ObservedStateV2, PreparedNativeDisplayV2, RunManifestV2, RunResultV2,
+    ScreenshotRecordV2, StopModeV2, WORKER_PROTOCOL_VERSION, WorkerCommandV2, WorkerDescriptorV2,
+    WorkerIdentityV2, WorkerPayloadV2, WorkerRequestV2, WorkerResponseV2, WorkerStatusV2,
     device_component_guest_roles_v2,
 };
 use hd_platform::{
@@ -45,6 +47,285 @@ const INITIAL_DISPLAY_ATTACH_RETRY_MAX: Duration = Duration::from_millis(500);
 const CROSVM_DISPLAY_PARENT_HWND_ENV: &str = "CROSVM_DISPLAY_PARENT_HWND";
 const CROSVM_DISPLAY_WIDTH_ENV: &str = "CROSVM_DISPLAY_WIDTH";
 const CROSVM_DISPLAY_HEIGHT_ENV: &str = "CROSVM_DISPLAY_HEIGHT";
+const CROSVM_COCOA_CONTEXT_ENDPOINT_ENV: &str = "CROSVM_COCOA_CONTEXT_ENDPOINT";
+
+#[cfg(target_os = "macos")]
+const BOOTCONFIG_MAGIC: &[u8] = b"#BOOTCONFIG\n";
+
+#[cfg(target_os = "macos")]
+fn append_newc_entry(
+    archive: &mut Vec<u8>,
+    name: &str,
+    data: &[u8],
+    mode: u32,
+    inode: u32,
+) -> std::io::Result<()> {
+    let name_size = u32::try_from(name.len() + 1).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Android initramfs member name is too long: {error}"),
+        )
+    })?;
+    let file_size = u32::try_from(data.len()).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Android initramfs member is too large: {error}"),
+        )
+    })?;
+    let fields = [inode, mode, 0, 0, 1, 0, file_size, 0, 0, 0, 0, name_size, 0];
+    archive.extend_from_slice(b"070701");
+    for value in fields {
+        archive.extend_from_slice(format!("{value:08x}").as_bytes());
+    }
+    archive.extend_from_slice(name.as_bytes());
+    archive.push(0);
+    archive.resize(archive.len().next_multiple_of(4), 0);
+    archive.extend_from_slice(data);
+    archive.resize(archive.len().next_multiple_of(4), 0);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_android_fstab_for_nonsecure_keymint(source: &Path) -> std::io::Result<Vec<u8>> {
+    let text = std::fs::read_to_string(source)?;
+    let mut output = String::new();
+    let mut saw_data = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            output.push_str(raw_line);
+            output.push('\n');
+            continue;
+        }
+        let mut columns = line
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if columns.len() != 5 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported Android fstab line: {raw_line}"),
+            ));
+        }
+        if columns[1] == "/data" {
+            saw_data = true;
+            let mut flags = columns[4]
+                .split(',')
+                .filter(|flag| {
+                    !flag.starts_with("keydirectory=")
+                        && !flag.starts_with("fileencryption=")
+                        && *flag != "latemount"
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if !flags.iter().any(|flag| flag == "first_stage_mount") {
+                flags.push("first_stage_mount".to_owned());
+            }
+            columns[4] = flags.join(",");
+        }
+        output.push_str(&columns.join("\t"));
+        output.push('\n');
+    }
+    if !saw_data {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Android fstab has no /data entry",
+        ));
+    }
+    Ok(output.into_bytes())
+}
+
+#[cfg(target_os = "macos")]
+fn write_android_fstab_for_nonsecure_keymint(
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    std::fs::write(
+        destination,
+        normalize_android_fstab_for_nonsecure_keymint(source)?,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn make_android_fstab_override_cpio(source: &Path) -> std::io::Result<Vec<u8>> {
+    let normalized = normalize_android_fstab_for_nonsecure_keymint(source)?;
+    let normalized = std::str::from_utf8(&normalized).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("normalized Android fstab is not UTF-8: {error}"),
+        )
+    })?;
+    let mut fstab = String::new();
+    for raw_line in normalized.lines() {
+        if raw_line.split_whitespace().nth(1) != Some("/data") {
+            fstab.push_str(raw_line);
+            fstab.push('\n');
+        }
+    }
+    let mut archive = Vec::new();
+    let mut inode = 1_u32;
+    for name in [
+        ".",
+        "first_stage_ramdisk",
+        "first_stage_ramdisk/system",
+        "first_stage_ramdisk/system/etc",
+        "system",
+        "system/etc",
+    ] {
+        append_newc_entry(&mut archive, name, &[], 0o040_755, inode)?;
+        inode += 1;
+    }
+    for prefix in [
+        "",
+        "first_stage_ramdisk/",
+        "first_stage_ramdisk/system/etc/",
+        "system/etc/",
+    ] {
+        append_newc_entry(
+            &mut archive,
+            &format!("{prefix}fstab.hd"),
+            fstab.as_bytes(),
+            0o100_644,
+            inode,
+        )?;
+        inode += 1;
+    }
+    append_newc_entry(&mut archive, "TRAILER!!!", &[], 0, inode)?;
+    archive.resize(archive.len().next_multiple_of(512), 0);
+    Ok(archive)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_lines)]
+fn patch_android_initrd_bootconfig(
+    source: &Path,
+    android_fstab: &Path,
+    destination: &Path,
+) -> std::io::Result<bool> {
+    let data = std::fs::read(source)?;
+    let (prefix, existing) = if data.ends_with(BOOTCONFIG_MAGIC) {
+        let trailer_start = data.len() - BOOTCONFIG_MAGIC.len();
+        if trailer_start < 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Android initrd bootconfig trailer is too short",
+            ));
+        }
+        let size_offset = trailer_start - 8;
+        let size = u32::from_le_bytes(
+            data[size_offset..size_offset + 4]
+                .try_into()
+                .expect("bootconfig size field has a fixed width"),
+        ) as usize;
+        let checksum = u32::from_le_bytes(
+            data[size_offset + 4..trailer_start]
+                .try_into()
+                .expect("bootconfig checksum field has a fixed width"),
+        );
+        if size > size_offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid Android initrd bootconfig size {size}"),
+            ));
+        }
+        let config_start = size_offset - size;
+        let existing = &data[config_start..size_offset];
+        let actual_checksum = existing
+            .iter()
+            .fold(0_u32, |sum, byte| sum.wrapping_add(u32::from(*byte)));
+        if actual_checksum != checksum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Android initrd bootconfig checksum mismatch",
+            ));
+        }
+        (&data[..config_start], existing)
+    } else {
+        (&data[..], &[][..])
+    };
+
+    let text = std::str::from_utf8(existing).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Android initrd bootconfig is not UTF-8: {error}"),
+        )
+    })?;
+    let mut entries = Vec::<(String, String)>::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let key = line.split_once('=').map_or(line, |(key, _)| key);
+        if let Some((_, value)) = entries.iter_mut().find(|(entry, _)| entry == key) {
+            line.clone_into(value);
+        } else {
+            entries.push((key.to_owned(), line.to_owned()));
+        }
+    }
+    let key = "androidboot.boot_devices";
+    let value = "androidboot.boot_devices=10000.pci";
+    if let Some((_, entry)) = entries.iter_mut().find(|(entry, _)| entry == key) {
+        value.clone_into(entry);
+    } else {
+        entries.push((key.to_owned(), value.to_owned()));
+    }
+    let nonsecure_keymint = entries.iter().any(|(key, entry)| {
+        key == "androidboot.vendor.apex.com.android.hardware.keymint"
+            && entry == "androidboot.vendor.apex.com.android.hardware.keymint=com.android.hardware.keymint.rust_nonsecure"
+    });
+    let fstab_override = if nonsecure_keymint {
+        let key = "androidboot.fstab_suffix";
+        let value = "androidboot.fstab_suffix=hd";
+        if let Some((_, entry)) = entries.iter_mut().find(|(entry, _)| entry == key) {
+            value.clone_into(entry);
+        } else {
+            entries.push((key.to_owned(), value.to_owned()));
+        }
+        // The nonsecure KeyMint profile has no host-backed persistent root secret. Cuttlefish's
+        // keydirectory and file-encryption keys therefore succeed only on blank userdata and
+        // cannot be reopened after a VM power cycle. Project a dedicated unencrypted development
+        // fstab; the initramfs view deliberately omits /data so Android's native late-fs phase
+        // mounts it from the FDT view and emits `nonencrypted`. Persistent encryption requires a
+        // future host-backed secure KeyMint profile.
+        Some(make_android_fstab_override_cpio(android_fstab)?)
+    } else {
+        None
+    };
+
+    let mut bootconfig = String::new();
+    for (_, entry) in entries {
+        bootconfig.push_str(&entry);
+        bootconfig.push('\n');
+    }
+    let bootconfig = bootconfig.into_bytes();
+    let checksum = bootconfig
+        .iter()
+        .fold(0_u32, |sum, byte| sum.wrapping_add(u32::from(*byte)));
+    let mut patched = Vec::with_capacity(
+        prefix.len()
+            + fstab_override.as_ref().map_or(0, Vec::len)
+            + bootconfig.len()
+            + 8
+            + BOOTCONFIG_MAGIC.len(),
+    );
+    let bootconfig_len = u32::try_from(bootconfig.len()).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Android initrd bootconfig length exceeds u32: {error}"),
+        )
+    })?;
+    patched.extend_from_slice(prefix);
+    if let Some(fstab_override) = fstab_override {
+        patched.extend_from_slice(&fstab_override);
+    }
+    patched.extend_from_slice(&bootconfig);
+    patched.extend_from_slice(&bootconfig_len.to_le_bytes());
+    patched.extend_from_slice(&checksum.to_le_bytes());
+    patched.extend_from_slice(BOOTCONFIG_MAGIC);
+    std::fs::write(destination, patched)?;
+    Ok(nonsecure_keymint)
+}
 
 fn inject_initial_display_environment(
     environment: &mut BTreeMap<String, String>,
@@ -60,6 +341,12 @@ fn inject_initial_display_environment(
             environment.insert(
                 CROSVM_DISPLAY_HEIGHT_ENV.to_owned(),
                 display.viewport.height_px.to_string(),
+            );
+        }
+        NativeDisplayTargetV2::MacCaContext { endpoint, .. } => {
+            environment.insert(
+                CROSVM_COCOA_CONTEXT_ENDPOINT_ENV.to_owned(),
+                endpoint.clone(),
             );
         }
     }
@@ -105,7 +392,9 @@ struct WorkerMutable {
     started_at: Option<OffsetDateTime>,
     display_session: Option<ActiveDisplaySession>,
     #[cfg(unix)]
-    device_output_sockets: Vec<tokio::net::UnixDatagram>,
+    device_output_files: Vec<std::fs::File>,
+    #[cfg(unix)]
+    device_input_fifos: Vec<std::fs::File>,
 }
 
 #[derive(Debug)]
@@ -172,6 +461,8 @@ impl WorkerService {
         endpoint: String,
     ) -> Result<Arc<Self>, WorkerError> {
         paths.ensure()?;
+        #[cfg(target_os = "macos")]
+        hd_platform::ensure_open_file_limit(4096)?;
         hd_platform::ensure_owner_only_directory(&paths.worker_dir(instance_id))?;
         let instance_lock = acquire_worker_instance_lock(&paths, instance_id)?;
         let secret_path = paths.worker_secret(instance_id);
@@ -209,6 +500,7 @@ impl WorkerService {
                     child_pid: None,
                     cleanup_pending: false,
                     adb_serial: None,
+                    adb_ready: false,
                     frame_generation: 0,
                     frame_metrics: FrameMetricsV2::default(),
                     last_error: None,
@@ -225,7 +517,9 @@ impl WorkerService {
                 started_at: None,
                 display_session: None,
                 #[cfg(unix)]
-                device_output_sockets: Vec::new(),
+                device_output_files: Vec::new(),
+                #[cfg(unix)]
+                device_input_fifos: Vec::new(),
             }),
             operation: Mutex::new(()),
             shutdown,
@@ -241,7 +535,10 @@ impl WorkerService {
     }
 
     pub async fn status(&self) -> WorkerStatusV2 {
-        let mut status = self.mutable.lock().await.status.clone();
+        let mutable = self.mutable.lock().await;
+        let mut status = mutable.status.clone();
+        status.adb_ready = mutable.adb_ready;
+        drop(mutable);
         if let Some(run_id) = status.run_id {
             let metrics_path = self
                 .paths
@@ -534,6 +831,7 @@ impl WorkerService {
                     WorkerError::CapabilityBlocked(vec!["display.zero_copy".to_owned()])
                 })?)
             };
+            #[cfg(any(windows, target_os = "macos"))]
             let adb_bridge = discovery.adb_bridge;
             let host_tools = bundles.artifacts.host_tools.clone();
             let sensor_injector = bundles.artifacts.sensor_injector.clone();
@@ -570,19 +868,56 @@ impl WorkerService {
             #[cfg(unix)]
             {
                 let mut mutable = self.mutable.lock().await;
-                mutable.device_output_sockets = endpoints.output_sockets;
+                mutable.device_output_files = endpoints.output_files;
+                mutable.device_input_fifos = endpoints.input_fifos;
             }
             let backend = CrosvmBackend::new(discovery.crosvm.clone());
             backend
                 .prepare_keyboard_endpoint(&endpoints.keyboard)
                 .await?;
+            let mut artifacts = bundles.artifacts.clone();
+            #[cfg(target_os = "macos")]
+            {
+                let patched_initrd = run_dir.join("initrd-android-hd.img");
+                let nonsecure_keymint = patch_android_initrd_bootconfig(
+                    &artifacts.initrd,
+                    &artifacts.android_fstab,
+                    &patched_initrd,
+                )
+                .map_err(
+                    |source| WorkerError::Io {
+                        operation: "patch Android initrd bootconfig",
+                        path: patched_initrd.clone(),
+                        source,
+                    },
+                )?;
+                artifacts.initrd = patched_initrd;
+                if nonsecure_keymint {
+                    // The same fstab must also populate the FDT passed to crosvm. Android's
+                    // first-stage init reads the initramfs copy, while `mount_all --late`
+                    // consults the device tree after /vendor has replaced the ramdisk paths.
+                    // Mixing the projected unencrypted fstab with the source encrypted FDT
+                    // makes late-fs attempt to remount /data and suppresses `nonencrypted`.
+                    let patched_fstab = run_dir.join("android_fstab-hd.dt");
+                    write_android_fstab_for_nonsecure_keymint(
+                        &artifacts.android_fstab,
+                        &patched_fstab,
+                    )
+                    .map_err(|source| WorkerError::Io {
+                        operation: "project Android fstab for nonsecure KeyMint",
+                        path: patched_fstab.clone(),
+                        source,
+                    })?;
+                    artifacts.android_fstab = patched_fstab;
+                }
+            }
             let context = VmLaunchContextV2 {
                 spec: spec.clone(),
                 run_id,
                 guest_cid,
                 run_dir: run_dir.clone(),
                 disk_overlay: overlay,
-                artifacts: bundles.artifacts.clone(),
+                artifacts,
                 control_endpoint: endpoints.control,
                 frame_endpoint: endpoints.frame,
                 keyboard_endpoint: endpoints.keyboard,
@@ -684,30 +1019,42 @@ impl WorkerService {
             if let Some(serial) = &launch.adb_serial {
                 self.transition(ObservedStateV2::AdbConnecting, None)
                     .await?;
-                let bridge = adb_bridge
-                    .ok_or_else(|| WorkerError::CapabilityBlocked(vec!["adb.bridge".to_owned()]))?;
-                let port = adb_port.ok_or(WorkerError::ReadinessUnavailable)?;
-                self.start_component(
-                    ComponentStartSpec {
-                        executable: bridge,
-                        component: "adb-bridge".to_owned(),
-                        run_id,
-                        run_dir: run_dir.clone(),
-                        configuration: FormalComponentConfigurationV2::AdbBridge {
-                            listen_address: "127.0.0.1".to_owned(),
-                            listen_port: port,
-                            guest_cid,
-                            guest_port: 5555,
-                            vm_control_endpoint: launch.control_endpoint.clone(),
-                            crosvm_executable: launch.executable.clone(),
+                #[cfg(any(windows, target_os = "macos"))]
+                {
+                    let bridge = adb_bridge.ok_or_else(|| {
+                        WorkerError::CapabilityBlocked(vec!["adb.bridge".to_owned()])
+                    })?;
+                    let port = adb_port.ok_or(WorkerError::ReadinessUnavailable)?;
+                    self.start_component(
+                        ComponentStartSpec {
+                            executable: bridge,
+                            component: "adb-bridge".to_owned(),
+                            run_id,
+                            run_dir: run_dir.clone(),
+                            configuration: FormalComponentConfigurationV2::AdbBridge {
+                                listen_address: "127.0.0.1".to_owned(),
+                                listen_port: port,
+                                guest_cid,
+                                guest_port: 5555,
+                                vm_control_endpoint: launch.control_endpoint.clone(),
+                                crosvm_executable: launch.executable.clone(),
+                            },
                         },
-                    },
-                    &journal,
-                )
-                .await?;
+                        &journal,
+                    )
+                    .await?;
+                }
+                #[cfg(not(any(windows, target_os = "macos")))]
+                tracing::warn!(
+                    event = "worker.adb.bridge.skipped",
+                    instance_id = %self.instance_id,
+                    run_id = %run_id,
+                    %serial,
+                    "ADB bridge is not available on this host; readiness remains deferred"
+                );
                 let adb = AdbClient::new(discovery.adb, None)
                     .with_aapt2(host_tools.get("aapt2").cloned())
-                    .with_sensor_injector(Some(sensor_injector));
+                    .with_sensor_injector(sensor_injector.is_file().then_some(sensor_injector));
                 if native_display_direct {
                     // Native display attachment must not depend on adbd. Direct-linux images can
                     // create and present the gfxstream surface before their ADB transport is
@@ -737,7 +1084,14 @@ impl WorkerService {
                     adb.wait_ready(serial).await.map_err(WorkerError::Adb)?;
                 }
                 if !native_display_direct {
-                    adb.set_orientation(serial, spec.display.orientation)
+                    adb.apply_runtime_device_policy(
+                        serial,
+                        spec.devices.bluetooth,
+                        spec.devices.nfc,
+                    )
+                    .await;
+                    adb.keep_display_awake(serial).await.map_err(WorkerError::Adb)?;
+                    adb.set_display_configuration(serial, &spec.display)
                         .await
                         .map_err(WorkerError::Adb)?;
                 }
@@ -756,7 +1110,9 @@ impl WorkerService {
                         .adb_serial
                         .clone()
                         .ok_or(WorkerError::ReadinessUnavailable)?,
-                    spec.display.orientation,
+                    spec.display.clone(),
+                    spec.devices.bluetooth,
+                    spec.devices.nfc,
                 );
             }
             self.spawn_exit_monitor();
@@ -1619,7 +1975,9 @@ impl WorkerService {
         mutable.device_control_tokens.clear();
         mutable.journal = None;
         #[cfg(unix)]
-        mutable.device_output_sockets.clear();
+        mutable.device_output_files.clear();
+        #[cfg(unix)]
+        mutable.device_input_fifos.clear();
         Ok(())
     }
 
@@ -1686,7 +2044,7 @@ impl WorkerService {
         let previous = spec.display.clone();
         if display.orientation != previous.orientation
             && let (Some(adb), Some(serial)) = (&adb, serial.as_deref())
-            && let Err(error) = adb.set_orientation(serial, display.orientation).await
+            && let Err(error) = adb.set_display_configuration(serial, &display).await
         {
             return Err(WorkerError::Adb(error));
         }
@@ -1703,27 +2061,45 @@ impl WorkerService {
         }
         match action {
             InstanceActionV2::Key { key } => {
-                let (adb, serial) = {
-                    let mutable = self.mutable.lock().await;
-                    if !mutable.adb_ready {
-                        return Err(WorkerError::AdbNotReady);
-                    }
-                    (
-                        mutable
-                            .adb
-                            .clone()
-                            .ok_or(WorkerError::ReadinessUnavailable)?,
-                        mutable
-                            .status
-                            .adb_serial
-                            .clone()
-                            .ok_or(WorkerError::ReadinessUnavailable)?,
-                    )
-                };
-                adb.send_key(&serial, key).await?;
+                if key == KeyActionV2::Power {
+                    // Match Android's ADB KEYCODE_POWER semantics through the always-connected
+                    // virtio keyboard. The crosvm powerbtn control is unsupported by HVF, while
+                    // KEY_POWER must remain available when ADB is connecting or reconnecting.
+                    let (backend, keyboard_endpoint) = {
+                        let mutable = self.mutable.lock().await;
+                        (
+                            mutable.backend.clone().ok_or(WorkerError::NotRunning)?,
+                            mutable
+                                .launch
+                                .as_ref()
+                                .map(|plan| plan.keyboard_endpoint.clone())
+                                .ok_or(WorkerError::NotRunning)?,
+                        )
+                    };
+                    backend.send_key(&keyboard_endpoint, key).await?;
+                } else {
+                    let (adb, serial) = {
+                        let mutable = self.mutable.lock().await;
+                        if !mutable.adb_ready {
+                            return Err(WorkerError::AdbNotReady);
+                        }
+                        (
+                            mutable
+                                .adb
+                                .clone()
+                                .ok_or(WorkerError::ReadinessUnavailable)?,
+                            mutable
+                                .status
+                                .adb_serial
+                                .clone()
+                                .ok_or(WorkerError::ReadinessUnavailable)?,
+                        )
+                    };
+                    adb.send_key(&serial, key).await?;
+                }
             }
             InstanceActionV2::Rotate { orientation } => {
-                let (adb, serial) = {
+                let (adb, serial, mut display) = {
                     let mutable = self.mutable.lock().await;
                     if !mutable.adb_ready {
                         return Err(WorkerError::AdbNotReady);
@@ -1738,9 +2114,16 @@ impl WorkerService {
                             .adb_serial
                             .clone()
                             .ok_or(WorkerError::ReadinessUnavailable)?,
+                        mutable
+                            .active_spec
+                            .as_ref()
+                            .ok_or(WorkerError::NotRunning)?
+                            .display
+                            .clone(),
                     )
                 };
-                adb.set_orientation(&serial, orientation).await?;
+                display.orientation = orientation;
+                adb.set_display_configuration(&serial, &display).await?;
                 self.mutable
                     .lock()
                     .await
@@ -1754,10 +2137,33 @@ impl WorkerService {
                 self.call_device_component(
                     "hd-device-sim",
                     DeviceControlCommandV2::Action {
-                        action: InstanceActionV2::SetLocation { location },
+                        action: InstanceActionV2::SetLocation {
+                            location: location.clone(),
+                        },
                     },
                 )
                 .await?;
+                #[cfg(target_os = "macos")]
+                {
+                    let (adb, serial) = {
+                        let mutable = self.mutable.lock().await;
+                        if !mutable.adb_ready {
+                            return Err(WorkerError::AdbNotReady);
+                        }
+                        (
+                            mutable
+                                .adb
+                                .clone()
+                                .ok_or(WorkerError::ReadinessUnavailable)?,
+                            mutable
+                                .status
+                                .adb_serial
+                                .clone()
+                                .ok_or(WorkerError::ReadinessUnavailable)?,
+                        )
+                    };
+                    adb.set_location(&serial, &location).await?;
+                }
             }
             InstanceActionV2::SetBattery { battery } => {
                 self.call_device_component(
@@ -1827,24 +2233,27 @@ impl WorkerService {
                     },
                 )
                 .await?;
-                let (adb, serial) = {
-                    let mutable = self.mutable.lock().await;
-                    if !mutable.adb_ready {
-                        return Err(WorkerError::AdbNotReady);
-                    }
-                    (
-                        mutable
-                            .adb
-                            .clone()
-                            .ok_or(WorkerError::ReadinessUnavailable)?,
-                        mutable
-                            .status
-                            .adb_serial
-                            .clone()
-                            .ok_or(WorkerError::ReadinessUnavailable)?,
-                    )
-                };
-                adb.inject_sensor(&serial, &injection).await?;
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let (adb, serial) = {
+                        let mutable = self.mutable.lock().await;
+                        if !mutable.adb_ready {
+                            return Err(WorkerError::AdbNotReady);
+                        }
+                        (
+                            mutable
+                                .adb
+                                .clone()
+                                .ok_or(WorkerError::ReadinessUnavailable)?,
+                            mutable
+                                .status
+                                .adb_serial
+                                .clone()
+                                .ok_or(WorkerError::ReadinessUnavailable)?,
+                        )
+                    };
+                    adb.inject_sensor(&serial, &injection).await?;
+                }
             }
             InstanceActionV2::BluetoothPeer { action } => {
                 self.call_device_component(
@@ -2003,7 +2412,9 @@ impl WorkerService {
         self: &Arc<Self>,
         run_id: Uuid,
         serial: String,
-        orientation: hd_core::OrientationV2,
+        display: DisplayConfigV2,
+        bluetooth_enabled: bool,
+        nfc_enabled: bool,
     ) {
         let worker = Arc::clone(self);
         tokio::spawn(async move {
@@ -2065,7 +2476,19 @@ impl WorkerService {
                 );
                 return;
             }
-            if let Err(error) = adb.set_orientation(&serial, orientation).await {
+            adb.apply_runtime_device_policy(&serial, bluetooth_enabled, nfc_enabled)
+                .await;
+            if let Err(error) = adb.keep_display_awake(&serial).await {
+                tracing::warn!(
+                    event = "worker.adb.deferred_keep_awake.failed",
+                    instance_id = %worker.instance_id,
+                    %run_id,
+                    %serial,
+                    %error,
+                    "Android display keep-awake policy could not be applied"
+                );
+            }
+            if let Err(error) = adb.set_display_configuration(&serial, &display).await {
                 tracing::warn!(
                     event = "worker.adb.deferred_orientation.failed",
                     instance_id = %worker.instance_id,
@@ -2244,7 +2667,9 @@ impl WorkerService {
                 mutable.launch = None;
                 mutable.device_control_tokens.clear();
                 #[cfg(unix)]
-                mutable.device_output_sockets.clear();
+                mutable.device_output_files.clear();
+                #[cfg(unix)]
+                mutable.device_input_fifos.clear();
             }
         }
         transition_result?;
@@ -2291,14 +2716,21 @@ struct RuntimeEndpoints {
     devices: BTreeMap<String, DeviceSerialEndpointV2>,
     device_controls: BTreeMap<String, String>,
     #[cfg(unix)]
-    output_sockets: Vec<tokio::net::UnixDatagram>,
+    output_files: Vec<std::fs::File>,
+    #[cfg(unix)]
+    input_fifos: Vec<std::fs::File>,
 }
 
 fn enabled_device_components(spec: &InstanceSpecV2) -> Vec<&'static str> {
     let mut components = Vec::new();
-    if spec.devices.gnss || spec.devices.sensors || spec.devices.power || spec.devices.network {
+    if spec.devices.gnss
+        || spec.devices.sensors
+        || spec.devices.power
+        || (spec.devices.network && !cfg!(target_os = "macos"))
+    {
         components.push("hd-device-sim");
     }
+    #[cfg(not(target_os = "macos"))]
     for (enabled, component) in [
         (spec.devices.bluetooth, "rootcanal-adapter"),
         (spec.devices.nfc, "casimir-adapter"),
@@ -2313,6 +2745,16 @@ fn enabled_device_components(spec: &InstanceSpecV2) -> Vec<&'static str> {
 }
 
 fn device_role_enabled(spec: &InstanceSpecV2, role: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return match role {
+            "gnss" | "location" => spec.devices.gnss,
+            "sensors" => spec.devices.sensors,
+            "mcu-control" | "mcu-uart" => spec.devices.power,
+            _ => false,
+        };
+    }
+    #[cfg(not(target_os = "macos"))]
     match role {
         "bluetooth" => spec.devices.bluetooth,
         "gnss" | "location" => spec.devices.gnss,
@@ -2339,31 +2781,40 @@ impl RuntimeEndpoints {
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let mut devices = BTreeMap::new();
         #[cfg(unix)]
-        let mut output_sockets = Vec::new();
+        let mut output_files = Vec::new();
+        #[cfg(unix)]
+        let mut input_fifos = Vec::new();
         for role in DEVICE_GUEST_ENDPOINT_ROLES_V2 {
             if !device_role_enabled(spec, role) {
                 continue;
             }
-            let output = runtime_endpoint(spec.id, run_id, &format!("{role}-out"), "sock")?;
+            let output = runtime_endpoint(spec.id, run_id, &format!("{role}-out"), "bin")?;
             let input = runtime_endpoint(spec.id, run_id, &format!("{role}-in"), "fifo")?;
             #[cfg(unix)]
             {
-                let socket =
-                    tokio::net::UnixDatagram::bind(&output).map_err(|source| WorkerError::Io {
-                        operation: "bind device output socket",
+                let output_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&output)
+                    .map_err(|source| WorkerError::Io {
+                        operation: "create device output file",
                         path: PathBuf::from(&output),
                         source,
                     })?;
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600)).map_err(
-                    |source| WorkerError::Io {
-                        operation: "secure device output socket",
-                        path: PathBuf::from(&output),
-                        source,
-                    },
-                )?;
                 hd_platform::create_owner_only_fifo(Path::new(&input))?;
-                output_sockets.push(socket);
+                let fifo = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&input)
+                    .map_err(|source| WorkerError::Io {
+                        operation: "hold device input FIFO open",
+                        path: PathBuf::from(&input),
+                        source,
+                    })?;
+                output_files.push(output_file);
+                input_fifos.push(fifo);
             }
             devices.insert(
                 role.to_owned(),
@@ -2380,7 +2831,9 @@ impl RuntimeEndpoints {
             devices,
             device_controls,
             #[cfg(unix)]
-            output_sockets,
+            output_files,
+            #[cfg(unix)]
+            input_fifos,
         })
     }
 }
@@ -2389,10 +2842,11 @@ fn runtime_endpoint(
     instance_id: Uuid,
     run_id: Uuid,
     role: &str,
-    _suffix: &str,
+    suffix: &str,
 ) -> Result<String, WorkerError> {
     #[cfg(windows)]
     {
+        let _ = suffix;
         let scope = hd_platform::current_user_scope()?;
         Ok(format!(
             r"\\.\pipe\bscp-hd-{scope}-{instance_id}-{run_id}-{role}"
@@ -2404,7 +2858,7 @@ fn runtime_endpoint(
         let scope = hd_platform::current_user_scope()?;
         let instance = &instance_id.simple().to_string()[..12];
         let run = &run_id.simple().to_string()[..12];
-        let path = root.join(format!("hd-{scope}-{instance}-{run}-{role}.{_suffix}"));
+        let path = root.join(format!("hd-{scope}-{instance}-{run}-{role}.{suffix}"));
         if path.as_os_str().len() >= 100 {
             return Err(WorkerError::EndpointTooLong(path));
         }
@@ -2412,7 +2866,12 @@ fn runtime_endpoint(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "macos"))]
+fn runtime_root() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn runtime_root() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -2470,7 +2929,10 @@ fn cleanup_runtime_endpoints(launch: &LaunchPlanV2) -> Result<(), WorkerError> {
                     });
                 }
             };
-            if !(metadata.file_type().is_socket() || metadata.file_type().is_fifo()) {
+            if !(metadata.file_type().is_socket()
+                || metadata.file_type().is_fifo()
+                || metadata.file_type().is_file())
+            {
                 return Err(WorkerError::UnsafeEndpoint(path));
             }
             std::fs::remove_file(&path).map_err(|source| WorkerError::Io {

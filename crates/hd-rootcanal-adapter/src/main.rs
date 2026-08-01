@@ -1,4 +1,7 @@
 #![allow(unsafe_code)]
+#![cfg_attr(not(windows), allow(dead_code, unused_mut, clippy::unused_async))]
+
+// The formal RootCanal runtime is Windows-only; non-Windows builds retain probe and parser coverage.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -100,6 +103,7 @@ struct Peer {
     advertising: bool,
 }
 
+#[cfg(windows)]
 unsafe extern "C" {
     fn rootcanal_controller_new(
         address: *const u8,
@@ -123,6 +127,41 @@ unsafe extern "C" {
     );
     fn rootcanal_controller_tick(controller: *mut c_void);
 }
+
+#[cfg(not(windows))]
+unsafe fn rootcanal_controller_new(
+    _address: *const u8,
+    _context: *mut c_void,
+    _hci_callback: unsafe extern "C" fn(*mut c_void, i32, *const u8, usize),
+    _link_layer_callback: unsafe extern "C" fn(*mut c_void, *const u8, usize, i32, i32),
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(windows))]
+unsafe fn rootcanal_controller_delete(_controller: *mut c_void) {}
+
+#[cfg(not(windows))]
+unsafe fn rootcanal_controller_receive_hci(
+    _controller: *mut c_void,
+    _packet_type: i32,
+    _data: *const u8,
+    _size: usize,
+) {
+}
+
+#[cfg(not(windows))]
+unsafe fn rootcanal_controller_receive_ll(
+    _controller: *mut c_void,
+    _data: *const u8,
+    _size: usize,
+    _phy: i32,
+    _rssi: i32,
+) {
+}
+
+#[cfg(not(windows))]
+unsafe fn rootcanal_controller_tick(_controller: *mut c_void) {}
 
 impl Controller {
     fn new(
@@ -237,7 +276,7 @@ fn probe() -> FormalComponentProbeV2 {
     FormalComponentProbeV2 {
         protocol_version: COMPONENT_PROTOCOL_VERSION,
         component: "rootcanal-adapter".to_owned(),
-        formal: true,
+        formal: cfg!(windows),
         features: vec![
             "guest-serial-v2".to_owned(),
             "hci-v2".to_owned(),
@@ -250,6 +289,10 @@ fn probe() -> FormalComponentProbeV2 {
 }
 
 async fn serve_formal(launch_path: &Path) -> Result<()> {
+    if !cfg!(windows) {
+        bail!("the formal RootCanal runtime is supported only on Windows");
+    }
+
     let launch_bytes = hd_platform::read_regular_nofollow_limited(launch_path, 64 * 1024)
         .context("read RootCanal adapter launch")?;
     let launch: FormalComponentLaunchV2 =

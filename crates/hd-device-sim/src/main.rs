@@ -13,14 +13,18 @@ use hd_core::{
 use hd_device_sim::{DeviceCommandV2, DeviceRequestV2, DeviceSimulatorV2, probe};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
-use tokio::io::{
-    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader,
-};
+#[cfg(windows)]
+use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const MAX_DEVICE_MESSAGE_BYTES: usize = 64 * 1024;
+#[cfg(windows)]
 const FIXED_LOCATION_COMMAND: &[u8] = b"CMD_GET_LOCATION";
+
+#[cfg(unix)]
+mod sensor_bridge;
 
 #[derive(Debug, Parser)]
 #[command(about = "Signed HD host-side Android device simulator")]
@@ -47,6 +51,7 @@ struct FormalContext {
     launch: FormalComponentLaunchV2,
     control_endpoint: String,
     control_token: DeviceControlTokenV2,
+    #[cfg_attr(not(windows), allow(dead_code))]
     guest_endpoints: std::collections::BTreeMap<String, DeviceSerialEndpointV2>,
     simulator: Mutex<DeviceSimulatorV2>,
 }
@@ -129,6 +134,18 @@ async fn serve_formal(launch_path: &Path) -> Result<()> {
         guest_endpoints,
         simulator: Mutex::new(DeviceSimulatorV2::default()),
     });
+    #[cfg(unix)]
+    if context.guest_endpoints.contains_key("sensors") {
+        let bridge_context = Arc::clone(&context);
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = sensor_bridge::run(Arc::clone(&bridge_context)).await {
+                    tracing::warn!(%error, "sensor Guest bridge disconnected");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        });
+    }
     #[cfg(windows)]
     if context.guest_endpoints.contains_key("location") {
         let bridge_context = Arc::clone(&context);
@@ -396,6 +413,7 @@ where
     }
 }
 
+#[cfg(windows)]
 fn format_fixed_location(location: &hd_core::LocationV2) -> String {
     let timestamp_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

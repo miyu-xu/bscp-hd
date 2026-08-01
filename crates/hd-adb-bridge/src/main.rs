@@ -1,4 +1,7 @@
+#![cfg_attr(not(windows), allow(clippy::unused_async))]
+
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,8 +13,11 @@ use hd_core::{
     FormalComponentProbeV2, FormalComponentReadyV2,
 };
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::AsyncReadExt as _;
+#[cfg(any(windows, target_os = "macos"))]
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(windows)]
 use tokio::process::Command;
 
 const LAUNCH_LIMIT: u64 = 64 * 1024;
@@ -19,6 +25,7 @@ const LAUNCH_LIMIT: u64 = 64 * 1024;
 // loader/AV scanning before it reaches the already-running VM control pipe.  Keep this aligned
 // with the runtime control timeout so a cold helper launch does not leave ADB permanently offline.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
 const PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -37,10 +44,13 @@ struct Arguments {
 
 #[derive(Debug)]
 struct BridgeContext {
+    #[cfg(windows)]
     crosvm_executable: PathBuf,
     guest_cid: u32,
     guest_port: u32,
+    #[cfg(windows)]
     vm_control_endpoint: String,
+    #[cfg(windows)]
     connection_gate: tokio::sync::Mutex<()>,
 }
 
@@ -68,26 +78,36 @@ async fn main() -> Result<()> {
 }
 
 fn probe() -> FormalComponentProbeV2 {
+    let formal = cfg!(any(windows, target_os = "macos"));
+    let mut features = if formal {
+        vec![
+            "loopback-tcp-v2".to_owned(),
+            "vsock-guest-v2".to_owned(),
+            "ready-marker-v2".to_owned(),
+            "lifecycle-v2".to_owned(),
+        ]
+    } else {
+        Vec::new()
+    };
+    if cfg!(windows) {
+        features.push("windows-owner-pipe-v2".to_owned());
+    }
+    if cfg!(target_os = "macos") {
+        features.push("macos-owner-uds-v1".to_owned());
+    }
     FormalComponentProbeV2 {
         protocol_version: COMPONENT_PROTOCOL_VERSION,
         component: "adb-bridge".to_owned(),
-        formal: cfg!(windows),
-        features: if cfg!(windows) {
-            vec![
-                "loopback-tcp-v2".to_owned(),
-                "vsock-guest-v2".to_owned(),
-                "ready-marker-v2".to_owned(),
-                "lifecycle-v2".to_owned(),
-                "windows-owner-pipe-v2".to_owned(),
-            ]
-        } else {
-            Vec::new()
-        },
+        formal,
+        features,
     }
 }
 
 async fn serve(launch_path: &Path) -> Result<()> {
-    ensure!(cfg!(windows), "hd-adb-bridge currently requires Windows");
+    ensure!(
+        cfg!(any(windows, target_os = "macos")),
+        "hd-adb-bridge requires Windows or macOS"
+    );
     let launch_bytes = hd_platform::read_regular_nofollow_limited(launch_path, LAUNCH_LIMIT)
         .context("read ADB bridge launch")?;
     let launch: FormalComponentLaunchV2 =
@@ -129,6 +149,14 @@ async fn serve(launch_path: &Path) -> Result<()> {
         vm_control_endpoint.starts_with(r"\\.\pipe\"),
         "crosvm control endpoint is not a local named pipe"
     );
+    #[cfg(target_os = "macos")]
+    ensure!(
+        vm_control_endpoint.starts_with('/')
+            && Path::new(vm_control_endpoint)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("sock")),
+        "crosvm control endpoint is not a local Unix socket"
+    );
 
     let listener = TcpListener::bind((listen_address.as_str(), *listen_port))
         .await
@@ -144,10 +172,13 @@ async fn serve(launch_path: &Path) -> Result<()> {
     );
     publish_ready(&launch, &launch_bytes)?;
     let context = Arc::new(BridgeContext {
+        #[cfg(windows)]
         crosvm_executable: crosvm_executable.clone(),
         guest_cid: *guest_cid,
         guest_port: *guest_port,
+        #[cfg(windows)]
         vm_control_endpoint: vm_control_endpoint.clone(),
+        #[cfg(windows)]
         connection_gate: tokio::sync::Mutex::new(()),
     });
     loop {
@@ -201,51 +232,117 @@ async fn bridge_connection(mut tcp: TcpStream, context: &BridgeContext) -> Resul
         );
         return Ok(());
     }
-    // crosvm exposes one named-pipe instance for a guest CID/port pair. ADB may open a new TCP
-    // transport while it is tearing down an offline one, so serialize the corresponding vsock
-    // sessions instead of racing multiple connect_vsock commands against the same pipe.
-    let _connection_guard = context.connection_gate.lock().await;
+    #[cfg(target_os = "macos")]
+    {
+        return bridge_macos_uds(&mut tcp, context, &initial[..initial_size]).await;
+    }
+
+    #[cfg(windows)]
+    {
+        // crosvm exposes one named-pipe instance for a guest CID/port pair. ADB may open a new TCP
+        // transport while it is tearing down an offline one, so serialize the corresponding vsock
+        // sessions instead of racing multiple connect_vsock commands against the same pipe.
+        let _connection_guard = context.connection_gate.lock().await;
+        tracing::info!(
+            event = "adb.bridge.connect_vsock.started",
+            guest_cid = context.guest_cid,
+            guest_port = context.guest_port,
+            vm_control_endpoint = %context.vm_control_endpoint,
+            "requesting crosvm connect_vsock"
+        );
+        let mut command = Command::new(&context.crosvm_executable);
+        command
+            .args([
+                "connect_vsock",
+                &context.guest_port.to_string(),
+                &context.vm_control_endpoint,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        hd_platform::configure_transient_command(command.as_std_mut())
+            .context("configure hidden crosvm connect_vsock process")?;
+        let status = tokio::time::timeout(CONTROL_TIMEOUT, command.status())
+            .await
+            .context("crosvm connect_vsock timed out")?
+            .context("start crosvm connect_vsock")?;
+        if status.success() {
+            tracing::info!(
+                event = "adb.bridge.connect_vsock.succeeded",
+                guest_cid = context.guest_cid,
+                guest_port = context.guest_port,
+                "crosvm connect_vsock succeeded"
+            );
+        } else {
+            tracing::warn!(
+                event = "adb.bridge.connect_vsock.nonzero",
+                guest_cid = context.guest_cid,
+                guest_port = context.guest_port,
+                %status,
+                "crosvm connect_vsock returned nonzero; attempting to consume a pending host-vsock pipe"
+            );
+        }
+        bridge_named_pipe(&mut tcp, context, &initial[..initial_size]).await
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    bail!("guest-vsock transport is unavailable on this platform")
+}
+
+#[cfg(target_os = "macos")]
+async fn bridge_macos_uds(
+    tcp: &mut TcpStream,
+    context: &BridgeContext,
+    initial: &[u8],
+) -> Result<()> {
+    use tokio::net::UnixStream;
+
+    const HOST_CONNECT_MAGIC: &[u8; 4] = b"HDVS";
+    const HOST_CONNECT_VERSION: u32 = 1;
+    let endpoint = format!("/tmp/bscp_crosvm_vsock_{}.sock", context.guest_cid);
     tracing::info!(
-        event = "adb.bridge.connect_vsock.started",
+        event = "adb.bridge.uds.connecting",
+        endpoint = %endpoint,
         guest_cid = context.guest_cid,
         guest_port = context.guest_port,
-        vm_control_endpoint = %context.vm_control_endpoint,
-        "requesting crosvm connect_vsock"
+        "connecting to crosvm host-vsock endpoint"
     );
-    let mut command = Command::new(&context.crosvm_executable);
-    command
-        .args([
-            "connect_vsock",
-            &context.guest_port.to_string(),
-            &context.vm_control_endpoint,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    hd_platform::configure_transient_command(command.as_std_mut())
-        .context("configure hidden crosvm connect_vsock process")?;
-    let status = tokio::time::timeout(CONTROL_TIMEOUT, command.status())
+    let mut vsock = tokio::time::timeout(CONTROL_TIMEOUT, UnixStream::connect(&endpoint))
         .await
-        .context("crosvm connect_vsock timed out")?
-        .context("start crosvm connect_vsock")?;
-    if status.success() {
-        tracing::info!(
-            event = "adb.bridge.connect_vsock.succeeded",
-            guest_cid = context.guest_cid,
-            guest_port = context.guest_port,
-            "crosvm connect_vsock succeeded"
-        );
-    } else {
-        tracing::warn!(
-            event = "adb.bridge.connect_vsock.nonzero",
-            guest_cid = context.guest_cid,
-            guest_port = context.guest_port,
-            %status,
-            "crosvm connect_vsock returned nonzero; attempting to consume a pending host-vsock pipe"
-        );
-    }
-    bridge_named_pipe(&mut tcp, context, &initial[..initial_size]).await
+        .context("crosvm host-vsock endpoint timed out")?
+        .with_context(|| format!("connect crosvm host-vsock endpoint {endpoint}"))?;
+    let mut header = [0_u8; 12];
+    header[..4].copy_from_slice(HOST_CONNECT_MAGIC);
+    header[4..8].copy_from_slice(&HOST_CONNECT_VERSION.to_be_bytes());
+    header[8..12].copy_from_slice(&context.guest_port.to_be_bytes());
+    vsock
+        .write_all(&header)
+        .await
+        .context("write crosvm host-vsock request")?;
+    vsock
+        .write_all(initial)
+        .await
+        .context("copy initial ADB bytes to guest-vsock")?;
+    tracing::info!(
+        event = "adb.bridge.uds.connected",
+        endpoint = %endpoint,
+        guest_cid = context.guest_cid,
+        guest_port = context.guest_port,
+        "crosvm host-vsock connection requested"
+    );
+    let (tcp_to_guest, guest_to_tcp) = tokio::io::copy_bidirectional(tcp, &mut vsock)
+        .await
+        .context("bridge ADB TCP and macOS guest-vsock")?;
+    tracing::info!(
+        event = "adb.bridge.copy.finished",
+        tcp_to_guest,
+        guest_to_tcp,
+        "ADB bridge byte copy finished"
+    );
+    let _ = vsock.shutdown().await;
+    tcp.shutdown().await.context("shutdown ADB TCP stream")?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -321,15 +418,7 @@ async fn bridge_named_pipe(
     Ok(())
 }
 
-#[cfg(not(windows))]
-async fn bridge_named_pipe(
-    _tcp: &mut TcpStream,
-    _context: &BridgeContext,
-    _initial: &[u8],
-) -> Result<()> {
-    bail!("Windows named-pipe guest-vsock transport is unavailable")
-}
-
+#[cfg(windows)]
 fn is_pipe_instance_busy_error(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(231)
 }

@@ -490,6 +490,7 @@ impl HostService {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn reconcile(self: &Arc<Self>) -> Result<Vec<ReconcileReportV2>, HostError> {
         let mut reports = Vec::new();
         for mut record in self.store.list_instances()? {
@@ -530,14 +531,28 @@ impl HostService {
                 actions.push("stale_worker_identity_removed".to_owned());
             }
             if !reconnected && record.status.observed.is_active() {
-                let target = if worker_alive_unverified
-                    || record.status.desired == DesiredStateV2::Running
-                        && matches!(record.spec.restart_policy, RestartPolicyV2::OnFailure)
+                let restart_requested = record.status.desired == DesiredStateV2::Running
+                    && matches!(record.spec.restart_policy, RestartPolicyV2::OnFailure);
+                #[cfg(target_os = "macos")]
+                let defer_native_display_restart = !worker_alive_unverified
+                    && restart_requested
+                    && crate::dev::native_display_direct_enabled();
+                #[cfg(not(target_os = "macos"))]
+                let defer_native_display_restart = false;
+                let target = if (worker_alive_unverified || restart_requested)
+                    && !defer_native_display_restart
                 {
                     ObservedStateV2::Recovering
                 } else {
                     ObservedStateV2::Stopped
                 };
+                if defer_native_display_restart {
+                    // A macOS CAContext endpoint is owned by the Player process and must be in
+                    // crosvm's environment before gfxstream creates its CAMetalLayer. Leave the
+                    // desired state intact, but let the Player establish its display session
+                    // before it starts the replacement Worker.
+                    actions.push("native_display_restart_deferred_until_player_session".to_owned());
+                }
                 record.status.force_reconciled(
                     target,
                     Some(if worker_alive_unverified {
@@ -557,6 +572,7 @@ impl HostService {
                 } else {
                     record.active_run_id = None;
                     record.adb_serial = None;
+                    record.adb_ready = false;
                     self.leases.release_instance(record.spec.id)?;
                 }
             } else if !reconnected
@@ -566,6 +582,7 @@ impl HostService {
                 record.worker = None;
                 record.active_run_id = None;
                 record.adb_serial = None;
+                record.adb_ready = false;
                 self.leases.release_instance(record.spec.id)?;
             }
             self.store.put_instance(&record)?;
@@ -1227,6 +1244,7 @@ impl HostService {
                 .force_reconciled(ObservedStateV2::Stopped, None, None);
             record.active_run_id = None;
             record.adb_serial = None;
+            record.adb_ready = false;
             self.leases.release_instance(id)?;
             self.persist_instance(&record)?;
             return Ok(());
@@ -1266,6 +1284,7 @@ impl HostService {
             .force_reconciled(ObservedStateV2::Stopped, None, None);
         record.active_run_id = None;
         record.adb_serial = None;
+        record.adb_ready = false;
         record.host_fps_milli = None;
         self.leases.release_instance(id)?;
         self.persist_instance(&record)
@@ -1745,6 +1764,7 @@ impl HostService {
         record.worker = None;
         record.active_run_id = None;
         record.adb_serial = None;
+        record.adb_ready = false;
         record.host_fps_milli = None;
         if let Err(release_error) = self.leases.release_instance(record.spec.id) {
             tracing::error!(
@@ -1770,6 +1790,32 @@ impl HostService {
     fn schedule_runtime_restart(self: &Arc<Self>, record: &InstanceRecordV2, cause: &str) {
         if !should_restart_after_failure(record) {
             return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let has_live_display_session = self
+                .display_sessions
+                .try_lock()
+                .ok()
+                .and_then(|sessions| {
+                    sessions.get(&record.spec.id).map(|active| {
+                        process_identity_is_alive(active.target.owner())
+                            && active.session.expires_at > OffsetDateTime::now_utc()
+                    })
+                })
+                .unwrap_or(false);
+            if should_wait_for_native_display_session(
+                crate::dev::native_display_direct_enabled(),
+                has_live_display_session,
+            ) {
+                tracing::debug!(
+                    event = "instance.runtime_failure.restart_waiting_for_player_session",
+                    instance_id = %record.spec.id,
+                    %cause,
+                    "macOS zero-copy recovery is waiting for a live Player display session"
+                );
+                return;
+            }
         }
         let attempt = {
             let mut restarts = self.runtime_restarts.lock();
@@ -1897,6 +1943,7 @@ fn sync_runtime_fields(record: &mut InstanceRecordV2, status: &WorkerStatusV2) {
     record.worker = Some(status.identity.clone());
     record.active_run_id = status.run_id;
     record.adb_serial.clone_from(&status.adb_serial);
+    record.adb_ready = status.adb_ready;
     record.frame_generation = record.frame_generation.max(status.frame_generation);
     record.host_fps_milli =
         (status.frame_metrics.fps_milli > 0).then_some(status.frame_metrics.fps_milli);
@@ -1905,6 +1952,25 @@ fn sync_runtime_fields(record: &mut InstanceRecordV2, status: &WorkerStatusV2) {
 fn should_restart_after_failure(record: &InstanceRecordV2) -> bool {
     record.status.desired == DesiredStateV2::Running
         && matches!(record.spec.restart_policy, RestartPolicyV2::OnFailure)
+}
+
+const fn should_wait_for_native_display_session(
+    native_display_direct: bool,
+    has_live_display_session: bool,
+) -> bool {
+    native_display_direct && !has_live_display_session
+}
+
+#[cfg(test)]
+mod native_display_restart_tests {
+    use super::should_wait_for_native_display_session;
+
+    #[test]
+    fn macos_zero_copy_restart_waits_for_player_session() {
+        assert!(should_wait_for_native_display_session(true, false));
+        assert!(!should_wait_for_native_display_session(true, true));
+        assert!(!should_wait_for_native_display_session(false, false));
+    }
 }
 
 fn frame_generation_high_water(paths: &DataPaths, instance_id: Uuid) -> u64 {

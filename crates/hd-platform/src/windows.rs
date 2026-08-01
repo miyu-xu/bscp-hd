@@ -420,6 +420,9 @@ fn windows_target(
             }
             Ok((hwnd, owner))
         }
+        NativeDisplayTargetV2::MacCaContext { .. } => Err(PlatformError::Identity(
+            "Windows display requires an HWND target".to_owned(),
+        )),
     }
 }
 

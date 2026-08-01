@@ -169,10 +169,19 @@ impl CapabilityDiscovery {
                                 probes.push(supported_probe(
                                     "display.zero_copy",
                                     true,
-                                    "Windows native child HWND is rendered directly by crosvm/gfxstream",
+                                    if cfg!(target_os = "macos") {
+                                        "macOS CoreAnimation remote layer is rendered directly by crosvm/gfxstream"
+                                    } else {
+                                        "Windows native child HWND is rendered directly by crosvm/gfxstream"
+                                    },
                                     BTreeMap::from([(
                                         "mode".to_owned(),
-                                        "native_child_hwnd".to_owned(),
+                                        if cfg!(target_os = "macos") {
+                                            "mac_ca_context"
+                                        } else {
+                                            "native_child_hwnd"
+                                        }
+                                        .to_owned(),
                                     )]),
                                 ));
                             } else if dev_display_copy_fallback {
@@ -367,7 +376,7 @@ impl CapabilityDiscovery {
                 BTreeMap::new(),
             ),
         });
-        probes.push(device_probe(&devices, spec.is_some()));
+        probes.push(device_probe(&devices, spec));
 
         let evidence_fingerprint = release_fingerprint(&probes, &devices);
         let certified = if fast_artifacts && spec.is_some() {
@@ -564,7 +573,10 @@ async fn run_probe_process(path: &Path, arguments: &[&str]) -> Result<ProbeOutpu
         .take()
         .ok_or_else(|| "probe stderr pipe was not created".to_owned())?;
     let exchange = async move {
-        let _containment = containment;
+        tracing::debug!(
+            containment_pid = containment.process_id(),
+            "probe process containment established"
+        );
         let (stdout, stderr, status) = tokio::try_join!(
             read_probe_stream(stdout),
             read_probe_stream(stderr),
@@ -700,13 +712,32 @@ fn resource_probe(paths: &DataPaths, spec: Option<&InstanceSpecV2>) -> Capabilit
     }
 }
 
-fn device_probe(devices: &DeviceCapabilitiesV2, required: bool) -> CapabilityProbeV2 {
+fn device_probe(
+    devices: &DeviceCapabilitiesV2,
+    spec: Option<&InstanceSpecV2>,
+) -> CapabilityProbeV2 {
+    let enabled = |id: &str| {
+        spec.is_none_or(|spec| match id {
+            "bluetooth" => spec.devices.bluetooth,
+            "nfc" => spec.devices.nfc,
+            "uwb" => spec.devices.uwb,
+            "modem" => spec.devices.modem,
+            "gnss" => spec.devices.gnss,
+            "sensors" => spec.devices.sensors,
+            "network" => spec.devices.network,
+            "audio" => spec.devices.audio,
+            "camera" => spec.devices.camera,
+            "power" => spec.devices.power,
+            _ => true,
+        })
+    };
     let missing = devices
         .devices
         .iter()
-        .filter(|device| !device.available)
+        .filter(|device| enabled(&device.id) && !device.available)
         .map(|device| device.id.clone())
         .collect::<Vec<_>>();
+    let required = spec.is_some();
     if missing.is_empty() {
         supported_probe(
             "device.profile",
@@ -781,7 +812,7 @@ async fn device_capabilities(
     let network = artifact_roles_status(tools, &["crosvm", "hd-device-sim"]);
     let audio = artifact_roles_status(tools, &["crosvm", "crosvm-runtime-audio"]);
     let camera = artifact_roles_status(tools, &["crosvm", "gfxstream-backend"]);
-    let statuses = FormalDeviceStatuses {
+    let statuses = constrain_host_device_capabilities(FormalDeviceStatuses {
         simulator,
         sensor_injector: artifact_file_status(sensor_injector, "sensor-injector"),
         bluetooth,
@@ -791,7 +822,7 @@ async fn device_capabilities(
         network,
         audio,
         camera,
-    };
+    });
     compose_device_capabilities(&statuses)
 }
 
@@ -799,7 +830,7 @@ fn fast_device_capabilities(
     tools: &BTreeMap<String, PathBuf>,
     sensor_injector: &Path,
 ) -> DeviceCapabilitiesV2 {
-    let statuses = FormalDeviceStatuses {
+    let statuses = constrain_host_device_capabilities(FormalDeviceStatuses {
         simulator: fast_formal_tool_status(true, tools, "hd-device-sim"),
         sensor_injector: artifact_file_status(sensor_injector, "sensor-injector"),
         bluetooth: fast_formal_tool_status(true, tools, "rootcanal-adapter"),
@@ -809,7 +840,7 @@ fn fast_device_capabilities(
         network: artifact_roles_status(tools, &["crosvm", "hd-device-sim"]),
         audio: artifact_roles_status(tools, &["crosvm", "crosvm-runtime-audio"]),
         camera: artifact_roles_status(tools, &["crosvm", "gfxstream-backend"]),
-    };
+    });
     compose_device_capabilities(&statuses)
 }
 
@@ -826,9 +857,117 @@ struct FormalDeviceStatuses {
     camera: FormalToolStatus,
 }
 
+fn constrain_host_device_capabilities(mut statuses: FormalDeviceStatuses) -> FormalDeviceStatuses {
+    #[cfg(target_os = "macos")]
+    {
+        statuses.bluetooth = software_on_macos(
+            "Android AIDL Bluetooth HCI and framework services; host peer/RF injection is not exposed",
+        );
+        statuses.nfc = software_on_macos(
+            "Android NFC framework package and HCE surface; host NDEF/RF injection is not exposed",
+        );
+        statuses.uwb = software_on_macos(
+            "Android UWB framework and AIDL HAL baseline; host ranging injection is not exposed",
+        );
+        statuses.modem = software_on_macos(
+            "Android Radio AIDL HAL baseline with deterministic out-of-service state",
+        );
+        statuses.network = software_on_macos(
+            "Android Connectivity and wireless simulation stack in an offline profile",
+        );
+        statuses.audio = software_on_macos(
+            "Android AIDL Audio HAL with deterministic virtual speaker and microphone endpoints",
+        );
+        statuses.camera = software_on_macos(
+            "Android virtual camera provider with deterministic internal test sources",
+        );
+    }
+    statuses
+}
+
+#[cfg(target_os = "macos")]
+fn software_on_macos(detail: &str) -> FormalToolStatus {
+    FormalToolStatus {
+        available: true,
+        detail: format!("macOS Guest software simulation: {detail}"),
+    }
+}
+
 fn compose_device_capabilities(statuses: &FormalDeviceStatuses) -> DeviceCapabilitiesV2 {
     let mut devices = primary_device_capabilities(statuses);
     devices.extend(simulated_device_capabilities(statuses));
+    #[cfg(target_os = "macos")]
+    for device in &mut devices {
+        device.available = true;
+        device.backend = DeviceBackendKindV2::SoftwareBacked;
+        let (boundary, features): (&str, &[&str]) = match device.id.as_str() {
+            "bluetooth" => (
+                "Android AIDL Bluetooth HCI and framework software surface; no physical RF or host peer injection claim",
+                &["hci_service", "framework_state"],
+            ),
+            "nfc" => (
+                "Android NFC framework and HCE software surface; no secure-element, physical RF, or host NDEF injection claim",
+                &["framework_state", "hce"],
+            ),
+            "uwb" => (
+                "Android UWB framework and AIDL HAL software baseline; no physical ranging, angle, RF, or host session injection claim",
+                &["framework_state", "aidl_hal"],
+            ),
+            "modem" => (
+                "Android Radio AIDL HAL software baseline with deterministic out-of-service state; no carrier, call, SMS, IMS, or data-attach claim",
+                &["radio_hal", "service_state"],
+            ),
+            "gnss" => (
+                "Android LocationManager test provider with deterministic coordinate injection and verification",
+                &["location", "runtime_control"],
+            ),
+            "sensors" => (
+                "Android Guest software Sensors HAL with deterministic accelerometer, gyroscope, magnetometer, light and proximity sources",
+                &[
+                    "accelerometer",
+                    "gyroscope",
+                    "magnetometer",
+                    "light",
+                    "proximity",
+                ],
+            ),
+            "network" => (
+                "Android Connectivity and wireless simulation stack in an offline profile; no host uplink or runtime traffic shaping claim",
+                &["connectivity_stack", "offline_profile"],
+            ),
+            "audio" => (
+                "Android AIDL Audio HAL with deterministic virtual speaker and microphone endpoints; no physical host-device audio claim",
+                &["aidl_audio_hal", "playback", "capture", "virtual_endpoints"],
+            ),
+            "camera" => (
+                "Android virtual camera provider with deterministic internal test sources; no physical host-camera claim",
+                &["preview", "jpeg_capture", "virtual_test_source"],
+            ),
+            "power" => (
+                "Android BatteryService software state with typed host injection and verification",
+                &["battery", "runtime_control"],
+            ),
+            _ => continue,
+        };
+        device.boundary = boundary.to_owned();
+        device.features = features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect();
+    }
+    #[cfg(not(target_os = "macos"))]
+    for device in &mut devices {
+        if matches!(
+            device.id.as_str(),
+            "bluetooth" | "nfc" | "gnss" | "sensors" | "network" | "power"
+        ) && !device
+            .features
+            .iter()
+            .any(|feature| feature == "runtime_control")
+        {
+            device.features.push("runtime_control".to_owned());
+        }
+    }
     DeviceCapabilitiesV2 {
         profile: "hd-phone-android15-v2".to_owned(),
         devices,
@@ -897,11 +1036,19 @@ fn simulated_device_capabilities(statuses: &FormalDeviceStatuses) -> Vec<DeviceC
         device(
             "sensors",
             DeviceBackendKindV2::Simulated,
-            statuses.simulator.available && statuses.sensor_injector.available,
-            &format!(
-                "Android SensorService HAL-bypass injection for the fixed five-sensor manifest; simulator: {}; Guest injector: {}",
-                statuses.simulator.detail, statuses.sensor_injector.detail
-            ),
+            statuses.simulator.available
+                && (cfg!(target_os = "macos") || statuses.sensor_injector.available),
+            &if cfg!(target_os = "macos") {
+                format!(
+                    "Android Sensors HAL hvc13 bridge for the fixed five-sensor manifest; simulator: {}",
+                    statuses.simulator.detail
+                )
+            } else {
+                format!(
+                    "Android SensorService HAL-bypass injection for the fixed five-sensor manifest; simulator: {}; Guest injector: {}",
+                    statuses.simulator.detail, statuses.sensor_injector.detail
+                )
+            },
             &[
                 "accelerometer",
                 "gyroscope",

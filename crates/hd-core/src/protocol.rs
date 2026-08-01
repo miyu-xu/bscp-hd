@@ -344,6 +344,8 @@ pub struct InstanceRecordV2 {
     pub active_run_id: Option<Uuid>,
     pub worker: Option<WorkerIdentityV2>,
     pub adb_serial: Option<String>,
+    #[serde(default)]
+    pub adb_ready: bool,
     pub host_fps_milli: Option<u32>,
     pub frame_generation: u64,
     #[serde(with = "time::serde::rfc3339")]
@@ -358,6 +360,7 @@ impl InstanceRecordV2 {
             active_run_id: None,
             worker: None,
             adb_serial: None,
+            adb_ready: false,
             host_fps_milli: None,
             frame_generation: 0,
             created_at: OffsetDateTime::now_utc(),
@@ -373,6 +376,8 @@ pub struct InstanceSummaryV2 {
     pub active_run_id: Option<Uuid>,
     pub worker: Option<WorkerIdentityV2>,
     pub adb_serial: Option<String>,
+    #[serde(default)]
+    pub adb_ready: bool,
     pub host_fps_milli: Option<u32>,
     pub frame_generation: u64,
 }
@@ -386,6 +391,7 @@ impl From<&InstanceRecordV2> for InstanceSummaryV2 {
             active_run_id: record.active_run_id,
             worker: record.worker.clone(),
             adb_serial: record.adb_serial.clone(),
+            adb_ready: record.adb_ready,
             host_fps_milli: record.host_fps_milli,
             frame_generation: record.frame_generation,
         }
@@ -1049,6 +1055,8 @@ pub struct WorkerStatusV2 {
     #[serde(default)]
     pub cleanup_pending: bool,
     pub adb_serial: Option<String>,
+    #[serde(default)]
+    pub adb_ready: bool,
     pub frame_generation: u64,
     pub frame_metrics: FrameMetricsV2,
     pub last_error: Option<ApiErrorV2>,
@@ -1133,13 +1141,20 @@ pub struct DisplaySessionV2 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "platform", rename_all = "snake_case")]
 pub enum NativeDisplayTargetV2 {
-    WindowsHwnd { hwnd: u64, owner: WorkerIdentityV2 },
+    WindowsHwnd {
+        hwnd: u64,
+        owner: WorkerIdentityV2,
+    },
+    MacCaContext {
+        endpoint: String,
+        owner: WorkerIdentityV2,
+    },
 }
 
 impl NativeDisplayTargetV2 {
     pub const fn owner(&self) -> &WorkerIdentityV2 {
         match self {
-            Self::WindowsHwnd { owner, .. } => owner,
+            Self::WindowsHwnd { owner, .. } | Self::MacCaContext { owner, .. } => owner,
         }
     }
 }

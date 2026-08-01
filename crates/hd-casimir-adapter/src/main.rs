@@ -1,3 +1,6 @@
+#![cfg_attr(not(windows), allow(dead_code, clippy::unused_async))]
+
+// The formal Casimir runtime is Windows-only; non-Windows builds retain probe and parser coverage.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;

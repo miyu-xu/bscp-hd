@@ -2,6 +2,8 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+#[cfg(target_os = "macos")]
+use std::ffi::{CStr, c_char, c_void};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -10,14 +12,16 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use hd_core::{
     ArtifactSelectionV2, CreateInstanceRequestV2, DiagnosticRequestV2, DisplaySessionV2,
-    DisplayViewportV2, InstanceActionV2, InstanceRecordV2, InstanceSpecV2, InstanceSummaryV2,
-    KeyActionV2, NativeDisplayTargetV2, OperationKindV2, OrientationV2, StopModeV2,
-    UpdateInstanceRequestV2,
+    DisplayViewportV2, HostCapabilitiesV2, InstanceActionV2, InstanceRecordV2, InstanceSpecV2,
+    InstanceSummaryV2, KeyActionV2, NativeDisplayTargetV2, OperationKindV2, OrientationV2,
+    StopModeV2, UpdateInstanceRequestV2,
 };
 use hd_platform::{
-    DataPaths, NativeDisplayBounds, NativeDisplayHost, create_native_display_host,
+    DataPaths, NativeDisplayBounds, NativeDisplayHost, choose_apk_file, create_native_display_host,
     current_process_identity,
 };
+#[cfg(target_os = "macos")]
+use hd_platform::{install_macos_titlebar_controls, set_macos_window_content_aspect_ratio};
 use hd_runtime::HostClientV2;
 use raw_window_handle::HasWindowHandle as _;
 use serde::{Deserialize, Serialize};
@@ -29,7 +33,7 @@ use uuid::Uuid;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{Fullscreen, Window};
+use winit::window::Window;
 use wry::dpi::{PhysicalPosition as WebPosition, PhysicalSize as WebSize};
 use wry::http::{Request, Response, header::CONTENT_TYPE};
 use wry::{Rect, WebView, WebViewBuilder};
@@ -37,6 +41,9 @@ use wry::{Rect, WebView, WebViewBuilder};
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DISPLAY_RETRY: Duration = Duration::from_millis(500);
 const DISPLAY_HEARTBEAT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const TOP_BAR_LOGICAL: f64 = 0.0;
+#[cfg(not(target_os = "macos"))]
 const TOP_BAR_LOGICAL: f64 = 48.0;
 const SIDEBAR_LOGICAL: f64 = 260.0;
 const SURFACE_GAP_PX: u32 = 0;
@@ -67,8 +74,15 @@ struct Cli {
 enum UserEvent {
     Ipc(String),
     Refreshed(Result<(Vec<InstanceSummaryV2>, Option<InstanceRecordV2>), String>),
+    CapabilitiesRefreshed {
+        instance_id: Uuid,
+        result: Result<HostCapabilitiesV2, String>,
+    },
     Created(Result<InstanceRecordV2, String>),
-    Saved(Result<InstanceRecordV2, String>),
+    Saved {
+        result: Result<InstanceRecordV2, String>,
+        restarted: bool,
+    },
     CommandFinished(Result<String, String>),
     DisplayFinished {
         instance_id: Uuid,
@@ -95,12 +109,22 @@ struct SurfaceLayout {
     sidebar_width: u32,
     page: Page,
     sidebar_collapsed: bool,
+    display_maximized: bool,
+    android_focused: bool,
 }
 
 impl SurfaceLayout {
-    fn from_window(size: PhysicalSize<u32>, scale: f64, page: Page, collapsed: bool) -> Self {
+    fn from_window(
+        size: PhysicalSize<u32>,
+        scale: f64,
+        page: Page,
+        collapsed: bool,
+        display_maximized: bool,
+    ) -> Self {
         let top_height = logical_to_physical(TOP_BAR_LOGICAL, scale).min(size.height);
-        let sidebar_width = if collapsed {
+        let android_focused = page == Page::Player && display_maximized;
+        let hide_sidebar = collapsed || android_focused;
+        let sidebar_width = if hide_sidebar {
             0
         } else {
             logical_to_physical(SIDEBAR_LOGICAL, scale).min(size.width)
@@ -112,7 +136,13 @@ impl SurfaceLayout {
             sidebar_width,
             page,
             sidebar_collapsed: collapsed,
+            display_maximized,
+            android_focused,
         }
+    }
+
+    fn sidebar_visible(self) -> bool {
+        !self.sidebar_collapsed && self.sidebar_width > 0 && self.body_height() > 0
     }
 
     fn body_y(self) -> u32 {
@@ -217,6 +247,8 @@ struct ShellState {
     summaries: Vec<InstanceSummaryV2>,
     selected_id: Option<Uuid>,
     selected: Option<InstanceRecordV2>,
+    capabilities: Option<HostCapabilitiesV2>,
+    capabilities_for: Option<Uuid>,
     status: String,
     artifact_hint: Option<String>,
     viewport: Option<DisplayViewportV2>,
@@ -227,14 +259,18 @@ struct ShellState {
     last_display_attempt: Instant,
     last_session_touch: Instant,
     refresh_in_flight: bool,
+    capabilities_in_flight: bool,
     command_in_flight: bool,
     display_in_flight: bool,
     reset_display_after_command: bool,
     root_was_minimized: bool,
     auto_start_selected: bool,
     closing: bool,
-    fullscreen: bool,
+    display_maximized: bool,
     sidebar_collapsed: bool,
+    window_aspect: Option<(u32, u32)>,
+    android_focused: bool,
+    sidebar_visible: bool,
     page: Page,
     apk_path: Option<PathBuf>,
     include_guest_logs: bool,
@@ -278,18 +314,22 @@ pub(crate) fn run() -> Result<()> {
         .build()
         .context("create HD event loop")?;
     let proxy = event_loop.create_proxy();
+    let window_attributes = Window::default_attributes()
+        .with_title("HD Android")
+        .with_visible(false)
+        .with_inner_size(LogicalSize::new(1180.0, 820.0))
+        .with_min_inner_size(LogicalSize::new(720.0, 520.0));
+    #[cfg(target_os = "macos")]
+    let window_attributes = window_attributes.with_decorations(true);
+    #[cfg(not(target_os = "macos"))]
+    let window_attributes = window_attributes.with_decorations(false);
     let window = Arc::new(
         event_loop
-            .create_window(
-                Window::default_attributes()
-                    .with_title("HD Android")
-                    .with_decorations(false)
-                    .with_visible(false)
-                    .with_inner_size(LogicalSize::new(1360.0, 860.0))
-                    .with_min_inner_size(LogicalSize::new(920.0, 620.0)),
-            )
+            .create_window(window_attributes)
             .context("create HD root window")?,
     );
+    install_native_titlebar_controls(window.as_ref(), &proxy)
+        .context("install HD native titlebar controls")?;
     let raw_parent = window
         .window_handle()
         .context("read HD root window handle")?
@@ -298,7 +338,7 @@ pub(crate) fn run() -> Result<()> {
         create_native_display_host(raw_parent).context("create HD NativeDisplayHost")?;
     let identity = current_process_identity(Uuid::new_v4())
         .map_err(|error| anyhow::anyhow!("identify HD UI process: {error}"))?;
-    let display_target = native_display_target(native_display.handle(), identity);
+    let display_target = native_display.target(identity);
     let mut webviews = WebSurfaces::new(window.as_ref(), &web_root, &proxy)?;
 
     let now = Instant::now();
@@ -311,6 +351,8 @@ pub(crate) fn run() -> Result<()> {
         summaries: Vec::new(),
         selected_id: None,
         selected: None,
+        capabilities: None,
+        capabilities_for: None,
         status: "正在连接 HD Host…".to_owned(),
         artifact_hint,
         viewport: None,
@@ -321,14 +363,18 @@ pub(crate) fn run() -> Result<()> {
         last_display_attempt: now.checked_sub(DISPLAY_RETRY).unwrap_or(now),
         last_session_touch: now,
         refresh_in_flight: false,
+        capabilities_in_flight: false,
         command_in_flight: false,
         display_in_flight: false,
         reset_display_after_command: false,
         root_was_minimized: false,
         auto_start_selected: true,
         closing: false,
-        fullscreen: false,
-        sidebar_collapsed: false,
+        display_maximized: false,
+        sidebar_collapsed: true,
+        window_aspect: None,
+        android_focused: false,
+        sidebar_visible: false,
         page: Page::Player,
         apk_path: None,
         include_guest_logs: true,
@@ -364,6 +410,12 @@ pub(crate) fn run() -> Result<()> {
                 WindowEvent::ScaleFactorChanged { .. } => {
                     apply_window_layout(&window, &mut webviews, &mut shell);
                 }
+                WindowEvent::Focused(false) => {
+                    if !shell.sidebar_collapsed {
+                        shell.sidebar_collapsed = true;
+                        shell.ui_dirty = true;
+                    }
+                }
                 _ => {}
             },
             Event::UserEvent(UserEvent::Ipc(message)) => {
@@ -373,8 +425,14 @@ pub(crate) fn run() -> Result<()> {
             Event::UserEvent(event) => {
                 match event {
                     UserEvent::Refreshed(result) => shell.on_refresh(result),
+                    UserEvent::CapabilitiesRefreshed {
+                        instance_id,
+                        result,
+                    } => shell.on_capabilities_refreshed(instance_id, result),
                     UserEvent::Created(result) => shell.on_created(result),
-                    UserEvent::Saved(result) => shell.on_saved(result),
+                    UserEvent::Saved { result, restarted } => {
+                        shell.on_saved(result, restarted);
+                    }
                     UserEvent::CommandFinished(result) => shell.on_command_finished(result),
                     UserEvent::DisplayFinished {
                         instance_id,
@@ -385,7 +443,7 @@ pub(crate) fn run() -> Result<()> {
                     UserEvent::ShutdownFinished(Err(error)) => {
                         shell.closing = false;
                         shell.command_in_flight = false;
-                        shell.notice(format!("关闭 Android 失败：{error}"));
+                        shell.notice(format!("关闭 HD 失败：{error}"));
                     }
                     UserEvent::Ipc(_) => unreachable!(),
                 }
@@ -475,17 +533,64 @@ fn asset_mime(path: &Path) -> &'static str {
 }
 
 fn apply_window_layout(window: &Window, webviews: &mut WebSurfaces, shell: &mut ShellState) {
+    shell.sync_window_aspect(window);
     let size = window.inner_size();
     let layout = SurfaceLayout::from_window(
         size,
         window.scale_factor(),
         shell.page,
         shell.sidebar_collapsed,
+        shell.display_maximized,
     );
+    let layout_state_changed = shell.android_focused != layout.android_focused
+        || shell.sidebar_visible != layout.sidebar_visible();
+    shell.android_focused = layout.android_focused;
+    shell.sidebar_visible = layout.sidebar_visible();
+    if layout_state_changed {
+        shell.ui_dirty = true;
+    }
     if let Err(error) = webviews.apply_layout(layout) {
         shell.notice(format!("WebView 布局失败：{error}"));
     }
     shell.update_display_layout(layout, window.scale_factor());
+}
+
+#[cfg(target_os = "macos")]
+fn install_native_titlebar_controls(
+    window: &Window,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> Result<()> {
+    let handle = window
+        .window_handle()
+        .context("read macOS window handle for native titlebar controls")?
+        .as_raw();
+    let context = Box::into_raw(Box::new(proxy.clone())).cast::<c_void>();
+    install_macos_titlebar_controls(handle, context, native_titlebar_callback)
+        .context("install macOS native titlebar controls")
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn native_titlebar_callback(context: *mut c_void, message: *const c_char) {
+    if context.is_null() || message.is_null() {
+        return;
+    }
+    // SAFETY: context is a leaked Box<EventLoopProxy<UserEvent>> for the UI process lifetime, and
+    // AppKit supplies a NUL-terminated JSON command from the native button table.
+    let (proxy, message) = unsafe {
+        (
+            &*context.cast::<EventLoopProxy<UserEvent>>(),
+            CStr::from_ptr(message).to_string_lossy().into_owned(),
+        )
+    };
+    let _ = proxy.send_event(UserEvent::Ipc(message));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_native_titlebar_controls(
+    _window: &Window,
+    _proxy: &EventLoopProxy<UserEvent>,
+) -> Result<()> {
+    Ok(())
 }
 
 fn web_rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
@@ -500,23 +605,13 @@ fn web_rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
 }
 
 fn logical_to_physical(value: f64, scale: f64) -> u32 {
+    if value <= 0.0 {
+        return 0;
+    }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     {
         (value * scale).round().clamp(1.0, f64::from(u32::MAX)) as u32
     }
-}
-
-#[cfg(windows)]
-fn native_display_target(handle: u64, owner: hd_core::WorkerIdentityV2) -> NativeDisplayTargetV2 {
-    NativeDisplayTargetV2::WindowsHwnd {
-        hwnd: handle,
-        owner,
-    }
-}
-
-#[cfg(not(windows))]
-fn native_display_target(_handle: u64, _owner: hd_core::WorkerIdentityV2) -> NativeDisplayTargetV2 {
-    unimplemented!("NativeDisplayTarget is not implemented for this platform")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -542,7 +637,10 @@ fn handle_ipc(message: &str, window: &Window, shell: &mut ShellState) {
                 shell.ready_surfaces.insert(surface.to_owned());
             }
             shell.ui_dirty = true;
-            if shell.ready_surfaces.contains("top") && shell.ready_surfaces.contains("sidebar") {
+            if shell.ready_surfaces.contains("top")
+                && (shell.sidebar_collapsed || shell.ready_surfaces.contains("sidebar"))
+                && (shell.page == Page::Player || shell.ready_surfaces.contains("content"))
+            {
                 // Keep the root hidden until both surfaces visible on the initial Player page have
                 // painted their first document. The content WebView is parked and hidden on this
                 // page; WebView2 is allowed to defer its navigation while hidden, so it must not
@@ -552,8 +650,19 @@ fn handle_ipc(message: &str, window: &Window, shell: &mut ShellState) {
             }
         }
         "toggle_sidebar" => {
-            shell.sidebar_collapsed = !shell.sidebar_collapsed;
+            if shell.display_maximized {
+                shell.display_maximized = false;
+                shell.sidebar_collapsed = false;
+            } else {
+                shell.sidebar_collapsed = !shell.sidebar_collapsed;
+            }
             shell.ui_dirty = true;
+        }
+        "close_sidebar" => {
+            if !shell.sidebar_collapsed {
+                shell.sidebar_collapsed = true;
+                shell.ui_dirty = true;
+            }
         }
         "page" => {
             let page = value
@@ -589,7 +698,13 @@ fn handle_ipc(message: &str, window: &Window, shell: &mut ShellState) {
             .ok_or_else(|| "设置命令缺少 spec".to_owned())
             .and_then(|spec| serde_json::from_value(spec).map_err(|error| error.to_string()))
         {
-            Ok(spec) => shell.save_spec(spec),
+            Ok(spec) => shell.save_spec(
+                spec,
+                value
+                    .get("restart")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
             Err(error) => shell.notice(format!("设置格式无效：{error}")),
         },
         "operation" => {
@@ -614,6 +729,8 @@ fn handle_ipc(message: &str, window: &Window, shell: &mut ShellState) {
             }
             shell.install_selected_apk();
         }
+        "choose_apk" => shell.choose_apk(false),
+        "choose_install_apk" => shell.choose_apk(true),
         "set_apk_path" => {
             shell.apk_path = value
                 .get("path")
@@ -649,10 +766,14 @@ fn handle_ipc(message: &str, window: &Window, shell: &mut ShellState) {
                 }
             }
             Some("minimize") => window.set_minimized(true),
-            Some("maximize") => window.set_maximized(!window.is_maximized()),
-            Some("fullscreen") => {
-                shell.fullscreen = !shell.fullscreen;
-                window.set_fullscreen(shell.fullscreen.then_some(Fullscreen::Borderless(None)));
+            Some("maximize") => {
+                window.set_maximized(!window.is_maximized());
+                shell.ui_dirty = true;
+            }
+            Some("maximize_display" | "fullscreen") => {
+                shell.display_maximized = !shell.display_maximized;
+                shell.page = Page::Player;
+                shell.ui_dirty = true;
             }
             Some("close") => shell.begin_close(),
             Some(action) => shell.notice(format!("未知窗口操作：{action}")),
@@ -665,59 +786,114 @@ fn handle_ipc(message: &str, window: &Window, shell: &mut ShellState) {
 impl ShellState {
     fn navigate(&mut self, page: Page) {
         if self.page == page {
+            self.sidebar_collapsed = true;
+            self.ui_dirty = true;
             return;
         }
         if self.page == Page::Player || page == Page::Player {
             self.release_display();
             self.last_session_viewport = None;
         }
+        if page != Page::Player {
+            self.display_maximized = false;
+        }
         self.page = page;
+        self.sidebar_collapsed = true;
+        self.ui_dirty = true;
+    }
+
+    fn sync_window_aspect(&mut self, window: &Window) {
+        let Some((guest_width, guest_height)) = self.selected.as_ref().map(|record| {
+            let display = &record.spec.display;
+            match display.orientation {
+                OrientationV2::Portrait | OrientationV2::ReversePortrait => (
+                    display.width.min(display.height),
+                    display.width.max(display.height),
+                ),
+                OrientationV2::Landscape | OrientationV2::ReverseLandscape => (
+                    display.width.max(display.height),
+                    display.width.min(display.height),
+                ),
+            }
+        }) else {
+            return;
+        };
+        let aspect = (guest_width, guest_height);
+        if self.window_aspect == Some(aspect) {
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Ok(handle) = window.window_handle() {
+            let _ = set_macos_window_content_aspect_ratio(
+                handle.as_raw(),
+                f64::from(guest_width),
+                f64::from(guest_height),
+            );
+        }
+
+        let ratio = f64::from(guest_width) / f64::from(guest_height);
+        let (minimum_width, minimum_height) = if ratio >= 1.0 {
+            (720.0, (720.0 / ratio).max(360.0))
+        } else {
+            (480.0, (480.0 / ratio).max(640.0))
+        };
+        window.set_min_inner_size(Some(LogicalSize::new(minimum_width, minimum_height)));
+
+        if !window.is_maximized() {
+            let scale = window.scale_factor().max(1.0);
+            let current = window.inner_size();
+            let current_width = f64::from(current.width) / scale;
+            let current_height = f64::from(current.height) / scale;
+            let area = (current_width * current_height).max(1.0);
+            let mut target_width = (area * ratio).sqrt();
+            let mut target_height = target_width / ratio;
+            let monitor =
+                window
+                    .current_monitor()
+                    .map_or(LogicalSize::new(1440.0, 900.0), |monitor| {
+                        let size = monitor.size();
+                        LogicalSize::new(
+                            f64::from(size.width) / scale,
+                            f64::from(size.height) / scale,
+                        )
+                    });
+            let maximum_width = monitor.width * 0.90;
+            let maximum_height = monitor.height * 0.86;
+            let shrink = (maximum_width / target_width)
+                .min(maximum_height / target_height)
+                .min(1.0);
+            target_width = (target_width * shrink).max(minimum_width);
+            target_height = (target_height * shrink).max(minimum_height);
+            let _ = window.request_inner_size(LogicalSize::new(target_width, target_height));
+        }
+        self.window_aspect = Some(aspect);
         self.ui_dirty = true;
     }
 
     fn update_display_layout(&mut self, layout: SurfaceLayout, scale: f64) {
         if self.page != Page::Player
-            || layout.content_width() < 64
-            || layout.body_height() < 64
+            || layout.width < 64
+            || layout.height < 64
             || self.native_display.root_is_minimized()
         {
             self.set_viewport_hidden();
             self.sync_display();
             return;
         }
-        let (guest_width, guest_height) =
-            self.selected
-                .as_ref()
-                .map_or((1080_u32, 1920_u32), |record| {
-                    let display = &record.spec.display;
-                    match display.orientation {
-                        OrientationV2::Portrait | OrientationV2::ReversePortrait => (
-                            display.width.min(display.height),
-                            display.width.max(display.height),
-                        ),
-                        OrientationV2::Landscape | OrientationV2::ReverseLandscape => (
-                            display.width.max(display.height),
-                            display.width.min(display.height),
-                        ),
-                    }
-                });
-        let available_width = layout.content_width();
-        let available_height = layout.body_height();
-        let fit = (f64::from(available_width) / f64::from(guest_width))
-            .min(f64::from(available_height) / f64::from(guest_height));
-        let width = physical_dimension(f64::from(guest_width) * fit, available_width);
-        let height = physical_dimension(f64::from(guest_height) * fit, available_height);
-        let x = layout
-            .content_x()
-            .saturating_add(available_width.saturating_sub(width) / 2);
-        let y = layout
-            .body_y()
-            .saturating_add(available_height.saturating_sub(height) / 2);
+        let available_width = layout.width;
+        let available_height = layout.height;
+        let rotation_quarters = self.selected.as_ref().map_or(0, |record| {
+            record.spec.display.orientation.android_rotation()
+        });
+        let x = 0;
+        let y = 0;
         let bounds = NativeDisplayBounds {
             x_px: i32::try_from(x).unwrap_or(i32::MAX),
             y_px: i32::try_from(y).unwrap_or(i32::MAX),
-            width_px: width,
-            height_px: height,
+            width_px: available_width,
+            height_px: available_height,
+            rotation_quarters,
             visible: true,
         };
         if let Err(error) = self.native_display.set_bounds(bounds) {
@@ -726,16 +902,16 @@ impl ShellState {
         }
         let dpi = physical_dimension(96.0 * scale, 960).clamp(72, 960);
         let changed = self.viewport.as_ref().is_none_or(|viewport| {
-            viewport.width_px != width
-                || viewport.height_px != height
+            viewport.width_px != available_width
+                || viewport.height_px != available_height
                 || viewport.dpi != dpi
                 || !viewport.visible
         });
         if changed {
             self.viewport_revision = self.viewport_revision.saturating_add(1);
             self.viewport = Some(DisplayViewportV2 {
-                width_px: width,
-                height_px: height,
+                width_px: available_width,
+                height_px: available_height,
                 dpi,
                 visible: true,
                 revision: self.viewport_revision,
@@ -755,6 +931,9 @@ impl ShellState {
                 "selected": self.selected,
                 "status": self.status,
                 "artifact_hint": self.artifact_hint,
+                "device_capabilities": self.capabilities.as_ref().map_or(&[][..], |capabilities| capabilities.devices.devices.as_slice()),
+                "device_capabilities_loading": self.selected_id.is_some()
+                    && (self.capabilities_for != self.selected_id || self.capabilities_in_flight),
             }
         });
         webviews.broadcast(&snapshot);
@@ -764,6 +943,9 @@ impl ShellState {
                 "page": self.page,
                 "sidebar_collapsed": self.sidebar_collapsed,
                 "apk_path": self.apk_path.as_ref().map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+                "display_maximized": self.display_maximized,
+                "android_focused": self.android_focused,
+                "sidebar_visible": self.sidebar_visible,
             }
         }));
         webviews.broadcast(&json!({ "type": "busy", "payload": self.command_in_flight }));
@@ -812,6 +994,56 @@ impl ShellState {
         });
     }
 
+    fn request_capabilities(&mut self) {
+        if self.capabilities_in_flight || self.closing {
+            return;
+        }
+        let Some(instance_id) = self.selected_id else {
+            self.capabilities = None;
+            self.capabilities_for = None;
+            return;
+        };
+        self.capabilities_in_flight = true;
+        self.ui_dirty = true;
+        let client = self.client.clone();
+        let proxy = self.proxy.clone();
+        self.runtime.spawn(async move {
+            let result = client
+                .capabilities(Some(instance_id))
+                .await
+                .map_err(|error| error.to_string());
+            let _ = proxy.send_event(UserEvent::CapabilitiesRefreshed {
+                instance_id,
+                result,
+            });
+        });
+    }
+
+    fn on_capabilities_refreshed(
+        &mut self,
+        instance_id: Uuid,
+        result: Result<HostCapabilitiesV2, String>,
+    ) {
+        self.capabilities_in_flight = false;
+        if self.selected_id != Some(instance_id) {
+            self.request_capabilities();
+            return;
+        }
+        match result {
+            Ok(capabilities) => {
+                self.capabilities = Some(capabilities);
+                self.capabilities_for = Some(instance_id);
+                self.ui_dirty = true;
+            }
+            Err(error) => {
+                self.capabilities = None;
+                self.capabilities_for = Some(instance_id);
+                self.ui_dirty = true;
+                warn!(%error, %instance_id, "refresh HD device capabilities failed");
+            }
+        }
+    }
+
     fn on_refresh(
         &mut self,
         result: Result<(Vec<InstanceSummaryV2>, Option<InstanceRecordV2>), String>,
@@ -823,6 +1055,10 @@ impl ShellState {
                 self.summaries = summaries;
                 self.selected_id = selected.as_ref().map(|record| record.spec.id);
                 self.selected = selected;
+                if self.capabilities_for != self.selected_id && !self.capabilities_in_flight {
+                    self.capabilities = None;
+                    self.request_capabilities();
+                }
                 if self.status == "正在连接 HD Host…" {
                     "HD Host 已同步".clone_into(&mut self.status);
                     self.ui_dirty = true;
@@ -852,12 +1088,14 @@ impl ShellState {
     fn select(&mut self, instance_id: Uuid) {
         if self.selected_id == Some(instance_id) {
             self.page = Page::Player;
-            self.operation("start");
+            self.ui_dirty = true;
             return;
         }
         self.release_display();
         self.selected_id = Some(instance_id);
         self.selected = None;
+        self.capabilities = None;
+        self.capabilities_for = None;
         self.auto_start_selected = true;
         self.page = Page::Player;
         self.last_refresh = Instant::now()
@@ -899,6 +1137,9 @@ impl ShellState {
             Ok(record) => {
                 self.selected_id = Some(record.spec.id);
                 self.selected = Some(record);
+                self.capabilities = None;
+                self.capabilities_for = None;
+                self.request_capabilities();
                 self.auto_start_selected = true;
                 self.page = Page::Player;
                 self.notice("实例已创建，正在启动".to_owned());
@@ -908,7 +1149,7 @@ impl ShellState {
         }
     }
 
-    fn save_spec(&mut self, spec: InstanceSpecV2) {
+    fn save_spec(&mut self, spec: InstanceSpecV2, restart: bool) {
         if self.command_in_flight {
             return;
         }
@@ -921,35 +1162,104 @@ impl ShellState {
             self.notice(error.to_string());
             return;
         }
-        let request = UpdateInstanceRequestV2 {
-            expected_revision: record.status.revision,
-            spec,
-        };
         let id = record.spec.id;
+        let was_active = record.status.observed.is_active();
+        if was_active && !restart {
+            self.notice("当前实例正在运行；请使用“保存并重启”应用规格更改".to_owned());
+            return;
+        }
+        if restart {
+            self.release_display();
+            self.last_session_viewport = None;
+        }
         self.command_in_flight = true;
         self.ui_dirty = true;
         let client = self.client.clone();
         let proxy = self.proxy.clone();
         self.runtime.spawn(async move {
-            let result = client
-                .update_instance(id, &request)
-                .await
-                .map_err(|error| error.to_string());
-            let _ = proxy.send_event(UserEvent::Saved(result));
+            let result = async {
+                if was_active {
+                    let operation = client
+                        .create_operation(
+                            id,
+                            OperationKindV2::Stop {
+                                mode: StopModeV2::Graceful,
+                                graceful_timeout_ms: 20_000,
+                            },
+                            &format!("hd-web-ui-save-stop-{}", Uuid::new_v4()),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    client
+                        .wait_operation(operation.id, Duration::from_secs(90))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+
+                let current = client
+                    .get_instance(id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let request = UpdateInstanceRequestV2 {
+                    expected_revision: current.status.revision,
+                    spec,
+                };
+                let mut saved = client
+                    .update_instance(id, &request)
+                    .await
+                    .map_err(|error| error.to_string())?;
+
+                if was_active {
+                    let operation = client
+                        .create_operation(
+                            id,
+                            OperationKindV2::Start,
+                            &format!("hd-web-ui-save-start-{}", Uuid::new_v4()),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    client
+                        .wait_operation(operation.id, Duration::from_mins(3))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    saved = client
+                        .get_instance(id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(saved)
+            }
+            .await;
+            let _ = proxy.send_event(UserEvent::Saved {
+                result,
+                restarted: was_active,
+            });
         });
     }
 
-    fn on_saved(&mut self, result: Result<InstanceRecordV2, String>) {
+    fn on_saved(&mut self, result: Result<InstanceRecordV2, String>, restarted: bool) {
         self.command_in_flight = false;
         match result {
             Ok(record) => {
                 self.selected = Some(record);
-                self.notice("设置已保存".to_owned());
+                self.capabilities = None;
+                self.capabilities_for = None;
+                self.request_capabilities();
+                self.last_display_attempt = Instant::now()
+                    .checked_sub(DISPLAY_RETRY)
+                    .unwrap_or_else(Instant::now);
+                self.notice(if restarted {
+                    "设置已保存，Android 已重新启动".to_owned()
+                } else {
+                    "设置已保存".to_owned()
+                });
+                self.request_refresh();
             }
             Err(error) => self.notice(error),
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn operation(&mut self, kind: &str) {
         if self.command_in_flight {
             return;
@@ -1010,11 +1320,20 @@ impl ShellState {
             matches!(operation, OperationKindV2::Start | OperationKindV2::Restart)
                 .then(|| self.selected.as_ref())
                 .flatten()
-                .filter(|record| record.spec.artifacts.is_none())
                 .and_then(|record| {
+                    let artifacts = DIRECT_DEV_SELECTION.get().cloned().or_else(|| {
+                        record
+                            .spec
+                            .artifacts
+                            .is_none()
+                            .then(default_artifact_selection)
+                            .flatten()
+                    })?;
+                    if record.spec.artifacts.as_ref() == Some(&artifacts) {
+                        return None;
+                    }
                     let mut spec = record.spec.clone();
-                    spec.artifacts = default_artifact_selection();
-                    spec.artifacts.as_ref()?;
+                    spec.artifacts = Some(artifacts);
                     Some(UpdateInstanceRequestV2 {
                         expected_revision: record.status.revision,
                         spec,
@@ -1149,6 +1468,22 @@ impl ShellState {
             return;
         };
         self.install_apk(path);
+    }
+
+    fn choose_apk(&mut self, install_after_selection: bool) {
+        match choose_apk_file() {
+            Ok(Some(path)) => {
+                self.apk_path = Some(path.clone());
+                self.ui_dirty = true;
+                if install_after_selection {
+                    self.install_apk(path);
+                } else {
+                    self.notice(format!("已选择 APK：{}", path.display()));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => self.notice(format!("选择 APK 失败：{error}")),
+        }
     }
 
     fn install_apk(&mut self, path: PathBuf) {
@@ -1352,40 +1687,19 @@ impl ShellState {
         self.closing = true;
         self.command_in_flight = true;
         let _ = self.native_display.hide();
-        self.notice("正在关闭当前 Android 实例…".to_owned());
+        self.notice("正在关闭 HD；Android 实例保持运行…".to_owned());
         let session = self.session.take();
-        let selected = self.selected.clone();
         let client = self.client.clone();
         let proxy = self.proxy.clone();
         self.runtime.spawn(async move {
-            let result = async {
-                if let Some(session) = session {
-                    let _ = client
-                        .release_display_session(session.instance_id, session.session_token)
-                        .await;
-                }
-                if let Some(record) = selected
-                    && record.status.observed.is_active()
-                {
-                    let operation = client
-                        .create_operation(
-                            record.spec.id,
-                            OperationKindV2::Stop {
-                                mode: StopModeV2::Graceful,
-                                graceful_timeout_ms: 20_000,
-                            },
-                            &format!("hd-web-ui-close-{}", Uuid::new_v4()),
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    client
-                        .wait_operation(operation.id, Duration::from_secs(90))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
+            let result = if let Some(session) = session {
+                client
+                    .release_display_session(session.instance_id, session.session_token)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
                 Ok(())
-            }
-            .await;
+            };
             let _ = proxy.send_event(UserEvent::ShutdownFinished(result));
         });
     }
@@ -1423,7 +1737,14 @@ fn resolve_web_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 fn configure_fast_dev_artifacts(root: &Path) -> Option<String> {
-    let direct = root.join("products/android/vsoc_x86_64/direct-linux");
+    let direct = [
+        root.to_path_buf(),
+        root.join("direct-linux"),
+        root.join("products/android/vsoc_arm64_only/direct-linux"),
+        root.join("products/android/vsoc_x86_64/direct-linux"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.join("kernel").is_file())?;
     let sparse_rootfs = direct.join("aggregate_android.sparse.img");
     let raw_rootfs = direct.join("aggregate_android.img");
     let rootfs = if sparse_rootfs.is_file() {
@@ -1445,7 +1766,7 @@ fn configure_fast_dev_artifacts(root: &Path) -> Option<String> {
         .or_else(default_adb_path)?;
     let aapt2 = std::env::var_os("HD_DEV_AAPT2")
         .map(PathBuf::from)
-        .or_else(default_aapt2_path)?;
+        .or_else(default_aapt2_path);
     // SAFETY: initialization runs before Tokio, Host, Worker, or any other process is started.
     unsafe {
         if std::env::var_os("HD_DEV_FAST_ARTIFACTS").is_none() {
@@ -1466,8 +1787,10 @@ fn configure_fast_dev_artifacts(root: &Path) -> Option<String> {
         if std::env::var_os("HD_DEV_ADB").is_none() {
             std::env::set_var("HD_DEV_ADB", &adb);
         }
-        if std::env::var_os("HD_DEV_AAPT2").is_none() {
-            std::env::set_var("HD_DEV_AAPT2", &aapt2);
+        if let Some(aapt2) = aapt2.as_ref()
+            && std::env::var_os("HD_DEV_AAPT2").is_none()
+        {
+            std::env::set_var("HD_DEV_AAPT2", aapt2);
         }
     }
     info!(path = %direct.display(), rootfs = %rootfs.display(), "configured Android development artifacts");
@@ -1489,20 +1812,38 @@ fn default_artifact_selection() -> Option<ArtifactSelectionV2> {
 }
 
 fn direct_host_tools_root() -> Option<PathBuf> {
+    let executable = hd_platform::executable_name("crosvm");
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_owned))
-        .filter(|path| path.join("crosvm.exe").is_file())
+        .filter(|path| path.join(&executable).is_file())
         .or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .ancestors()
                 .nth(3)
-                .map(|root| root.join("out/dist/windows/bin"))
-                .filter(|path| path.join("crosvm.exe").is_file())
+                .map(|root| {
+                    root.join("out/dist")
+                        .join(hd_platform::platform_name())
+                        .join("bin")
+                })
+                .filter(|path| path.join(&executable).is_file())
         })
 }
 
 fn default_adb_path() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return std::env::var_os("ANDROID_HOME")
+            .or_else(|| std::env::var_os("ANDROID_SDK_ROOT"))
+            .map(PathBuf::from)
+            .map(|root| root.join("platform-tools/adb"))
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                let path = PathBuf::from("/opt/homebrew/bin/adb");
+                path.is_file().then_some(path)
+            })
+            .and_then(|path| path.canonicalize().ok())
+            .filter(|path| path.is_file());
+    }
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .map(|root| root.join("Android/Sdk/platform-tools/adb.exe"))
@@ -1510,9 +1851,16 @@ fn default_adb_path() -> Option<PathBuf> {
 }
 
 fn default_aapt2_path() -> Option<PathBuf> {
-    let root = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)?
-        .join("Android/Sdk/build-tools");
+    let sdk = if cfg!(target_os = "macos") {
+        std::env::var_os("ANDROID_HOME").or_else(|| std::env::var_os("ANDROID_SDK_ROOT"))
+    } else {
+        std::env::var_os("LOCALAPPDATA")
+    };
+    let root = sdk.map(PathBuf::from)?.join(if cfg!(target_os = "macos") {
+        "build-tools"
+    } else {
+        "Android/Sdk/build-tools"
+    });
     let mut versions = std::fs::read_dir(root)
         .ok()?
         .filter_map(Result::ok)
@@ -1521,7 +1869,13 @@ fn default_aapt2_path() -> Option<PathBuf> {
     versions.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
     versions
         .into_iter()
-        .map(|entry| entry.path().join("aapt2.exe"))
+        .map(|entry| {
+            entry.path().join(if cfg!(target_os = "macos") {
+                "aapt2"
+            } else {
+                "aapt2.exe"
+            })
+        })
         .find(|path| path.is_file())
 }
 

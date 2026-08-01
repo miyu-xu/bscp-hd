@@ -10,21 +10,20 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signer as _, SigningKey};
-#[cfg(windows)]
-use hd_core::FormalComponentProbeV2;
 use hd_core::{
     ARTIFACT_INDEX_VERSION, ApiErrorV2, ArtifactBundleKindV2, ArtifactBundleV2, ArtifactFileV2,
-    ArtifactReadyMarkerV2, BluetoothPeerActionV2, COMPONENT_PROTOCOL_VERSION,
-    CONTROL_PROTOCOL_VERSION, CreateInstanceRequestV2, DEVICE_GUEST_ENDPOINT_ROLES_V2,
-    DeviceControlCommandV2, DeviceControlRequestV2, DeviceControlResponseV2, DeviceControlTokenV2,
-    DeviceSerialEndpointV2, DiagnosticRequestV2, FRAME_PROTOCOL_VERSION,
-    FormalComponentConfigurationV2, FormalComponentLaunchV2, FormalComponentReadyV2,
-    HOST_CERTIFICATION_VERSION, HostCapabilitiesV2, HostCertificationV2, InstanceActionV2,
-    InstanceSpecV2, KeyActionV2, LeaseKindV2, LeaseV2, NfcTagActionV2, ObservedStateV2,
-    OperationKindV2, ResolvedGuestArtifactsV2, StopModeV2, WORKER_PROTOCOL_VERSION,
-    WorkerCommandV2, WorkerDescriptorV2, WorkerIdentityV2, WorkerPayloadV2, WorkerRequestV2,
-    device_component_guest_roles_v2,
+    ArtifactReadyMarkerV2, COMPONENT_PROTOCOL_VERSION, CONTROL_PROTOCOL_VERSION,
+    CreateInstanceRequestV2, DEVICE_GUEST_ENDPOINT_ROLES_V2, DeviceControlCommandV2,
+    DeviceControlRequestV2, DeviceControlResponseV2, DeviceControlTokenV2, DeviceSerialEndpointV2,
+    DiagnosticRequestV2, FRAME_PROTOCOL_VERSION, FormalComponentConfigurationV2,
+    FormalComponentLaunchV2, FormalComponentReadyV2, HOST_CERTIFICATION_VERSION,
+    HostCapabilitiesV2, HostCertificationV2, InstanceActionV2, InstanceSpecV2, KeyActionV2,
+    LeaseKindV2, LeaseV2, ObservedStateV2, OperationKindV2, ResolvedGuestArtifactsV2, StopModeV2,
+    WORKER_PROTOCOL_VERSION, WorkerCommandV2, WorkerDescriptorV2, WorkerIdentityV2,
+    WorkerPayloadV2, WorkerRequestV2, device_component_guest_roles_v2,
 };
+#[cfg(windows)]
+use hd_core::{BluetoothPeerActionV2, FormalComponentProbeV2, NfcTagActionV2};
 #[cfg(windows)]
 use hd_platform::FrameInteropProbeV2;
 use hd_platform::{DataPaths, ProcessSpec, ProcessSupervisor, VmBackend as _, VmLaunchContextV2};
@@ -479,6 +478,16 @@ fn quality_target_args() -> Vec<&'static str> {
     }
 }
 
+fn secure_tempdir() -> Result<tempfile::TempDir> {
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .context("canonicalize system temporary directory")?;
+    tempfile::Builder::new()
+        .prefix("hd-")
+        .tempdir_in(root)
+        .context("create HD temporary directory")
+}
+
 struct SmokeEvidence {
     output: PathBuf,
     gates: BTreeMap<String, process::GateRecord>,
@@ -576,9 +585,13 @@ fn smoke(root: &Path, evidence_output: Option<&Path>) -> Result<()> {
         let mut evidence = evidence_output
             .map(|output| SmokeEvidence::new(root, output))
             .transpose()?;
-        let temporary = tempfile::tempdir().context("create smoke data directory")?;
+        let temporary = secure_tempdir()?;
+        let temporary_root = temporary
+            .path()
+            .canonicalize()
+            .context("canonicalize smoke data directory")?;
         let lease_started = Instant::now();
-        let lease_audit = lease_multi_instance_smoke(temporary.path())?;
+        let lease_audit = lease_multi_instance_smoke(&temporary_root)?;
         if let Some(evidence) = evidence.as_mut() {
             evidence.write_artifact("lease-audit.jsonl", &lease_audit)?;
             evidence.pass(
@@ -588,7 +601,7 @@ fn smoke(root: &Path, evidence_output: Option<&Path>) -> Result<()> {
             )?;
         }
         let host_worker_started = Instant::now();
-        let paths = DataPaths::from_root(temporary.path().join("data"));
+        let paths = DataPaths::from_root(temporary_root.join("data"));
         paths.ensure()?;
         let legacy_id = Uuid::new_v4();
         let legacy_dir = paths.instance_dir(legacy_id);
@@ -762,7 +775,7 @@ fn smoke(root: &Path, evidence_output: Option<&Path>) -> Result<()> {
             "leases remained after stop"
         );
 
-        let apk = temporary.path().join("contract.apk");
+        let apk = temporary_root.join("contract.apk");
         std::fs::write(&apk, minimal_apk()?)?;
         let upload = client.upload_apk(&apk).await?;
         ensure!(upload.path.is_file(), "streamed APK upload is missing");
@@ -1636,7 +1649,7 @@ async fn formal_device_component_smoke(
     actions: &[InstanceActionV2],
     additional_ready_marker: Option<&Path>,
 ) -> Result<serde_json::Value> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = secure_tempdir()?;
     let instance_id = Uuid::new_v4();
     let run_id = Uuid::new_v4();
     let launch_path = temporary.path().join(format!("{component}-launch-v2.json"));
@@ -1814,7 +1827,7 @@ async fn formal_peripheral_component_smoke(
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
 
-    let temporary = tempfile::tempdir()?;
+    let temporary = secure_tempdir()?;
     let exchange_marker = temporary.path().join("guest-exchange-complete");
     let suffix = Uuid::new_v4();
     let guest_output = format!(r"\\.\pipe\bscp-hd-{component}-smoke-{suffix}-out");
@@ -1967,7 +1980,7 @@ async fn formal_adb_bridge_smoke(root: &Path, executable: &Path) -> Result<serde
         "hd-adb-bridge probe identity is invalid"
     );
 
-    let temporary = tempfile::tempdir()?;
+    let temporary = secure_tempdir()?;
     let instance_id = Uuid::new_v4();
     let run_id = Uuid::new_v4();
     let guest_cid = 34_567_u32;
@@ -2105,7 +2118,7 @@ async fn formal_adb_bridge_smoke(root: &Path, executable: &Path) -> Result<serde
 }
 
 async fn managed_process_tree_smoke(root: &Path) -> Result<serde_json::Value> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = secure_tempdir()?;
     let marker = temporary.path().join("process-tree.json");
     let executable = std::env::current_exe()?;
     let spec = ProcessSpec {
@@ -2172,7 +2185,7 @@ async fn managed_process_tree_smoke(root: &Path) -> Result<serde_json::Value> {
 
 #[allow(clippy::too_many_lines)]
 async fn worker_process_smoke(worker_executable: &Path) -> Result<Vec<serde_json::Value>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = secure_tempdir()?;
     let paths = DataPaths::from_root(temporary.path().join("worker-data"));
     paths.ensure()?;
     let instance_id = Uuid::new_v4();
@@ -2925,7 +2938,7 @@ fn publish_bundle(request: PublishBundleRequest) -> Result<()> {
 }
 
 fn bundle_publish_smoke() -> Result<serde_json::Value> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = secure_tempdir()?;
     let input = temporary.path().join("input");
     let store = temporary.path().join("store");
     std::fs::create_dir_all(&input)?;
