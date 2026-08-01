@@ -949,7 +949,7 @@ fn compose_device_capabilities(statuses: &FormalDeviceStatuses) -> DeviceCapabil
             ),
             _ => continue,
         };
-        device.boundary = boundary.to_owned();
+        boundary.clone_into(&mut device.boundary);
         device.features = features
             .iter()
             .map(|feature| (*feature).to_owned())

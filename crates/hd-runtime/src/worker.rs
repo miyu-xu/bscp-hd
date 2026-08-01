@@ -2747,12 +2747,12 @@ fn enabled_device_components(spec: &InstanceSpecV2) -> Vec<&'static str> {
 fn device_role_enabled(spec: &InstanceSpecV2, role: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        return match role {
+        match role {
             "gnss" | "location" => spec.devices.gnss,
             "sensors" => spec.devices.sensors,
             "mcu-control" | "mcu-uart" => spec.devices.power,
             _ => false,
-        };
+        }
     }
     #[cfg(not(target_os = "macos"))]
     match role {

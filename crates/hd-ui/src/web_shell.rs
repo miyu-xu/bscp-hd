@@ -31,7 +31,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{Event, WindowEvent};
+use winit::event::{Event, StartCause, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::Window;
 use wry::dpi::{PhysicalPosition as WebPosition, PhysicalSize as WebSize};
@@ -72,6 +72,7 @@ struct Cli {
 
 #[derive(Debug)]
 enum UserEvent {
+    Tick,
     Ipc(String),
     Refreshed(Result<(Vec<InstanceSummaryV2>, Option<InstanceRecordV2>), String>),
     CapabilitiesRefreshed {
@@ -340,6 +341,15 @@ pub(crate) fn run() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("identify HD UI process: {error}"))?;
     let display_target = native_display.target(identity);
     let mut webviews = WebSurfaces::new(window.as_ref(), &web_root, &proxy)?;
+    let ticker_proxy = proxy.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if ticker_proxy.send_event(UserEvent::Tick).is_err() {
+                break;
+            }
+        }
+    });
 
     let now = Instant::now();
     let mut shell = ShellState {
@@ -385,9 +395,9 @@ pub(crate) fn run() -> Result<()> {
     apply_window_layout(&window, &mut webviews, &mut shell);
 
     event_loop.run(move |event, active| {
-        active.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(100),
-        ));
+        if matches!(&event, Event::NewEvents(StartCause::Init)) {
+            active.set_control_flow(ControlFlow::Wait);
+        }
         match event {
             Event::WindowEvent { window_id, event } if window_id == window.id() => match event {
                 WindowEvent::CloseRequested => shell.begin_close(),
@@ -410,11 +420,9 @@ pub(crate) fn run() -> Result<()> {
                 WindowEvent::ScaleFactorChanged { .. } => {
                     apply_window_layout(&window, &mut webviews, &mut shell);
                 }
-                WindowEvent::Focused(false) => {
-                    if !shell.sidebar_collapsed {
-                        shell.sidebar_collapsed = true;
-                        shell.ui_dirty = true;
-                    }
+                WindowEvent::Focused(false) if !shell.sidebar_collapsed => {
+                    shell.sidebar_collapsed = true;
+                    shell.ui_dirty = true;
                 }
                 _ => {}
             },
@@ -424,6 +432,11 @@ pub(crate) fn run() -> Result<()> {
             }
             Event::UserEvent(event) => {
                 match event {
+                    UserEvent::Tick => {
+                        shell.poll();
+                        shell.flush_web_state(&webviews);
+                        return;
+                    }
                     UserEvent::Refreshed(result) => shell.on_refresh(result),
                     UserEvent::CapabilitiesRefreshed {
                         instance_id,
@@ -448,11 +461,6 @@ pub(crate) fn run() -> Result<()> {
                     UserEvent::Ipc(_) => unreachable!(),
                 }
                 apply_window_layout(&window, &mut webviews, &mut shell);
-            }
-            Event::AboutToWait => {
-                shell.poll();
-                apply_window_layout(&window, &mut webviews, &mut shell);
-                shell.flush_web_state(&webviews);
             }
             _ => {}
         }
@@ -886,11 +894,9 @@ impl ShellState {
         let rotation_quarters = self.selected.as_ref().map_or(0, |record| {
             record.spec.display.orientation.android_rotation()
         });
-        let x = 0;
-        let y = 0;
         let bounds = NativeDisplayBounds {
-            x_px: i32::try_from(x).unwrap_or(i32::MAX),
-            y_px: i32::try_from(y).unwrap_or(i32::MAX),
+            x_px: 0,
+            y_px: 0,
             width_px: available_width,
             height_px: available_height,
             rotation_quarters,

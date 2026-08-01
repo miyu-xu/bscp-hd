@@ -418,12 +418,12 @@ impl AdbClient {
     /// Reconciles Android services with the instance's fixed device inventory after boot.
     ///
     /// These commands are deliberately fixed rather than caller-provided. In particular, an
-    /// Android 15 cuttlefish NFC service without its virtio backend blocks in its persistent
-    /// process and is restarted by `ActivityManager` even after `disable-user` or `force-stop`.
-    /// Remove it for user 0 when NFC is absent; `install-existing` restores the system package
-    /// when NFC is enabled again. Also stop the boot-time full logcat stream: diagnostics can
-    /// collect a bounded log through ADB without continuously driving the virtio console or
-    /// growing a per-run file.
+    /// Android 15 cuttlefish services must match the host-backed device inventory. Remove NFC for
+    /// user 0 when its backend is absent; `install-existing` restores it when Casimir is enabled.
+    /// Thread Network is not part of the current HD device profile, so stop both its framework
+    /// daemon and vendor HAL instead of allowing init to restart a missing `ThreadChip` backend.
+    /// Also stop the boot-time full logcat stream: diagnostics collect a bounded log through ADB
+    /// without continuously driving the virtio console or growing a per-run file.
     pub async fn apply_runtime_device_policy(
         &self,
         serial: &str,
@@ -488,6 +488,24 @@ impl AdbClient {
             ));
             commands.push(("stop NFC HAL", vec!["su", "0", "stop", "nfc_hal_service"]));
         }
+        if cfg!(target_os = "macos") {
+            commands.push((
+                "stop RIL without a modem backend",
+                vec!["su", "0", "stop", "vendor.ril-daemon"],
+            ));
+        }
+        commands.push((
+            "disable unsupported Thread radio",
+            vec!["cmd", "thread_network", "disable"],
+        ));
+        commands.push((
+            "stop Thread framework daemon",
+            vec!["cmd", "thread_network", "force-stop-ot-daemon", "enabled"],
+        ));
+        commands.push((
+            "stop missing Thread HAL backend",
+            vec!["su", "0", "stop", "vendor.threadnetwork_hal"],
+        ));
         commands.push((
             "stop unbounded boot log stream",
             vec!["su", "0", "stop", "seriallogging"],
@@ -554,7 +572,7 @@ impl AdbClient {
         Ok(())
     }
 
-    /// Applies a typed mock provider location through Android 15's LocationManager shell API.
+    /// Applies a typed mock provider location through Android 15's `LocationManager` shell API.
     /// This is the macOS fallback when the Guest fixed-location serial bridge is unavailable.
     pub async fn set_location(&self, serial: &str, location: &LocationV2) -> Result<(), AdbError> {
         let latitude = f64::from(location.latitude_e7) / 10_000_000.0;

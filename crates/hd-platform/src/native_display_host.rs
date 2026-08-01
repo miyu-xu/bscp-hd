@@ -309,6 +309,7 @@ mod macos {
     pub(super) struct MacNativeDisplayHost {
         raw: *mut c_void,
         endpoint: PathBuf,
+        last_bounds: Option<NativeDisplayBounds>,
     }
 
     impl std::fmt::Debug for MacNativeDisplayHost {
@@ -342,7 +343,11 @@ mod macos {
                     "create macOS CoreAnimation display host failed".to_owned(),
                 ));
             }
-            Ok(Self { raw, endpoint })
+            Ok(Self {
+                raw,
+                endpoint,
+                last_bounds: None,
+            })
         }
 
         fn call(operation: &'static str, succeeded: bool) -> Result<(), PlatformError> {
@@ -369,6 +374,12 @@ mod macos {
         }
 
         fn set_bounds(&mut self, bounds: NativeDisplayBounds) -> Result<(), PlatformError> {
+            if self.last_bounds == Some(bounds) {
+                return Ok(());
+            }
+            if !bounds.visible {
+                return self.hide();
+            }
             // SAFETY: raw is retained until Drop and UI calls occur on the AppKit thread.
             let succeeded = unsafe {
                 hd_macos_native_display_set_bounds(
@@ -381,13 +392,22 @@ mod macos {
                     bounds.visible,
                 )
             };
-            Self::call("set bounds", succeeded)
+            Self::call("set bounds", succeeded)?;
+            self.last_bounds = Some(bounds);
+            Ok(())
         }
 
         fn hide(&mut self) -> Result<(), PlatformError> {
+            if self.last_bounds.is_some_and(|bounds| !bounds.visible) {
+                return Ok(());
+            }
             // SAFETY: raw is retained until Drop and UI calls occur on the AppKit thread.
             let succeeded = unsafe { hd_macos_native_display_hide(self.raw) };
-            Self::call("hide", succeeded)
+            Self::call("hide", succeeded)?;
+            if let Some(bounds) = self.last_bounds.as_mut() {
+                bounds.visible = false;
+            }
+            Ok(())
         }
 
         fn focus_guest(&self) -> Result<(), PlatformError> {

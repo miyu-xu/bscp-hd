@@ -296,21 +296,29 @@ impl VmBackend for CrosvmBackend {
             Self::gpu_argument(&spec.display),
         ]);
 
-        if spec.devices.network && !cfg!(target_os = "macos") {
+        if spec.devices.network {
             arguments.extend([
                 "--net".to_owned(),
-                format!(
-                    "mac=02:48:{:02x}:{:02x}:{:02x}:00,pci-address=00:01.1",
-                    spec.id.as_bytes()[0],
-                    spec.id.as_bytes()[1],
-                    spec.id.as_bytes()[2]
+                network_argument(
+                    "primary",
+                    &format!(
+                        "02:48:{:02x}:{:02x}:{:02x}:00",
+                        spec.id.as_bytes()[0],
+                        spec.id.as_bytes()[1],
+                        spec.id.as_bytes()[2]
+                    ),
+                    "00:01.1",
                 ),
                 "--net".to_owned(),
-                format!(
-                    "mac=02:49:{:02x}:{:02x}:{:02x}:00,pci-address=00:01.2",
-                    spec.id.as_bytes()[3],
-                    spec.id.as_bytes()[4],
-                    spec.id.as_bytes()[5]
+                network_argument(
+                    "secondary",
+                    &format!(
+                        "02:49:{:02x}:{:02x}:{:02x}:00",
+                        spec.id.as_bytes()[3],
+                        spec.id.as_bytes()[4],
+                        spec.id.as_bytes()[5]
+                    ),
+                    "00:01.2",
                 ),
             ]);
         }
@@ -693,6 +701,18 @@ fn safe_key_value_path(value: &str) -> Result<String, PlatformError> {
     Ok(value.to_owned())
 }
 
+fn network_argument(interface_name: &str, mac: &str, pci_address: &str) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        format!("tap-name=hd-offline-{interface_name},mac={mac},pci-address={pci_address}")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = interface_name;
+        format!("mac={mac},pci-address={pci_address}")
+    }
+}
+
 fn key_report(code: u16) -> [u8; 32] {
     let mut bytes = [0_u8; 32];
     encode_input_event(&mut bytes[0..8], 1, code, 1);
@@ -735,6 +755,15 @@ mod tests {
     #[test]
     fn unsafe_key_value_path_is_rejected() {
         assert!(safe_key_value_path("c:/guest,image.img").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_network_argument_selects_offline_backend() {
+        assert_eq!(
+            network_argument("primary", "02:48:00:00:00:00", "00:01.1"),
+            "tap-name=hd-offline-primary,mac=02:48:00:00:00:00,pci-address=00:01.1"
+        );
     }
 
     #[cfg(windows)]

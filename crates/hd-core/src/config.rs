@@ -161,7 +161,7 @@ pub struct BootConfigV2 {
 impl Default for BootConfigV2 {
     fn default() -> Self {
         Self {
-            kernel_log_level: 7,
+            kernel_log_level: 4,
             panic_timeout_seconds: 5,
             boot_animation: true,
         }
@@ -185,7 +185,14 @@ impl BootConfigV2 {
         let mut arguments = vec![
             format!("loglevel={}", self.kernel_log_level),
             format!("panic={}", self.panic_timeout_seconds),
-            "printk.devkmsg=on".to_owned(),
+            format!(
+                "printk.devkmsg={}",
+                if self.kernel_log_level >= 7 {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
         ];
         if !self.boot_animation {
             arguments.push("androidboot.debug.sf.nobootanimation=1".to_owned());
@@ -563,6 +570,12 @@ mod tests {
         assert_eq!(spec.display.refresh_rate_hz, 60);
         assert_eq!(spec.display.vsync, VsyncModeV2::On);
         assert_eq!(spec.adb.mode, AdbModeV2::Loopback);
+        assert_eq!(spec.boot.kernel_log_level, 4);
+        assert!(
+            spec.boot
+                .kernel_arguments()
+                .contains(&"printk.devkmsg=off".to_owned())
+        );
         assert!(spec.validate().is_ok());
     }
 

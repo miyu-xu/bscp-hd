@@ -60,6 +60,17 @@ pub(super) async fn run(context: Arc<FormalContext>) -> Result<()> {
     }
 }
 
+fn format_microunits(value: i64) -> String {
+    let magnitude = value.unsigned_abs();
+    let whole = magnitude / 1_000_000;
+    let fraction = magnitude % 1_000_000;
+    if value.is_negative() {
+        format!("-{whole}.{fraction:06}")
+    } else {
+        format!("{whole}.{fraction:06}")
+    }
+}
+
 async fn write_sensor_reports(
     context: &FormalContext,
     guest_input: &mut tokio::fs::File,
@@ -82,7 +93,7 @@ async fn write_sensor_reports(
             "{protocol_name}:{}\n",
             values
                 .iter()
-                .map(|value| format!("{:.6}", *value as f64 / 1_000_000.0))
+                .map(|value| format_microunits(*value))
                 .collect::<Vec<_>>()
                 .join(":")
         );
