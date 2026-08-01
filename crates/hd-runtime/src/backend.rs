@@ -704,13 +704,43 @@ fn safe_key_value_path(value: &str) -> Result<String, PlatformError> {
 fn network_argument(interface_name: &str, mac: &str, pci_address: &str) -> String {
     #[cfg(target_os = "macos")]
     {
-        format!("tap-name=hd-offline-{interface_name},mac={mac},pci-address={pci_address}")
+        network_argument_for_macos(
+            interface_name,
+            mac,
+            pci_address,
+            macos_socket_vmnet_path().as_deref(),
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = interface_name;
         format!("mac={mac},pci-address={pci_address}")
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_socket_vmnet_path() -> Option<PathBuf> {
+    if let Some(configured) = std::env::var_os("HD_SOCKET_VMNET").filter(|value| !value.is_empty())
+    {
+        let path = PathBuf::from(configured);
+        return path.exists().then_some(path);
+    }
+    let system_socket = PathBuf::from("/var/run/socket_vmnet");
+    system_socket.exists().then_some(system_socket)
+}
+
+#[cfg(target_os = "macos")]
+fn network_argument_for_macos(
+    interface_name: &str,
+    mac: &str,
+    pci_address: &str,
+    socket_vmnet: Option<&Path>,
+) -> String {
+    let tap_name = socket_vmnet.map_or_else(
+        || format!("hd-offline-{interface_name}"),
+        |path| format!("hd-socket-vmnet:{}", path.to_string_lossy()),
+    );
+    format!("tap-name={tap_name},mac={mac},pci-address={pci_address}")
 }
 
 fn key_report(code: u16) -> [u8; 32] {
@@ -761,8 +791,22 @@ mod tests {
     #[test]
     fn macos_network_argument_selects_offline_backend() {
         assert_eq!(
-            network_argument("primary", "02:48:00:00:00:00", "00:01.1"),
+            network_argument_for_macos("primary", "02:48:00:00:00:00", "00:01.1", None),
             "tap-name=hd-offline-primary,mac=02:48:00:00:00:00,pci-address=00:01.1"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_network_argument_selects_socket_vmnet_backend() {
+        assert_eq!(
+            network_argument_for_macos(
+                "primary",
+                "02:48:00:00:00:00",
+                "00:01.1",
+                Some(Path::new("/var/run/socket_vmnet")),
+            ),
+            "tap-name=hd-socket-vmnet:/var/run/socket_vmnet,mac=02:48:00:00:00:00,pci-address=00:01.1"
         );
     }
 

@@ -872,9 +872,15 @@ fn constrain_host_device_capabilities(mut statuses: FormalDeviceStatuses) -> For
         statuses.modem = software_on_macos(
             "Android Radio AIDL HAL baseline with deterministic out-of-service state",
         );
-        statuses.network = software_on_macos(
-            "Android Connectivity and wireless simulation stack in an offline profile",
-        );
+        statuses.network = if crate::backend::macos_socket_vmnet_path().is_some() {
+            software_on_macos(
+                "Android Connectivity stack with a shared NAT uplink through socket_vmnet",
+            )
+        } else {
+            software_on_macos(
+                "Android Connectivity and wireless simulation stack in an offline profile",
+            )
+        };
         statuses.audio = software_on_macos(
             "Android AIDL Audio HAL with deterministic virtual speaker and microphone endpoints",
         );
@@ -896,6 +902,8 @@ fn software_on_macos(detail: &str) -> FormalToolStatus {
 fn compose_device_capabilities(statuses: &FormalDeviceStatuses) -> DeviceCapabilitiesV2 {
     let mut devices = primary_device_capabilities(statuses);
     devices.extend(simulated_device_capabilities(statuses));
+    #[cfg(target_os = "macos")]
+    let macos_network_uplink = crate::backend::macos_socket_vmnet_path().is_some();
     #[cfg(target_os = "macos")]
     for device in &mut devices {
         device.available = true;
@@ -930,6 +938,10 @@ fn compose_device_capabilities(statuses: &FormalDeviceStatuses) -> DeviceCapabil
                     "light",
                     "proximity",
                 ],
+            ),
+            "network" if macos_network_uplink => (
+                "Android Connectivity stack with a shared NAT uplink through socket_vmnet; no Wi-Fi RF or port-forward claim",
+                &["connectivity_stack", "shared_nat_uplink"],
             ),
             "network" => (
                 "Android Connectivity and wireless simulation stack in an offline profile; no host uplink or runtime traffic shaping claim",
