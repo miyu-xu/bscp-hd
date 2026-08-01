@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::StreamExt as _;
 use hd_core::{
     AcquireDisplaySessionRequestV2, ActionRequestV2, ApiErrorV2, CONTROL_PROTOCOL_VERSION,
@@ -337,6 +339,12 @@ impl HostClientV2 {
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("apk"))
             })
             .ok_or_else(|| ClientError::Input("APK file name must end in .apk".to_owned()))?;
+        let encoded_file_name = BASE64.encode(file_name.as_bytes());
+        let legacy_file_name = if file_name.is_ascii() {
+            file_name
+        } else {
+            "upload.apk"
+        };
         let digest_path = path.to_owned();
         let sha256 = tokio::task::spawn_blocking(move || crate::sha256_file(&digest_path))
             .await
@@ -353,7 +361,8 @@ impl HostClientV2 {
             self.http
                 .post(self.url("/v2/uploads/apk")?)
                 .timeout(Duration::from_mins(30))
-                .header("x-file-name", file_name)
+                .header("x-file-name", legacy_file_name)
+                .header("x-file-name-base64", encoded_file_name)
                 .header("x-content-sha256", sha256)
                 .header(CONTENT_LENGTH, metadata.len())
                 .body(body),

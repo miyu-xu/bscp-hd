@@ -12,6 +12,8 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::{Stream, StreamExt as _, TryStreamExt as _};
 use hd_core::{
     AcquireDisplaySessionRequestV2, ActionRequestV2, ApiErrorV2, CONTROL_PROTOCOL_VERSION,
@@ -252,7 +254,7 @@ fn add_security_headers(
         headers.insert(
             "access-control-allow-headers",
             HeaderValue::from_static(
-                "Authorization, Content-Type, Idempotency-Key, X-Content-SHA256, X-File-Name, X-Request-ID",
+                "Authorization, Content-Type, Idempotency-Key, X-Content-SHA256, X-File-Name, X-File-Name-Base64, X-Request-ID",
             ),
         );
     }
@@ -466,7 +468,7 @@ async fn upload_apk(
     headers: HeaderMap,
     body: Body,
 ) -> ApiResult<impl IntoResponse> {
-    let file_name = required_header(&headers, "x-file-name")?;
+    let file_name = uploaded_file_name(&headers)?;
     let sha256 = required_header(&headers, "x-content-sha256")?;
     let stream = body.into_data_stream().map_err(std::io::Error::other);
     let reader = StreamReader::new(stream);
@@ -568,6 +570,30 @@ fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, Ap
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
         .ok_or_else(|| ApiHttpError::input("required_header", &format!("{name} is required")))
+}
+
+fn uploaded_file_name(headers: &HeaderMap) -> Result<String, ApiHttpError> {
+    let Some(encoded) = headers.get("x-file-name-base64") else {
+        return required_header(headers, "x-file-name");
+    };
+    let encoded = encoded.to_str().map_err(|_| {
+        ApiHttpError::input(
+            "invalid_file_name_header",
+            "x-file-name-base64 must be an ASCII base64 value",
+        )
+    })?;
+    let decoded = BASE64.decode(encoded).map_err(|_| {
+        ApiHttpError::input(
+            "invalid_file_name_header",
+            "x-file-name-base64 is not valid base64",
+        )
+    })?;
+    String::from_utf8(decoded).map_err(|_| {
+        ApiHttpError::input(
+            "invalid_file_name_header",
+            "x-file-name-base64 does not contain a UTF-8 file name",
+        )
+    })
 }
 
 fn random_bearer() -> Result<String, HttpError> {
@@ -683,6 +709,7 @@ fn openapi_paths() -> serde_json::Value {
             "operationId": "uploadApk",
             "parameters": [
                 {"name": "X-File-Name", "in": "header", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 128}},
+                {"name": "X-File-Name-Base64", "in": "header", "required": false, "description": "Base64-encoded UTF-8 original file name; takes precedence over X-File-Name", "schema": {"type": "string", "minLength": 4, "maxLength": 344}},
                 {"name": "X-Content-Sha256", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
             ],
             "requestBody": {"required": true, "content": {"application/vnd.android.package-archive": {"schema": {"type": "string", "format": "binary"}}}},

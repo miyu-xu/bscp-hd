@@ -775,7 +775,7 @@ fn smoke(root: &Path, evidence_output: Option<&Path>) -> Result<()> {
             "leases remained after stop"
         );
 
-        let apk = temporary_root.join("contract.apk");
+        let apk = temporary_root.join("Google Play 商店 contract.apk");
         std::fs::write(&apk, minimal_apk()?)?;
         let upload = client.upload_apk(&apk).await?;
         ensure!(upload.path.is_file(), "streamed APK upload is missing");
