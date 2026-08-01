@@ -1750,6 +1750,13 @@ fn resolve_web_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
                 .filter(|path| path.join("index.html").is_file())
         })
         .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent()?.parent().map(Path::to_owned))
+                .map(|contents| contents.join("Resources/ui"))
+                .filter(|path| path.join("index.html").is_file())
+        })
+        .or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .ancestors()
                 .nth(2)

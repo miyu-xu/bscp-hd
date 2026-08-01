@@ -163,6 +163,25 @@ hdctl diagnostics --instance-id <UUID>
 
 只有 `certified=true` 且所有 required probe 和启用设备均 available 才具备启动资格。
 
+## macOS 自包含应用、签名与公证
+
+macOS 发布应用必须通过 `scripts/package-macos.sh` 从同一 release target、已构建 Web UI 和明确的 crosvm/ADB/aapt2 输入生成。脚本把 Host/Worker、正式设备组件、crosvm、gfxstream/ANGLE/Vulkan 运行库、ADB、aapt2 和网络兼容服务安装脚本一并封入 `HD.app`，逐个签名 Mach-O，保留 crosvm 的 Hypervisor/JIT entitlement，并生成逐文件 SHA-256 清单。输出路径必须不存在，避免把旧 dylib 混入新版本：
+
+```bash
+./scripts/package-macos.sh \
+  --target-dir ./target/release \
+  --runtime-dir /absolute/path/to/out/dist/macos \
+  --web-dist ./web/dist \
+  --adb /absolute/path/to/adb \
+  --aapt2 /absolute/path/to/aapt2 \
+  --output /absolute/path/to/release/HD.app \
+  --identity "Developer ID Application: Example (TEAMID)" \
+  --notary-profile hd-notary \
+  --version 0.1.0 --build 1
+```
+
+本地 RC 可省略 `--identity` 和 `--notary-profile`，此时只生成 ad-hoc 签名应用，不能对外发布。正式发布必须由 Apple Developer ID Application 证书签名，`notarytool` 返回 Accepted，成功 staple，并通过 `spctl --assess`。全隧道 VPN 下的 Guest NAT 还要求安装包以管理员权限执行应用内 `Contents/Resources/scripts/macos-network-setup.sh install`；仅把脚本放入 `.app` 不等于已安装系统服务。
+
 ## 生命周期语义
 
 - `start`、`stop`、`restart`、`pause`、`resume`、`delete`、`display`、`install` 和 diagnostics operation 都持久化，可用 `hdctl operations` / `hdctl operation <OP_UUID> --wait` 回读。
