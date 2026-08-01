@@ -736,10 +736,18 @@ fn network_argument_for_macos(
     pci_address: &str,
     socket_vmnet: Option<&Path>,
 ) -> String {
-    let tap_name = socket_vmnet.map_or_else(
-        || format!("hd-offline-{interface_name}"),
-        |path| format!("hd-socket-vmnet:{}", path.to_string_lossy()),
-    );
+    // Android's first virtio-net device backs the Cuttlefish Wi-Fi wrapper.
+    // Keep it off socket_vmnet: the daemon fans every inbound packet out to
+    // every client, so an inactive first NIC can eventually block the active
+    // Ethernet client's receive path.
+    let tap_name = if interface_name == "secondary" {
+        socket_vmnet.map_or_else(
+            || format!("hd-offline-{interface_name}"),
+            |path| format!("hd-socket-vmnet:{}", path.to_string_lossy()),
+        )
+    } else {
+        format!("hd-offline-{interface_name}")
+    };
     format!("tap-name={tap_name},mac={mac},pci-address={pci_address}")
 }
 
@@ -801,12 +809,26 @@ mod tests {
     fn macos_network_argument_selects_socket_vmnet_backend() {
         assert_eq!(
             network_argument_for_macos(
-                "primary",
+                "secondary",
                 "02:48:00:00:00:00",
                 "00:01.1",
                 Some(Path::new("/var/run/socket_vmnet")),
             ),
             "tap-name=hd-socket-vmnet:/var/run/socket_vmnet,mac=02:48:00:00:00:00,pci-address=00:01.1"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_primary_network_stays_offline_with_socket_vmnet() {
+        assert_eq!(
+            network_argument_for_macos(
+                "primary",
+                "02:48:00:00:00:00",
+                "00:01.1",
+                Some(Path::new("/var/run/socket_vmnet")),
+            ),
+            "tap-name=hd-offline-primary,mac=02:48:00:00:00:00,pci-address=00:01.1"
         );
     }
 
