@@ -1,13 +1,23 @@
 param(
     [Parameter(Mandatory = $true)][Guid]$InstanceId,
     [string]$DataRoot = "D:\hd-v2-data",
-    [string]$Hdctl = "C:\workspace\bscp\bscp\out\dist\windows\bin\hdctl.exe",
-    [string]$Adb = "C:\Users\developer\AppData\Local\Android\Sdk\platform-tools\adb.exe",
+    [string]$Hdctl = "",
+    [string]$Adb = "",
     [string]$Output = "out\windows-display-matrix"
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$Hdctl = if ($Hdctl) { $Hdctl } else { Join-Path $repoRoot "out\dist\windows\bin\hdctl.exe" }
+if (-not $Adb) {
+    $sdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME }
+    $Adb = if ($sdkRoot) {
+        Join-Path $sdkRoot "platform-tools\adb.exe"
+    } else {
+        $adbCommand = Get-Command adb.exe -ErrorAction SilentlyContinue
+        if ($adbCommand) { $adbCommand.Source } else { "adb.exe" }
+    }
+}
 $outputRoot = if ([IO.Path]::IsPathRooted($Output)) { $Output } else { Join-Path $repoRoot $Output }
 $records = [Collections.Generic.List[object]]::new()
 $failure = $null
