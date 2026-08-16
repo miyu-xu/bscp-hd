@@ -1,24 +1,34 @@
 //! Narrow, explicit host-platform boundaries used by the HD daemon and workers.
 
 use std::collections::BTreeMap;
+#[cfg(target_os = "macos")]
+use std::io::{Read as _, Write as _};
+#[cfg(target_os = "macos")]
+use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 use async_trait::async_trait;
 use hd_core::{
     DeviceSerialEndpointV2, DisplayConfigV2, DisplayViewportV2, FrameTransportKindV2,
     InstanceSpecV2, KeyActionV2, LaunchPlanV2, NativeDisplayTargetV2, ResolvedGuestArtifactsV2,
-    WorkerIdentityV2,
+    SecondaryDisplayConfigV2, TrackpadEventV2, WorkerIdentityV2,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+mod native_digest_macos;
 mod native_display_host;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+mod windows_titlebar;
 
 #[cfg(target_os = "macos")]
 pub use native_display_host::center_macos_traffic_lights;
@@ -27,16 +37,73 @@ pub use native_display_host::install_macos_titlebar_controls;
 #[cfg(target_os = "macos")]
 pub use native_display_host::set_macos_titlebar_fps;
 #[cfg(target_os = "macos")]
+pub use native_display_host::set_macos_titlebar_player_state;
+#[cfg(target_os = "macos")]
 pub use native_display_host::set_macos_window_content_aspect_ratio;
+#[cfg(windows)]
+pub use native_display_host::windows_root_has_foreground_focus;
 #[cfg(target_os = "macos")]
 pub use native_display_host::{
     MacTitlebarControlContract, macos_titlebar_control_contracts, map_macos_pointer,
 };
 pub use native_display_host::{
-    NativeDisplayBounds, NativeDisplayHost, choose_apk_file, create_native_display_host,
+    NativeDisplayBounds, NativeDisplayHost, activate_existing_desktop_application, choose_apk_file,
+    choose_location_route_file, configure_desktop_application_startup, create_native_display_host,
+};
+#[cfg(windows)]
+pub use windows_titlebar::{
+    install_windows_root_window_controller, set_windows_window_content_aspect_ratio,
 };
 
 pub const HD_DATA_DIR_ENV: &str = "HD_DATA_DIR";
+
+#[cfg_attr(windows, allow(unsafe_code))]
+pub fn show_fatal_error_dialog(
+    title: &str,
+    message: &str,
+    reveal_path: Option<&Path>,
+) -> Result<(), PlatformError> {
+    #[cfg(target_os = "macos")]
+    {
+        native_display_host::show_macos_error_dialog(title, message, reveal_path)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+        };
+
+        let _ = reveal_path;
+        let title = std::ffi::OsStr::new(title)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let message = std::ffi::OsStr::new(message)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        // SAFETY: both UTF-16 buffers are NUL-terminated and remain alive for the synchronous
+        // MessageBoxW call. A null owner intentionally creates a process-modal startup alert.
+        let result = unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+            )
+        };
+        (result != 0).then_some(()).ok_or_else(|| {
+            PlatformError::Process("show Windows fatal error dialog failed".to_owned())
+        })
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = reveal_path;
+        eprintln!("{title}: {message}");
+        Ok(())
+    }
+}
 
 pub fn native_display_toplevel_debug_enabled() -> bool {
     #[cfg(windows)]
@@ -65,19 +132,22 @@ pub fn attach_native_display(
     child_pid: u32,
     target: &NativeDisplayTargetV2,
     viewport: &DisplayViewportV2,
+    source_width: u32,
+    source_height: u32,
 ) -> Result<(), PlatformError> {
     #[cfg(windows)]
     {
+        let _ = (source_width, source_height);
         windows::attach_native_display(child_pid, target, viewport)
     }
     #[cfg(target_os = "macos")]
     {
         let _ = (child_pid, viewport);
-        validate_macos_native_target(target)
+        select_macos_native_target(target, source_width, source_height)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (child_pid, target, viewport);
+        let _ = (child_pid, target, viewport, source_width, source_height);
         Err(PlatformError::Unsupported(
             "native display embedding is not implemented for this platform",
         ))
@@ -98,8 +168,8 @@ pub fn prepare_native_display(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (child_pid, viewport);
-        validate_macos_native_target(target)
+        let _ = child_pid;
+        select_macos_native_target(target, viewport.width_px, viewport.height_px)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -133,38 +203,70 @@ pub fn resize_native_display(
     }
 }
 
-pub fn set_native_display_visibility(child_pid: u32, visible: bool) -> Result<(), PlatformError> {
+/// Verifies that the native render and input surfaces still match the Player viewport and repairs
+/// platform-owned hierarchy or geometry drift without touching a healthy display.
+pub fn ensure_native_display(
+    child_pid: u32,
+    target: &NativeDisplayTargetV2,
+    viewport: &DisplayViewportV2,
+) -> Result<(), PlatformError> {
     #[cfg(windows)]
     {
-        windows::set_native_display_visibility(child_pid, visible)
+        windows::ensure_native_display(child_pid, target, viewport)
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (child_pid, visible);
-        Ok(())
+        let _ = (child_pid, viewport);
+        validate_macos_native_target(target)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (child_pid, visible);
+        let _ = (child_pid, target, viewport);
         Err(PlatformError::Unsupported(
             "native display embedding is not implemented for this platform",
         ))
     }
 }
 
-pub fn detach_native_display(child_pid: u32) -> Result<(), PlatformError> {
+pub fn set_native_display_visibility(
+    child_pid: u32,
+    target: &NativeDisplayTargetV2,
+    visible: bool,
+) -> Result<(), PlatformError> {
     #[cfg(windows)]
     {
-        windows::detach_native_display(child_pid)
+        windows::set_native_display_visibility(child_pid, target, visible)
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = child_pid;
+        let _ = (child_pid, target, visible);
         Ok(())
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = child_pid;
+        let _ = (child_pid, target, visible);
+        Err(PlatformError::Unsupported(
+            "native display embedding is not implemented for this platform",
+        ))
+    }
+}
+
+pub fn detach_native_display(
+    child_pid: u32,
+    target: &NativeDisplayTargetV2,
+) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        windows::detach_native_display(child_pid, target)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (child_pid, target);
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (child_pid, target);
         Err(PlatformError::Unsupported(
             "native display embedding is not implemented for this platform",
         ))
@@ -173,7 +275,10 @@ pub fn detach_native_display(child_pid: u32) -> Result<(), PlatformError> {
 
 #[cfg(target_os = "macos")]
 fn validate_macos_native_target(target: &NativeDisplayTargetV2) -> Result<(), PlatformError> {
-    let NativeDisplayTargetV2::MacCaContext { endpoint, owner } = target else {
+    let NativeDisplayTargetV2::MacCaContext {
+        endpoint, owner, ..
+    } = target
+    else {
         return Err(PlatformError::Identity(
             "macOS display requires a CoreAnimation context endpoint".to_owned(),
         ));
@@ -188,6 +293,63 @@ fn validate_macos_native_target(target: &NativeDisplayTargetV2) -> Result<(), Pl
         return Err(PlatformError::Identity(
             "macOS display owner is not alive".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn select_macos_native_target(
+    target: &NativeDisplayTargetV2,
+    source_width: u32,
+    source_height: u32,
+) -> Result<(), PlatformError> {
+    const SELECT_MAGIC: u32 = 0x4844_534C;
+    validate_macos_native_target(target)?;
+    let NativeDisplayTargetV2::MacCaContext {
+        endpoint,
+        scanout_id,
+        ..
+    } = target
+    else {
+        unreachable!("validated macOS native target")
+    };
+    let mut stream = UnixStream::connect(endpoint).map_err(|error| {
+        PlatformError::Process(format!(
+            "connect macOS native display selection endpoint: {error}"
+        ))
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| PlatformError::Process(format!("set display read timeout: {error}")))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| PlatformError::Process(format!("set display write timeout: {error}")))?;
+    if source_width == 0 || source_height == 0 || source_width > 16_384 || source_height > 16_384 {
+        return Err(PlatformError::Identity(
+            "macOS display source dimensions are outside supported bounds".to_owned(),
+        ));
+    }
+    let mut request = [0_u8; 16];
+    request[..4].copy_from_slice(&SELECT_MAGIC.to_ne_bytes());
+    request[4..8].copy_from_slice(&scanout_id.to_ne_bytes());
+    request[8..12].copy_from_slice(&source_width.to_ne_bytes());
+    request[12..].copy_from_slice(&source_height.to_ne_bytes());
+    stream.write_all(&request).map_err(|error| {
+        PlatformError::Process(format!("send macOS native display selection: {error}"))
+    })?;
+    let mut response = [0_u8; 8];
+    stream.read_exact(&mut response).map_err(|error| {
+        PlatformError::Process(format!("read macOS native display selection: {error}"))
+    })?;
+    if u32::from_ne_bytes(response[..4].try_into().expect("fixed response")) != SELECT_MAGIC {
+        return Err(PlatformError::Process(
+            "macOS native display returned an incompatible selection response".to_owned(),
+        ));
+    }
+    if u32::from_ne_bytes(response[4..].try_into().expect("fixed response")) != 0 {
+        return Err(PlatformError::Process(format!(
+            "macOS native display scanout {scanout_id} is not connected yet"
+        )));
     }
     Ok(())
 }
@@ -213,6 +375,14 @@ impl DataPaths {
     pub fn screenshot_directory(&self) -> PathBuf {
         dirs::picture_dir()
             .unwrap_or_else(|| self.root.join("screenshots"))
+            .join("HD")
+    }
+
+    /// User-visible Android screen recordings use the platform Videos directory. The private
+    /// data-root fallback keeps headless QA profiles functional without widening runtime paths.
+    pub fn screen_recording_directory(&self) -> PathBuf {
+        dirs::video_dir()
+            .unwrap_or_else(|| self.root.join("recordings"))
             .join("HD")
     }
 
@@ -320,6 +490,11 @@ impl DataPaths {
         self.root.join("host-runtime-v2.json")
     }
 
+    pub fn host_startup_failure(&self, startup_attempt_id: Uuid) -> PathBuf {
+        self.root
+            .join(format!("host-startup-failure-v1-{startup_attempt_id}.json"))
+    }
+
     pub fn host_identity_secret(&self) -> PathBuf {
         self.root.join("host-identity.key")
     }
@@ -358,6 +533,15 @@ impl DataPaths {
 
     pub fn disk_overlay(&self, id: Uuid) -> PathBuf {
         self.disks.join(format!("{id}.img"))
+    }
+
+    pub fn powerwash_backup_dir(&self, id: Uuid) -> PathBuf {
+        self.disks.join("powerwash").join(id.to_string())
+    }
+
+    pub fn powerwash_backup(&self, id: Uuid, backup_id: Uuid) -> PathBuf {
+        self.powerwash_backup_dir(id)
+            .join(format!("{backup_id}.img"))
     }
 
     pub fn upload_path(&self, id: Uuid) -> PathBuf {
@@ -448,6 +632,13 @@ pub fn open_regular_read_nofollow(path: &Path) -> Result<std::fs::File, Platform
     }
 }
 
+/// Hashes a complete regular file with the macOS `CommonCrypto` implementation while preserving
+/// the same no-follow open boundary used by portable artifact verification.
+#[cfg(target_os = "macos")]
+pub fn sha256_regular_nofollow(path: &Path) -> Result<[u8; 32], PlatformError> {
+    native_digest_macos::sha256_regular_nofollow(path)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSpec {
     pub executable: PathBuf,
@@ -456,6 +647,9 @@ pub struct ProcessSpec {
     pub working_directory: PathBuf,
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
+    /// Requests latency-sensitive host scheduling for the managed process tree. On Windows this
+    /// is applied at creation time so sandboxed crosvm children inherit the priority class.
+    pub latency_sensitive: bool,
     pub kill_on_drop: bool,
 }
 
@@ -510,6 +704,7 @@ pub struct VmLaunchContextV2 {
     pub control_endpoint: String,
     pub frame_endpoint: String,
     pub keyboard_endpoint: String,
+    pub trackpad_endpoint: Option<String>,
     pub device_endpoints: BTreeMap<String, DeviceSerialEndpointV2>,
     pub device_control_endpoints: BTreeMap<String, String>,
     pub adb_host_port: Option<u16>,
@@ -528,6 +723,20 @@ pub trait VmBackend: Send + Sync {
         key: KeyActionV2,
     ) -> Result<(), PlatformError>;
 
+    /// Deliver Android `KEYCODE_POWER` when ADB is not yet ready. Platform adapters select the
+    /// native control path that is actually supported by their crosvm backend.
+    async fn send_power_key(
+        &self,
+        keyboard_endpoint: &str,
+        control_endpoint: &str,
+    ) -> Result<(), PlatformError>;
+
+    async fn send_trackpad(
+        &self,
+        trackpad_endpoint: &str,
+        event: TrackpadEventV2,
+    ) -> Result<(), PlatformError>;
+
     async fn pause(&self, control_endpoint: &str) -> Result<(), PlatformError>;
     async fn resume(&self, control_endpoint: &str) -> Result<(), PlatformError>;
     async fn power_button(&self, control_endpoint: &str) -> Result<(), PlatformError>;
@@ -535,7 +744,28 @@ pub trait VmBackend: Send + Sync {
     async fn replace_display(
         &self,
         control_endpoint: &str,
+        display_id: u32,
         display: &DisplayConfigV2,
+    ) -> Result<(), PlatformError>;
+
+    async fn add_secondary_display(
+        &self,
+        control_endpoint: &str,
+        expected_scanout_id: u32,
+        display: &SecondaryDisplayConfigV2,
+    ) -> Result<(), PlatformError>;
+
+    async fn remove_display(
+        &self,
+        control_endpoint: &str,
+        display_id: u32,
+    ) -> Result<(), PlatformError>;
+
+    async fn replace_secondary_display(
+        &self,
+        control_endpoint: &str,
+        display_id: u32,
+        display: &SecondaryDisplayConfigV2,
     ) -> Result<(), PlatformError>;
 }
 
@@ -762,14 +992,29 @@ pub fn spawn_detached(
     windows::configure_detached(&mut command);
     #[cfg(unix)]
     unix::configure_detached(&mut command);
-    command
-        .spawn()
-        .map(|child| child.id())
-        .map_err(|source| PlatformError::Io {
-            operation: "spawn detached process",
-            path: executable.to_owned(),
-            source,
-        })
+    let child = command.spawn().map_err(|source| PlatformError::Io {
+        operation: "spawn detached process",
+        path: executable.to_owned(),
+        source,
+    })?;
+    let pid = child.id();
+    #[cfg(unix)]
+    {
+        let mut child = child;
+        std::thread::Builder::new()
+            .name(format!("hd-reap-{pid}"))
+            .spawn(move || {
+                let _ = child.wait();
+            })
+            .map_err(|source| PlatformError::Io {
+                operation: "spawn detached process reaper",
+                path: executable.to_owned(),
+                source,
+            })?;
+    }
+    #[cfg(windows)]
+    drop(child);
+    Ok(pid)
 }
 
 #[cfg(windows)]
@@ -801,6 +1046,24 @@ pub fn configure_managed_command(command: &mut Command) -> Result<(), PlatformEr
     }
 }
 
+pub fn configure_latency_sensitive_managed_command(
+    command: &mut Command,
+) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        windows::configure_latency_sensitive_managed(command);
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        // Preserve the existing macOS/Linux process-group and parent-death contract. The Windows
+        // priority policy addresses a measured WHPX/gfxstream scheduling bottleneck and is not
+        // assumed to apply to the native macOS host path.
+        unix::configure_managed(command);
+        Ok(())
+    }
+}
+
 /// Configures a bounded, short-lived helper process without suspending its initial thread.
 ///
 /// Managed long-running processes are created suspended on Windows so they can be assigned to a
@@ -814,7 +1077,7 @@ pub fn configure_transient_command(command: &mut Command) -> Result<(), Platform
     }
     #[cfg(unix)]
     {
-        unix::configure_managed(command);
+        unix::configure_transient(command);
         Ok(())
     }
 }

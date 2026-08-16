@@ -30,7 +30,7 @@ cd hd
 build.bat
 ```
 
-项目统一构建会发布十四个 HD Windows 运行时：合并多实例管理与 Player 的 `hd.exe`、CLI/Host/Worker、设备模拟器、ADB bridge、RootCanal/Casimir、frame producer，以及 UWB、modem、network、audio、camera 五个正式 peripheral adapter。`hd.exe` 使用 `winit + Wry/WebView2` 呈现 React UI，并通过独立 `NativeDisplayHost` 子 HWND 承载 gfxstream 原生画面。顶部栏、侧栏、设置内容与 Android 区域是互不覆盖的子窗口；发布包包含 `bin/ui`，需要系统安装 Evergreen WebView2 Runtime，但不需要旁置 `WebView2Loader.dll`。
+项目统一构建会发布十四个 HD Windows 运行时：合并多实例管理与 Player 的 `hd.exe`、CLI/Host/Worker、设备模拟器、ADB bridge、RootCanal/Casimir、frame producer，以及 UWB、modem、network、audio、camera 五个正式 peripheral adapter。`hd.exe` 使用 `winit` 管理桌面窗口，Windows 标题栏由 Win32 原生控件实现、macOS 标题栏由 AppKit 实现；Wry/WebView2 只呈现 React 侧栏与设置等页面内容，独立 `NativeDisplayHost` 子 HWND 承载 gfxstream 原生画面。标题栏与侧栏作为原生覆盖层位于全窗口 Android 区域之上，WebView 不实现标题栏也不覆盖 Player；发布包包含 `bin/ui` 和 GNU 构建实际动态导入的 `bin/WebView2Loader.dll`，运行机仍需要 Evergreen WebView2 Runtime。
 
 ```bat
 build_all.bat
@@ -103,7 +103,7 @@ Host 数据根由 `host.lock` 单写者保护；正常关闭 `hd.exe` 会释放�
 - 运行时不下载 Guest、工具或设备组件；只接受受信 Ed25519 签名、READY 标记和逐文件 SHA-256 验证通过的 bundle。
 - 官方 Cuttlefish image ZIP 与 Linux `cvd-host_package.tar.gz` 都不是可直接启动的 HD bundle；必须先离线导入，并为对应 Android 版本通过 real-guest、设备拓扑和认证门禁。
 - VSync 是启动参数；不能真实热应用的变更返回需重启。分辨率、DPI、刷新率和方向走 crosvm 显示事务，Guest 方向失败时回滚。
-- 严格零拷贝不支持时阻止启动；没有 readback、软件 blit、视频编码或像素缓冲回退 API。
+- 严格零拷贝不支持时阻止启动；常规显示没有 readback、软件 blit、视频编码或像素缓冲回退。仅用户明确启动录屏期间，允许所选 scanout 走有界限速的 GPU→CPU 读回与硬件 H.264 编码；Player 仍沿用零拷贝 surface，停止或失败后必须立即注销录屏读回。
 - 所有常规 Guest 动作只在唯一 `Ready` 条件成立后执行；APK 会先流式上传、校验 SHA-256 和有界 ZIP32/唯一 manifest 结构，再由 ADB 安装并回读包路径。
 - 仓库约束为不运行 unittest；测试目标仍必须编译，可执行验证使用独立 smoke、集成构建和专用 real-guest runner。
 

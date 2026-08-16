@@ -76,6 +76,14 @@ where
         hd_core::WorkerCommandV2::Start { .. } => Duration::from_mins(8),
         hd_core::WorkerCommandV2::InstallApk { .. } => Duration::from_mins(6),
         hd_core::WorkerCommandV2::CaptureScreenshot { .. } => Duration::from_secs(45),
+        // AOSP bugreport is bounded to ten minutes inside the Worker. Allow only this typed
+        // operation enough IPC time to finish validation and publish its record afterwards;
+        // the HTTP client remains bounded independently at eleven minutes.
+        hd_core::WorkerCommandV2::CollectAndroidBugreport { .. } => Duration::from_secs(630),
+        // The Guest recording can be up to three minutes and the finalized MP4 is pulled before
+        // the Worker publishes success. Keep this boundary outside ADB's bounded two-minute pull.
+        hd_core::WorkerCommandV2::StopScreenRecording { .. } => Duration::from_mins(3),
+        hd_core::WorkerCommandV2::StartScreenRecording { .. } => Duration::from_secs(30),
         hd_core::WorkerCommandV2::Stop {
             graceful_timeout_ms,
             ..

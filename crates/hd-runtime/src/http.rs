@@ -19,14 +19,14 @@ use hd_core::{
     AcquireDisplaySessionRequestV2, ActionRequestV2, ApiErrorV2, CONTROL_PROTOCOL_VERSION,
     CreateInstanceRequestV2, CreateOperationRequestV2, DiagnosticRequestV2, HealthResponseV2,
     HostRuntimeDescriptorV2, ReleaseDisplaySessionRequestV2, ShutdownHostRequestV2,
-    UpdateDisplaySessionRequestV2, UpdateInstanceRequestV2,
+    StartScreenRecordingRequestV2, UpdateDisplaySessionRequestV2, UpdateInstanceRequestV2,
 };
 use subtle::ConstantTimeEq as _;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
-use crate::{HostError, HostService, StoreError, UploadError, store_apk_upload};
+use crate::{HostError, HostService, PowerwashError, StoreError, UploadError, store_apk_upload};
 
 const JSON_BODY_LIMIT: usize = 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -35,6 +35,7 @@ const MAX_HTTP_BODY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 struct HttpState {
     host: Arc<HostService>,
     origin: String,
+    executable_sha256: String,
 }
 
 struct SecurityState {
@@ -43,6 +44,7 @@ struct SecurityState {
     bearer: Vec<u8>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run_host_http(host: Arc<HostService>, port: Option<u16>) -> Result<(), HttpError> {
     let listener =
         tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port.unwrap_or(0)))
@@ -55,12 +57,15 @@ pub async fn run_host_http(host: Arc<HostService>, port: Option<u16>) -> Result<
     let host_header = format!("127.0.0.1:{}", address.port());
     let origin = format!("http://{host_header}");
     let token = random_bearer()?;
+    let executable = std::env::current_exe().map_err(HttpError::CurrentExecutable)?;
+    let executable_sha256 = crate::sha256_file(&executable)?;
     let descriptor = HostRuntimeDescriptorV2 {
         protocol_version: CONTROL_PROTOCOL_VERSION,
         pid: std::process::id(),
         process_start_marker: hd_platform::process_start_marker(std::process::id())?,
         origin: origin.clone(),
         bearer_token: token.clone(),
+        executable_sha256: Some(executable_sha256.clone()),
         started_at: host.started_at(),
     };
     let descriptor_bytes = serde_json::to_vec_pretty(&descriptor).map_err(HttpError::Json)?;
@@ -81,6 +86,7 @@ pub async fn run_host_http(host: Arc<HostService>, port: Option<u16>) -> Result<
     let state = Arc::new(HttpState {
         host: Arc::clone(&host),
         origin: origin.clone(),
+        executable_sha256,
     });
     let security = Arc::new(SecurityState {
         origin,
@@ -90,10 +96,15 @@ pub async fn run_host_http(host: Arc<HostService>, port: Option<u16>) -> Result<
     let router = Router::new()
         .route("/v2/health", get(health))
         .route("/v2/capabilities", get(capabilities))
+        .route("/v2/ui-snapshot", get(ui_snapshot))
         .route("/v2/instances", get(list_instances).post(create_instance))
         .route(
             "/v2/instances/{id}",
             get(get_instance).patch(update_instance),
+        )
+        .route(
+            "/v2/instances/{id}/resource-admission",
+            get(resource_admission),
         )
         .route("/v2/instances/{id}/operations", post(create_operation))
         .route("/v2/instances/{id}/actions", post(action))
@@ -104,6 +115,14 @@ pub async fn run_host_http(host: Arc<HostService>, port: Option<u16>) -> Result<
                 .delete(release_display_session),
         )
         .route("/v2/instances/{id}/screenshots", post(capture_screenshot))
+        .route(
+            "/v2/instances/{id}/android-bugreports",
+            post(collect_android_bugreport),
+        )
+        .route(
+            "/v2/instances/{id}/screen-recordings",
+            post(start_screen_recording).delete(stop_screen_recording),
+        )
         .route("/v2/operations", get(list_operations))
         .route("/v2/operations/{id}", get(get_operation))
         .route("/v2/uploads/apk", post(upload_apk))
@@ -297,6 +316,7 @@ async fn health(State(state): State<Arc<HttpState>>) -> Json<HealthResponseV2> {
         protocol_version: CONTROL_PROTOCOL_VERSION,
         service: "hd-host".to_owned(),
         pid: std::process::id(),
+        executable_sha256: Some(state.executable_sha256.clone()),
         started_at: state.host.started_at(),
     })
 }
@@ -321,6 +341,35 @@ async fn capabilities(
         }
     };
     Ok(Json(state.host.capabilities(instance_id).await?))
+}
+
+async fn resource_admission(
+    State(state): State<Arc<HttpState>>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.host.resource_admission(parse_uuid(&id)?)?))
+}
+
+async fn ui_snapshot(
+    State(state): State<Arc<HttpState>>,
+    RawQuery(query): RawQuery,
+) -> ApiResult<impl IntoResponse> {
+    let selected_id = match query.as_deref() {
+        None | Some("") => None,
+        Some(value) => {
+            let raw = value.strip_prefix("selected_id=").ok_or_else(|| {
+                ApiHttpError::input("invalid_query", "only selected_id is accepted")
+            })?;
+            if raw.contains('&') || raw.is_empty() {
+                return Err(ApiHttpError::input(
+                    "invalid_query",
+                    "selected_id must appear exactly once",
+                ));
+            }
+            Some(parse_uuid(raw)?)
+        }
+    };
+    Ok(Json(state.host.ui_snapshot(selected_id)?))
 }
 
 async fn list_instances(State(state): State<Arc<HttpState>>) -> ApiResult<impl IntoResponse> {
@@ -449,6 +498,53 @@ async fn capture_screenshot(
     Ok((
         StatusCode::CREATED,
         Json(state.host.capture_screenshot(parse_uuid(&id)?).await?),
+    ))
+}
+
+async fn collect_android_bugreport(
+    State(state): State<Arc<HttpState>>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<impl IntoResponse> {
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            state
+                .host
+                .collect_android_bugreport(parse_uuid(&id)?)
+                .await?,
+        ),
+    ))
+}
+
+async fn start_screen_recording(
+    State(state): State<Arc<HttpState>>,
+    AxumPath(id): AxumPath<String>,
+    payload: Result<Json<StartScreenRecordingRequestV2>, JsonRejection>,
+) -> ApiResult<impl IntoResponse> {
+    let request = json_payload(payload)?;
+    if !request.is_valid() {
+        return Err(ApiHttpError::input(
+            "screen_recording_duration_invalid",
+            "max_duration_seconds must be between 1 and 180",
+        ));
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            state
+                .host
+                .start_screen_recording(parse_uuid(&id)?, request)
+                .await?,
+        ),
+    ))
+}
+
+async fn stop_screen_recording(
+    State(state): State<Arc<HttpState>>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(
+        state.host.stop_screen_recording(parse_uuid(&id)?).await?,
     ))
 }
 
@@ -660,6 +756,7 @@ fn openapi_document(origin: &str) -> serde_json::Value {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn openapi_paths() -> serde_json::Value {
     let id_parameter = serde_json::json!({
         "name": "id", "in": "path", "required": true,
@@ -675,6 +772,11 @@ fn openapi_paths() -> serde_json::Value {
             "parameters": [{"name": "instance_id", "in": "query", "required": false, "schema": {"type": "string", "format": "uuid"}}],
             "responses": {"200": json_response("host capabilities", "HostCapabilitiesV2")}
         }},
+        "/v2/ui-snapshot": {"get": {
+            "operationId": "uiSnapshot",
+            "parameters": [{"name": "selected_id", "in": "query", "required": false, "schema": {"type": "string", "format": "uuid"}}],
+            "responses": {"200": json_response("atomic UI instance snapshot", "UiSnapshotV2")}
+        }},
         "/v2/instances": {
             "get": {"operationId": "listInstances", "responses": {"200": json_array_response("instances", "InstanceRecordV2")}},
             "post": {"operationId": "createInstance", "requestBody": json_request("CreateInstanceRequestV2"), "responses": {"201": json_response("created", "InstanceRecordV2")}}
@@ -683,6 +785,10 @@ fn openapi_paths() -> serde_json::Value {
             "parameters": [id_parameter.clone()],
             "get": {"operationId": "getInstance", "responses": {"200": json_response("instance", "InstanceRecordV2")}},
             "patch": {"operationId": "updateInstance", "requestBody": json_request("UpdateInstanceRequestV2"), "responses": {"200": json_response("updated", "InstanceRecordV2")}}
+        },
+        "/v2/instances/{id}/resource-admission": {
+            "parameters": [id_parameter.clone()],
+            "get": {"operationId": "resourceAdmission", "responses": {"200": json_response("lightweight resource admission", "CapabilityProbeV2")}}
         },
         "/v2/instances/{id}/operations": {
             "parameters": [id_parameter.clone()],
@@ -696,6 +802,50 @@ fn openapi_paths() -> serde_json::Value {
         "/v2/instances/{id}/actions": {
             "parameters": [id_parameter.clone()],
             "post": {"operationId": "typedAction", "requestBody": json_request("ActionRequestV2"), "responses": {"200": json_response("applied and read back", "ActionResultV2")}}
+        },
+        "/v2/instances/{id}/display-session": {
+            "parameters": [id_parameter.clone()],
+            "post": {
+                "operationId": "acquireDisplaySession",
+                "requestBody": json_request("AcquireDisplaySessionRequestV2"),
+                "responses": {"201": json_response("native display session acquired", "DisplaySessionV2")}
+            },
+            "patch": {
+                "operationId": "updateDisplaySession",
+                "requestBody": json_request("UpdateDisplaySessionRequestV2"),
+                "responses": {"200": json_response("native display session updated", "DisplaySessionV2")}
+            },
+            "delete": {
+                "operationId": "releaseDisplaySession",
+                "requestBody": json_request("ReleaseDisplaySessionRequestV2"),
+                "responses": {"204": {"description": "native display session released"}}
+            }
+        },
+        "/v2/instances/{id}/screenshots": {
+            "parameters": [id_parameter.clone()],
+            "post": {
+                "operationId": "captureScreenshot",
+                "responses": {"201": json_response("screenshot captured", "ScreenshotRecordV2")}
+            }
+        },
+        "/v2/instances/{id}/android-bugreports": {
+            "parameters": [id_parameter.clone()],
+            "post": {
+                "operationId": "collectAndroidBugreport",
+                "responses": {"201": json_response("full AOSP bugreport captured", "AndroidBugreportRecordV2")}
+            }
+        },
+        "/v2/instances/{id}/screen-recordings": {
+            "parameters": [id_parameter.clone()],
+            "post": {
+                "operationId": "startScreenRecording",
+                "requestBody": json_request("StartScreenRecordingRequestV2"),
+                "responses": {"201": json_response("recording started", "ScreenRecordingStatusV2")}
+            },
+            "delete": {
+                "operationId": "stopScreenRecording",
+                "responses": {"200": json_response("recording finalized", "ScreenRecordingRecordV2")}
+            }
         },
         "/v2/operations": {"get": {
             "operationId": "listOperations",
@@ -761,11 +911,12 @@ fn json_array_response(description: &str, item: &str) -> serde_json::Value {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn openapi_schemas() -> serde_json::Value {
     serde_json::json!({
         "InstanceSpecV2": {
             "type": "object",
-            "required": ["schema_version", "id", "name", "cpu_count", "memory_mib", "display", "adb", "boot", "devices", "restart_policy", "labels"],
+            "required": ["schema_version", "id", "name", "cpu_count", "memory_mib", "display", "adb", "boot", "devices", "host_audio_input", "restart_policy", "labels"],
             "properties": {
                 "schema_version": {"type": "integer", "const": 2},
                 "id": {"type": "string", "format": "uuid"},
@@ -776,6 +927,7 @@ fn openapi_schemas() -> serde_json::Value {
                 "adb": schema_reference("AdbConfigV2"),
                 "boot": schema_reference("BootConfigV2"),
                 "devices": schema_reference("DeviceConfigV2"),
+                "host_audio_input": {"type": "string", "enum": ["disabled", "default_microphone"]},
                 "restart_policy": {"type": "string", "enum": ["never", "on_failure"]},
                 "artifacts": {"oneOf": [schema_reference("ArtifactSelectionV2"), {"type": "null"}]},
                 "labels": {"type": "object", "maxProperties": 32, "additionalProperties": {"type": "string", "maxLength": 256}}
@@ -835,6 +987,22 @@ fn openapi_schemas() -> serde_json::Value {
         ),
         "CreateOperationRequestV2": object_with_properties(["operation"], &serde_json::json!({"operation": schema_reference("OperationKindV2")})),
         "ActionRequestV2": object_with_properties(["action"], &serde_json::json!({"action": schema_reference("InstanceActionV2")})),
+        "AcquireDisplaySessionRequestV2": object_with_properties(
+            ["target", "viewport"],
+            &serde_json::json!({"target": {"type": "object"}, "viewport": {"type": "object"}})
+        ),
+        "UpdateDisplaySessionRequestV2": object_with_properties(
+            ["session_token", "viewport"],
+            &serde_json::json!({"session_token": {"type": "string", "minLength": 1}, "viewport": {"type": "object"}})
+        ),
+        "ReleaseDisplaySessionRequestV2": object_with_properties(
+            ["session_token"],
+            &serde_json::json!({"session_token": {"type": "string", "minLength": 1}})
+        ),
+        "StartScreenRecordingRequestV2": object_with_properties(
+            ["max_duration_seconds"],
+            &serde_json::json!({"max_duration_seconds": {"type": "integer", "minimum": 1, "maximum": 180}})
+        ),
         "DiagnosticRequestV2": object_with_properties(
             ["instance_id", "include_guest_logs"],
             &serde_json::json!({"instance_id": {"type": ["string", "null"], "format": "uuid"}, "include_guest_logs": {"type": "boolean"}})
@@ -842,12 +1010,12 @@ fn openapi_schemas() -> serde_json::Value {
         "ShutdownHostRequestV2": object_with_properties(["stop_all"], &serde_json::json!({"stop_all": {"type": "boolean"}})),
         "OperationKindV2": {
             "type": "object", "required": ["operation"],
-            "properties": {"operation": {"type": "string", "enum": ["start", "stop", "restart", "pause", "resume", "reconfigure", "install_apk", "collect_diagnostics", "delete"]}, "parameters": {"type": "object"}},
+            "properties": {"operation": {"type": "string", "enum": ["start", "stop", "restart", "pause", "resume", "reconfigure", "install_apk", "collect_diagnostics", "powerwash", "restore_powerwash", "discard_powerwash_backup", "delete"]}, "parameters": {"type": "object"}},
             "additionalProperties": false
         },
         "InstanceActionV2": {
-            "type": "object", "required": ["action", "parameters"],
-            "properties": {"action": {"type": "string", "enum": ["key", "rotate", "set_location", "set_battery", "set_network_condition", "inject_sensor", "bluetooth_peer", "nfc_tag"]}, "parameters": {"type": "object"}},
+            "type": "object", "required": ["action"],
+            "properties": {"action": {"type": "string", "enum": ["key", "rotate", "set_location", "start_location_route", "pause_location_route", "resume_location_route", "stop_location_route", "set_battery", "set_network_condition", "inject_sensor", "set_sensor_pose", "bluetooth_peer", "nfc_tag", "set_uwb_ranging", "set_modem_state", "microdroid_console_challenge"]}, "parameters": {"type": "object"}},
             "additionalProperties": false
         },
         "ApiErrorV2": {
@@ -856,8 +1024,15 @@ fn openapi_schemas() -> serde_json::Value {
             "additionalProperties": false
         },
         "HealthResponseV2": {"type": "object"}, "HostCapabilitiesV2": {"type": "object"},
-        "InstanceRecordV2": {"type": "object"}, "OperationRecordV2": {"type": "object"},
+        "CapabilityProbeV2": {"type": "object"},
+        "InstanceRecordV2": {"type": "object"}, "UiSnapshotV2": {"type": "object"},
+        "OperationRecordV2": {"type": "object"},
         "ActionResultV2": {"type": "object"}, "UploadRecordV2": {"type": "object"},
+        "DisplaySessionV2": {"type": "object"},
+        "ScreenshotRecordV2": {"type": "object"},
+        "AndroidBugreportRecordV2": {"type": "object"},
+        "ScreenRecordingStatusV2": {"type": "object"},
+        "ScreenRecordingRecordV2": {"type": "object"},
         "DiagnosticBundleResponseV2": {"type": "object"}
     })
 }
@@ -894,7 +1069,8 @@ impl From<HostError> for ApiHttpError {
         let status = match &error {
             HostError::InstanceNotFound(_)
             | HostError::OperationNotFound(_)
-            | HostError::UploadNotFound(_) => StatusCode::NOT_FOUND,
+            | HostError::UploadNotFound(_)
+            | HostError::Powerwash(PowerwashError::BackupNotFound(_)) => StatusCode::NOT_FOUND,
             HostError::Busy(_) | HostError::InstanceMismatch | HostError::UploadDigestMismatch => {
                 StatusCode::CONFLICT
             }
@@ -902,11 +1078,33 @@ impl From<HostError> for ApiHttpError {
                 StoreError::RevisionConflict { .. }
                 | StoreError::AlreadyExists(_)
                 | StoreError::IdempotencyConflict,
+            )
+            | HostError::Powerwash(
+                PowerwashError::RevisionConflict { .. }
+                | PowerwashError::InstanceNotStopped
+                | PowerwashError::TransactionPending
+                | PowerwashError::WorkerStillAttached
+                | PowerwashError::BackupAlreadyAvailable
+                | PowerwashError::SourceChanged(_)
+                | PowerwashError::DestinationExists(_)
+                | PowerwashError::OverlayNotFound(_),
             ) => StatusCode::CONFLICT,
-            HostError::CapabilityBlocked => StatusCode::PRECONDITION_FAILED,
-            HostError::Store(StoreError::Config(_)) | HostError::Action(_) => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            HostError::Powerwash(
+                PowerwashError::InvalidDigest(_)
+                | PowerwashError::BackupSizeMismatch { .. }
+                | PowerwashError::BackupDigestMismatch(_)
+                | PowerwashError::UnsafePath(_)
+                | PowerwashError::EmptyOverlay(_)
+                | PowerwashError::AmbiguousRecovery(_),
+            )
+            | HostError::CapabilityBlocked(_) => StatusCode::PRECONDITION_FAILED,
+            HostError::Unsupported(_)
+            | HostError::Store(StoreError::Config(_))
+            | HostError::Action(_)
+            | HostError::Powerwash(
+                PowerwashError::AndroidOnly | PowerwashError::ConfirmationMismatch,
+            )
+            | HostError::InvalidScreenRecordingDuration(_) => StatusCode::UNPROCESSABLE_ENTITY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -950,12 +1148,16 @@ pub enum HttpError {
     Serve(std::io::Error),
     #[error("host runtime JSON failed: {0}")]
     Json(serde_json::Error),
+    #[error("failed to locate the running HD Host executable: {0}")]
+    CurrentExecutable(std::io::Error),
     #[error("secure random generation failed: {0}")]
     Random(String),
     #[error("failed to remove host runtime descriptor: {0}")]
     Cleanup(std::io::Error),
     #[error(transparent)]
     Platform(#[from] hd_platform::PlatformError),
+    #[error(transparent)]
+    Runtime(#[from] crate::ArtifactError),
 }
 
 #[cfg(test)]

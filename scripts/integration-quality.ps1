@@ -5,6 +5,7 @@ param(
     [string]$MingwRoot = "C:\workspace\mingw64",
     [string]$CrosvmFeatures = "whpx,composite-disk,android-sparse,net,slirp,balloon,gpu,gfxstream,vulkan_display,vulkano",
     [string]$Android17GfxstreamRun = "",
+    [string]$CargoTargetDir = "",
     [switch]$RunRootBuild,
     [switch]$PlanOnly
 )
@@ -19,6 +20,17 @@ $taskPath = (Resolve-Path $taskPath).Path
 $outputPath = if ([IO.Path]::IsPathRooted($Output)) { $Output } else { Join-Path $hdRoot $Output }
 $logsPath = Join-Path $outputPath "logs"
 [void](New-Item -ItemType Directory -Force -Path $logsPath)
+
+if ($CargoTargetDir) {
+    $cargoTargetPath = if ([IO.Path]::IsPathRooted($CargoTargetDir)) {
+        $CargoTargetDir
+    }
+    else {
+        Join-Path $hdRoot $CargoTargetDir
+    }
+    $env:CARGO_TARGET_DIR = [IO.Path]::GetFullPath($cargoTargetPath)
+    [void](New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR)
+}
 
 $mingwBin = Join-Path $MingwRoot "bin"
 $gcc = Join-Path $mingwBin "gcc.exe"
@@ -43,11 +55,21 @@ $env:CXX = Join-Path $mingwBin "g++.exe"
 $env:AR = Join-Path $mingwBin "ar.exe"
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = $gcc
 
+function Assert-CargoTargetAvailable {
+    if (-not $env:CARGO_TARGET_DIR) {
+        return
+    }
+    $targetVolume = [IO.Path]::GetPathRoot($env:CARGO_TARGET_DIR)
+    if (-not $targetVolume -or -not [IO.Directory]::Exists($targetVolume)) {
+        throw "Cargo target volume is unavailable: $targetVolume"
+    }
+}
+
 function Invoke-Gate {
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$Executable,
-        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
         [Parameter(Mandatory)][string]$WorkingDirectory
     )
 
@@ -74,6 +96,7 @@ function Invoke-Gate {
 
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     try {
+        Assert-CargoTargetAvailable
         $startInfo = [Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = $Executable
         $startInfo.WorkingDirectory = $WorkingDirectory
@@ -162,8 +185,13 @@ $gfxstreamBuild = Join-Path $workspaceRoot "out\gfxstream_build_windows"
 $records.Add((Invoke-Gate `
     -Name "gfxstream-mingw-build" `
     -Executable $make `
-    -Arguments @("-C", $gfxstreamBuild, "gfxstream_backend", "-j4") `
+    -Arguments @("-C", $gfxstreamBuild, "gfxstream_backend", "hd_host_recorder_windows_smoke", "-j4") `
     -WorkingDirectory $workspaceRoot))
+$records.Add((Invoke-Gate `
+    -Name "windows-host-recorder-smoke" `
+    -Executable (Join-Path $gfxstreamBuild "hd_host_recorder_windows_smoke.exe") `
+    -Arguments @() `
+    -WorkingDirectory $gfxstreamBuild))
 
 # rutabaga_gfx uses GFXSTREAM_PATH as the explicit Windows GNU link contract. Without it,
 # its build script falls back to pkg-config, which correctly rejects a host/target cross query.
@@ -222,6 +250,7 @@ if ($PlanOnly) {
     exit 0
 }
 
+Assert-CargoTargetAvailable
 & $cargo run --target x86_64-pc-windows-gnu -p xtask -- readback `
     --task $taskPath `
     --output $outputPath `

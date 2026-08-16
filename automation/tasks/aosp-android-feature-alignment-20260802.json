@@ -1,0 +1,374 @@
+{
+  "schema_version": 2,
+  "task_id": "aosp-android-feature-alignment-20260802",
+  "objective": "以 Android 15 AOSP Cuttlefish 的可交互设备功能为基线，补齐 HD Android 实例的控制契约、运行时、UI 和双平台真实 Guest 证据，同时保持严格零拷贝并禁止 SwiftShader 回退。",
+  "status": "in_progress",
+  "scope": {
+    "repositories": [
+      "hd",
+      "bscp-root",
+      "external/crosvm",
+      "hardware/google/gfxstream",
+      "packages/modules/Bluetooth",
+      "system/nfc"
+    ],
+    "owned_paths": [
+      "hd/automation/tasks/aosp-android-feature-alignment-20260802.json",
+      "hd/docs/AOSP_ANDROID_FEATURE_ALIGNMENT.md",
+      "hd/crates/hd-core/",
+      "hd/crates/hd-runtime/",
+      "hd/crates/hd-ui/",
+      "hd/crates/hd-device-sim/",
+      "hd/crates/hd-rootcanal-adapter/",
+      "hd/crates/hd-casimir-adapter/",
+      "hd/crates/hd-peripheral-adapters/",
+      "hd/xtask/",
+      "hd/web/",
+      "hd/scripts/"
+    ],
+    "excluded_paths": [
+      "out/",
+      "target/",
+      "用户实例数据和运行中的 Host/Worker/crosvm",
+      "hardware/google/gfxstream/host/gl/DisplayGl.cpp",
+      "scripts/package_aosp_vm_artifacts.sh",
+      "scripts/run_android_linux.sh"
+    ]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "windows_uses_mingw_only",
+    "preserve_user_changes",
+    "do_not_push",
+    "windows_and_macos_change_and_validate_together",
+    "zero_copy_or_block",
+    "do_not_use_swiftshader",
+    "do_not_claim_real_guest_from_contract_smoke"
+  ],
+  "acceptance": [
+    {
+      "id": "AOSP-ANDROID-001",
+      "criterion": "建立版本化 AOSP Cuttlefish 功能矩阵，每项能力明确为已验证、已实现待真机、阻断或非目标，并绑定稳定门禁证据。",
+      "evidence": [
+        "doc:docs/AOSP_ANDROID_FEATURE_ALIGNMENT.md",
+        "gate:process-check"
+      ]
+    },
+    {
+      "id": "AOSP-ANDROID-002",
+      "criterion": "Power、Home、Back、Recent、音量、旋转、键鼠、多点触控、截图、APK 安装、暂停恢复和显示配置在 Windows 与 macOS 的 Android 15 真实 Guest 中可回读验证。",
+      "evidence": [
+        "gate:windows-android-aosp-controls",
+        "gate:macos-android-aosp-controls"
+      ]
+    },
+    {
+      "id": "AOSP-ANDROID-003",
+      "criterion": "定位、电池、网络条件、五类传感器、Bluetooth RootCanal、NFC Casimir、UWB、modem、音频和相机具备按实例隔离的控制面或明确能力边界；切换实例不得继承表单或临时设备状态。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:device-profile-conformance",
+        "gate:windows-android-device-controls",
+        "gate:macos-android-device-controls",
+        "artifact:windows-android-real-guest-20260806-r36-location-delivery-uninstall/windows-real-guest.json",
+        "artifact:windows-android-real-guest-20260806-r36-location-delivery-uninstall/location-framework-callback.txt",
+        "artifact:windows-android-real-guest-20260806-r36-location-delivery-uninstall/location-delivery-v1.json",
+        "artifact:windows-android-real-guest-20260806-r37-location-route-framework/windows-real-guest.json",
+        "artifact:windows-android-real-guest-20260806-r37-location-route-framework/location-framework-callback.txt",
+        "artifact:windows-android-real-guest-20260806-r37-location-route-framework/location-route-framework-callback.txt",
+        "artifact:windows-android-real-guest-20260806-r37-location-route-framework/location-route-delivery-v1.json",
+        "artifact:productization-v56/uwb-runtime-control-windows-source-v110/host-smoke-gates.json",
+        "artifact:productization-v56/uwb-runtime-control-windows-source-v110/artifacts/lifecycle-journal.jsonl",
+        "artifact:productization-v56/uwb-runtime-control-source-v110/host-smoke-gates.json",
+        "artifact:productization-v56/uwb-runtime-control-source-v110/artifacts/lifecycle-journal.jsonl",
+        "artifact:productization-v56/ui-contract-uwb-v110-source.json",
+        "artifact:productization-v56/ui-contract-uwb-v111-source.json",
+        "artifact:productization-v56/android-readiness-soak-v111-uwb-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v111-uwb-c3/cycles/1/uwb-action.json",
+        "artifact:productization-v56/android-readiness-soak-v111-uwb-c3/cycles/3/uwb-show.json",
+        "artifact:windows-android-real-guest-20260806-r30-uwb-fira-argv/windows-real-guest.json",
+        "artifact:windows-android-real-guest-20260806-r30-uwb-fira-argv/uwb-fira-start.txt",
+        "artifact:windows-android-real-guest-20260806-r30-uwb-fira-argv/uwb-fira-reports.txt",
+        "artifact:windows-android-real-guest-20260806-r30-uwb-fira-argv/uwb-fira-stop.txt",
+        "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080343.tar.xz.distribution-v2.plist",
+        "sha256:dbabe490c4b2d412fe0fbd02cda69f4d66460a894513603e82b08c34b5b79e1d",
+        "artifact:productization-v56/modem-runtime-control-windows-source-v112-r2/host-smoke-gates.json",
+        "artifact:productization-v56/modem-runtime-control-windows-source-v112-r2/artifacts/lifecycle-journal.jsonl",
+        "artifact:productization-v56/modem-runtime-control-source-v112/host-smoke-gates.json",
+        "artifact:productization-v56/modem-runtime-control-source-v112/artifacts/lifecycle-journal.jsonl",
+        "artifact:productization-v56/ui-contract-modem-v112-source.json",
+        "artifact:productization-v56/android-readiness-soak-v112-modem-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v112-modem-c3/cycles/1/modem-action.json",
+        "artifact:productization-v56/android-readiness-soak-v112-modem-c3/cycles/3/modem-show.json",
+        "artifact:modem-unsolicited-20260806/windows-xtask-v1/host-smoke-gates.json",
+        "artifact:modem-unsolicited-20260806/windows-xtask-v1/artifacts/lifecycle-journal.jsonl",
+        "artifact:modem-unsolicited-20260806/macos-xtask-v5/host-smoke-gates.json",
+        "artifact:modem-unsolicited-20260806/macos-xtask-v5/artifacts/lifecycle-journal.jsonl",
+        "artifact:windows-android-real-guest-20260806-r28-modem-capability/windows-real-guest.json",
+        "artifact:windows-android-real-guest-20260806-r28-modem-capability/android-bugreport-a08d87d2-79c1-43ed-9fca-3dac3a165262-7e907678b00d463fb2d90de6d5708688.zip",
+        "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080344.tar.xz.distribution-v2.plist",
+        "sha256:1e9564aa600f8fbce84efab9ebd34fe73ee94de40e707a2e39048ae5f5c52f1a",
+        "artifact:productization-v56/bluetooth-beacon-windows-source-v113/host-smoke-gates.json",
+        "artifact:productization-v56/bluetooth-beacon-windows-source-v113/artifacts/lifecycle-journal.jsonl",
+        "artifact:productization-v56/bluetooth-beacon-source-v113/host-smoke-gates.json",
+        "artifact:productization-v56/bluetooth-beacon-source-v113/artifacts/lifecycle-journal.jsonl",
+        "artifact:productization-v56/ui-contract-bluetooth-beacon-v113-source.json",
+        "artifact:productization-v56/android-readiness-soak-v113-beacon-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v113-beacon-c3/cycles/1/bluetooth-beacon-action.json",
+        "artifact:productization-v56/android-readiness-soak-v113-beacon-c3/cycles/3/bluetooth-beacon-show.json",
+        "artifact:productization-v56/android-readiness-soak-v113-beacon-c3/cycles/3/bluetooth-beacon-remove.json",
+        "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080345.tar.xz.distribution-v2.plist",
+        "sha256:7e4283076ea8a7e46231486823d8fa7d2c58240b169a098b8f029d1f51f3f816",
+        "artifact:productization-v56/bluetooth-scripted-beacon-windows-source-v114-r2/host-smoke-gates.json",
+        "artifact:productization-v56/bluetooth-scripted-beacon-windows-source-v114-r2/artifacts/lifecycle-journal.jsonl",
+        "artifact:productization-v56/bluetooth-scripted-beacon-source-v114-r2/host-smoke-gates.json",
+        "artifact:productization-v56/bluetooth-scripted-beacon-source-v114-r2/artifacts/lifecycle-journal.jsonl",
+        "artifact:productization-v56/ui-contract-bluetooth-scripted-beacon-v114-source.json",
+        "artifact:productization-v56/android-readiness-soak-v114-scripted-beacon-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v114-scripted-beacon-c3/cycles/1/bluetooth-scripted-beacon-action.json",
+        "artifact:productization-v56/android-readiness-soak-v114-scripted-beacon-c3/cycles/3/bluetooth-scripted-beacon-show.json",
+        "artifact:productization-v56/android-readiness-soak-v114-scripted-beacon-c3/cycles/3/bluetooth-scripted-beacon-remove.json",
+        "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080346.tar.xz.distribution-v2.plist",
+        "sha256:fdd728c271b2d0b825eb24a470e5748e7ecdb4ccc501ab03524bfa71a291eef2",
+        "gate:macos-bluetooth-hogp-real-guest",
+        "gate:macos-bluetooth-hci-capture-real-guest",
+        "artifact:productization-v56/macos-android-distribution-v120-r1/result.json",
+        "artifact:productization-v56/macos-android-distribution-v120-r1/bluetooth-hci-capture.tsv",
+        "artifact:productization-v56/macos-android-distribution-v120-r1/bluetooth-hci-diagnostic-manifest.json",
+        "artifact:windows-android-real-guest-20260806-r6-hci/windows-real-guest.json",
+        "sha256:738d254d72df0e0dae9b148a12be3bc5383df1b7664e38d9b699d4980ccf0839",
+        "artifact:windows-android-real-guest-20260806-r9-hogp/windows-real-guest.json",
+        "artifact:windows-android-real-guest-20260806-r9-hogp/bluetooth-hid-getevent.txt",
+        "sha256:6b7c41525abd2aafaf8b87bf2d2c7d4f80a64984849495f458f41383e68b35b7"
+      ]
+    },
+    {
+      "id": "AOSP-ANDROID-004",
+      "criterion": "AOSP 的路线导入、屏幕录制、多显示器、麦克风/相机注入、完整 RootCanal 控制和环境控制按 portable contract 分阶段实现；不支持项必须给出可行动的 blocked/unsupported 原因，不能显示为已生效。",
+      "evidence": [
+        "gate:hd-quality",
+        "gate:macos-android-screen-recording",
+        "gate:macos-android-bugreport-real-guest",
+        "artifact:productization-v56/installed-android-controls-v100-r2/screen-recording-stop.json",
+        "artifact:productization-v56/installed-android-controls-v100-r2/screen-recording-capability.tsv",
+        "artifact:productization-v56/installed-android-controls-v100-r2/screen-recording.mp4",
+        "artifact:productization-v56/installed-android-controls-v102-r3/screen-recording-stop.json",
+        "artifact:productization-v56/installed-android-controls-v102-r3/screen-recording-capability.tsv",
+        "artifact:productization-v56/installed-android-controls-v102-r3/screen-recording.mp4",
+        "artifact:productization-v56/installed-android-controls-v103/screen-recording-stop.json",
+        "artifact:productization-v56/installed-android-controls-v103/screen-recording-capability.tsv",
+        "artifact:productization-v56/installed-android-controls-v103/screen-recording.mp4",
+        "artifact:productization-v56/diagnostics-product-v120.json",
+        "artifact:productization-v56/macos-android-distribution-v123-r1/result.json",
+        "artifact:productization-v56/macos-android-distribution-v123-r1/android-bugreport-record.json",
+        "artifact:productization-v56/macos-android-distribution-v123-r3/result.json",
+        "artifact:productization-v56/macos-android-distribution-v123-r3/android-bugreport-record.json",
+        "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080409.tar.xz.distribution-v2.plist",
+        "sha256:abd1dc05063393e350bcf037d640c394fa4eacfaed23ed71b55509eece0fb37e",
+        "artifact:windows-screen-recording-real-guest-20260807/result.json",
+        "sha256:86490c017bdbaa67b19ff22427c5a738bab2bcc629aca073fe7001f6a6301fbf",
+        "artifact:windows-camera-real-guest-20260807/result.json",
+        "sha256:2c9799399bb26305179c91ded92ffe5547fcbf8bcc635492fb2f71a77f595b6f",
+        "artifact:windows-cold-multidisplay-real-guest-20260807-r9/windows-real-guest.json",
+        "sha256:0bc7a0ca0195d386135824e5e01beeb4c88fbb1a07d0dccf8d38cfa18e82c7c7",
+        "artifact:windows-cold-multidisplay-real-guest-20260807-r9/input-display-viewports.txt",
+        "sha256:953d92ad5d8abce0dcae3659e4356873a8213d894f233ab76a837cea9301b17c",
+        "artifact:aosp-android-feature-matrix.json"
+      ]
+    },
+    {
+      "id": "AOSP-ANDROID-005",
+      "criterion": "日常显示继续使用 gfxstream 硬件路径和平台原生外部资源，Windows 与 macOS 的非录制状态 readback/software blit/SwiftShader 计数为零；用户显式启动录屏时允许在该有界生命周期内由 gfxstream 回读帧，停止后必须注销回读并恢复纯零拷贝显示。",
+      "evidence": [
+        "gate:windows-zero-copy",
+        "gate:macos-zero-copy",
+        "gate:macos-android-screen-recording"
+      ]
+    },
+    {
+      "id": "AOSP-ANDROID-006",
+      "criterion": "最终 macOS Player 必须显式处理 AppKit workspace sleep/wake：睡眠前隐藏并释放 Android DisplaySession，唤醒后重新计算 viewport 并立即附加；普通 Occluded 只能降低轮询，不能释放零拷贝显示。Windows 与 macOS 默认 profile 的第二次启动都必须在制品、Host 和 WebView 初始化前激活现有原生窗口并退出，显式 --data-root 继续允许隔离并行。Finder 生命周期必须保持单 UI/Host，direct-development 与 signed artifact-store 候选都必须能执行真实 Android 循环启动和 Host RSS、FD、线程、data-root 上界门禁。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:macos-ui-native-lifecycle",
+        "gate:macos-android-readiness-soak",
+        "gate:macos-resource-admission",
+        "artifact:productization-v56/ui-contract-v104-source-r2/macos-ui-interaction.json",
+        "artifact:productization-v56/ui-native-lifecycle-v104/result.json",
+        "artifact:productization-v56/android-readiness-soak-v103-c5/result.json",
+        "artifact:productization-v56/android-readiness-soak-v104-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v104-c20/result.json",
+        "artifact:productization-v56/android-readiness-soak-v109-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v111-uwb-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v113-beacon-c3/result.json",
+        "artifact:productization-v56/microdroid-soak-v113-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v114-scripted-beacon-c3/result.json",
+        "artifact:productization-v56/microdroid-soak-v114-c3/result.json",
+        "artifact:productization-v56/ui-contract-v109-source",
+        "artifact:productization-v56/ui-contract-uwb-v111-source.json",
+        "artifact:productization-v56/resource-admission-v104-direct/result.json",
+        "event:ui.lifecycle.suspended",
+        "event:ui.lifecycle.resumed"
+      ]
+    },
+    {
+      "id": "AOSP-ANDROID-007",
+      "criterion": "同时包含 x86_64 与 arm64 的 AOSP 总制品根必须严格按 Host 架构选择完整 direct-linux 闭包；Windows 只能使用 vsoc_x86_64，Apple Silicon 只能使用 vsoc_arm64_only/vsoc_arm64，未知架构和不完整候选不得跨架构回退。",
+      "evidence": [
+        "gate:android-artifact-selection-smoke",
+        "artifact:D:/bscp/bscp-vm-artifacts-20260721-aosp-all-targets/products/android/vsoc_x86_64/direct-linux",
+        "build_fingerprint:AP4A.250205.002"
+      ]
+    }
+  ],
+  "required_gates": [
+    "process-check",
+    "hd-quality",
+    "web-ui-contract",
+    "windows-android-aosp-controls",
+    "macos-android-aosp-controls",
+    "windows-android-device-controls",
+    "macos-android-device-controls",
+    "powerwash-product-smoke",
+    "macos-android-screen-recording",
+    "macos-android-bugreport-real-guest",
+    "macos-ui-native-lifecycle",
+    "macos-android-readiness-soak",
+    "macos-resource-admission",
+    "android-artifact-selection-smoke",
+    "windows-zero-copy",
+    "macos-zero-copy"
+  ],
+  "evidence_state": {
+    "code_present": true,
+    "tests_authored": true,
+    "contract_smoke_verified": true,
+    "real_guest_verified": false
+  },
+  "direction_decisions": [
+    {
+      "id": "D-AOSP-ANDROID-DUAL-PLATFORM",
+      "decision": "从本任务开始，Windows 与 macOS 使用同一 portable contract，同步修改并分别在原生平台构建和验证。",
+      "owner": "human",
+      "rationale": "用户要求双端进度保持一致，避免单平台分叉。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-ZERO-COPY",
+      "decision": "不使用 SwiftShader；日常显示在 gfxstream 或平台原生外部资源不满足时阻止启动，不增加图形软件回退。用户显式录屏期间允许 gfxstream GPU 到 CPU 回读，但该回读不得改变 Player 的零拷贝显示链，停止录屏必须立即注销。",
+      "owner": "human",
+      "rationale": "用户明确要求新的 gfxstream 与日常零拷贝，并明确允许录屏使用非零拷贝实现。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-ORDER",
+      "decision": "先完成 Android AOSP 功能对齐，再完成 Microdroid AOSP 功能对齐，之后才进入持续的功能、性能和使用体验自动优化循环。",
+      "owner": "human",
+      "rationale": "保持当前工作顺序和验收边界明确。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-SENSOR-DURATION-V152",
+      "decision": "传感器 duration_ms=0 表示持续覆盖，200–3600000 ms 由单一可唤醒监督器按传感器独立到期并恢复 HAL 默认值；同一传感器的新覆盖原子取代旧截止时间。build152 同步交付 Host/component 与固定工具链构建的 Web UI。",
+      "owner": "ai",
+      "rationale": "审计确认 macOS hvc13 旧路径会永久保留有界注入值，而 Windows SensorService replay 会恢复，导致双端语义不一致。Windows GNU 与 macOS 原生 check/Clippy/portable duration 黑盒通过，macOS UI contract、61 项包校验和、严格签名和包内 feature/UI token 审计通过；真实 Guest 事件回读继续保留为候选分发门。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-SENSOR-POSE-V153",
+      "decision": "三轴姿态统一采用 AOSP Cuttlefish 的负角度与 Rz × Ry × Rx 模型，在同一原子动作内生成 accelerometer、magnetometer 和 gyroscope；转换时间限定为 200–10000 ms，角速度到期归零而最终加速度与磁场保持。",
+      "owner": "ai",
+      "rationale": "AOSP 源码审计确认网页姿态不是三个互不相关的原始传感器值，而是由前后旋转矩阵和经过时间导出一致运动帧。portable contract 避免 Windows ADB injector 与 macOS sensors component 再次产生坐标、时序或状态分叉。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-FIXED-R14-SENSOR-BOUNDARY-V156",
+      "decision": "固定 Windows/macOS Android 15 r14 profile 只发布三轴姿态，通过 Guest 内置 AOSP cuttlefish_sensor_injection motion 执行；独立传感器值、Light、proximity 和 duration 不发布，UI 隐藏且 Worker 显式拒绝。",
+      "owner": "ai",
+      "rationale": "Windows 真实 Guest 证明该产品镜像使用 AOSP Mock Sensors HAL 而非 hvc13 transport；X=90° 的加速度、磁场、陀螺仪帧均可回读且 SensorService 保持 NORMAL。旧 portable duration contract 仅保留给未来真正接入相应 HAL 的 profile，不作为固定 r14 的产品能力。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-WINDOWS-BUGREPORT-R23",
+      "decision": "Windows Android 真 Guest 门新增可独立执行的 RunBugreport，必须自行启动 Ready，并验证完整 AOSP dumpstate 的受管路径、instance/run、大小、SHA、主文本、当前用户+SYSTEM DACL、采集后同一 run/ADB Ready 和零残留。",
+      "owner": "ai",
+      "rationale": "R23 独立模式首先证明真实 dumpstate；R24 进一步在同一固定 x86_64 Android 15 AP4A.250205.002 run 内组合 27 个 AOSP 动作与 bugreport，生成 4,169,905 字节、168 项 ZIP，采集后仍 Ready、无跳过项且最终残留为 0，关闭了仅有合成 ZIP 而没有 Windows Guest dumpstate 的证据缺口；macOS 分发 runner 已使用同一产品边界。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-MODEM-UNSOLICITED-R27",
+      "decision": "运行时 modem 状态不能只更新 Host/component watch；Windows 命名管道和 macOS Unix stream 均须按照 AOSP r14 向 Guest RIL 主动发布注册与信号 unsolicited result，运营商变更用一次有界 deregister/register 触发 COPS 重查。",
+      "owner": "ai",
+      "rationale": "R25 证明旧实现请求成功但 Android 长期保持启动时的 00101/HD Mobile/signal 20；R27 修复后 Guest telephony 精确回读 310260、HD-Mobile-QA、IN_SERVICE 和 signal 17 对应 -79 dBm，28 个动作无跳过、最终残留为 0。adapter probe 新增 runtime-modem-unsolicited-v2，防止旧二进制被新 Host 接受。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-MODEM-UNSOLICITED-COMPONENT-V2",
+      "decision": "双平台正式 modem component 门必须在 Guest 发送任何 AT 查询前，直接观察按序的注销、LTE 重新注册与 13 字段信号 unsolicited result；随后 CSQ、COPS 与 CREG 查询必须回读同一注册状态。",
+      "owner": "ai",
+      "rationale": "只轮询到最终值无法防止退化回旧的 Host-only watch 更新。Windows 命名管道与 macOS CID 隔离 Unix stream 现共用精确顺序断言，完整 xtask smoke 各 13 项均通过并完成受管进程/端点清理。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-MODEM-CAPABILITY-R28",
+      "decision": "真实 Windows Android 门必须使用重新构建并暂存的 Host 与 modem adapter；adapter probe 发布且 Host 要求 runtime-modem-unsolicited-v2，避免新源码配旧运行闭包产生假通过。",
+      "owner": "ai",
+      "rationale": "R28 在全新 data root 上完成 29 个动作和 16 个独立回读，Guest telephony 观察 310260、HD-Mobile-QA、IN_SERVICE、-79 dBm；4,222,714 字节、168 项 bugreport 后仍 Ready，零跳过且最终残留为 0。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-UWB-FIRA-R30",
+      "decision": "UWB 真实 Guest 门必须建立 AOSP r14 framework FiRa session，回读受控距离和成功状态后再停止并关闭；仅有 Host typed state、HAL 存活或非零 UCI 不得宣称 Guest 已观察测距。Windows 与 macOS 使用同一 session 77、3.21 m、status 0 断言。",
+      "owner": "ai",
+      "rationale": "Windows R30 在全新 data root 上完成 29 个动作和 16 个独立回读，framework 报告 DistanceMeasurement 3.21 m/status 0，停止与关闭成功，零跳过且最终残留为 0。macOS 分发 runner 已同步同一真实会话门，待下一候选包执行。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-LOCATION-FRAMEWORK-R36",
+      "decision": "固定定位真实 Guest 门必须由遵守 Android 15 前台定位规则的 test-only LocationManager 应用订阅真实 GPS_PROVIDER，逐字段回读纬度、经度、高度、精度和字段存在标志；不得使用 mock provider，也不得用动作成功、dumpsys 字节数或串口交付计数代替 framework 回调。Windows 与 macOS 使用同一架构无关探针并在门内卸载。",
+      "owner": "ai",
+      "rationale": "R32/R33 证明旧门会在 Guest 仍返回默认坐标时假通过；R34 定位到锁屏使测试请求 inactive。R36 保持探针前台后在第 4 次有界轮询精确收到 31.2304000、121.4737000、4.000 m、3.000 m，Guest 交付序列为 5、APK 已卸载，30 个动作、16 个回读、零跳过、零残留并同时通过 FiRa。macOS runner 已同步同一断言，待下一候选包执行。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-LOCATION-ROUTE-FRAMEWORK-R37",
+      "decision": "KML/GPX 路线真实 Guest 门不能只断言 Worker 状态或 Guest 串口交付计数；Windows 与 macOS 必须复用同一个架构无关、test-only 的前台 LocationManager 探针，从真实 GPS_PROVIDER 精确回读路线点的纬度、经度、高度、精度与字段存在标志，并在门后卸载。",
+      "owner": "ai",
+      "rationale": "Windows R37 在固定 Android 15 Guest 中完成三点 KML 的开始、暂停稳定、继续、循环和停止，从 GPS_PROVIDER 精确回读 37.4223000、-122.0837000、7.000 m、5.000 m，交付序列从 4 增至 23、应用 11 个点，未使用 mock provider且探针卸载；全轮 34 个动作、17 个回读、零跳过、零残留并同时回归 FiRa。macOS runner 已同步同一字段门，待下一候选包执行。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-TITLEBAR-PARITY-V3",
+      "decision": "Windows 标题栏使用与侧栏、内容页隔离的独立顶部 WebView，macOS 继续使用 AppKit 原生 accessory；两端通过同一 11 动作命令表和同一 TitlebarPlayerState 驱动动作顺序、侧栏开合反馈、播放器页可见性、readiness、录屏、FPS 与多显示器状态。Windows 顶栏输入不得触发全局 busy 广播、无变化原生布局提交或 Android 输入 HWND 焦点往返。标题栏安装 APK 在两端都必须重新打开平台文件选择器并在选择后立即安装。",
+      "owner": "human",
+      "rationale": "用户最后明确要求 Windows 标题栏恢复 WebView，同时解决标题栏点击引发的闪烁。独立顶栏 surface 不覆盖 Android 区域，controls_visible 由 Rust 页面状态统一计算，sidebar_visible 统一驱动展开/折叠反馈；稳定状态去重、mousedown 阻止抢焦点和布局签名门禁避免点击穿过 WebView/Win32/gfxstream 重排。macOS 保持已验证的 AppKit 原生标题栏，但功能与顺序继续一致。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-DESKTOP-SINGLE-INSTANCE-V2",
+      "decision": "Windows 与 macOS 的默认桌面 profile 都必须在制品发现、Host 连接和 WebView 创建前激活已有原生窗口并退出第二进程；显式 --data-root 的隔离 profile 继续允许并行。Windows 用会话级主互斥体与 PID owner marker 绑定真正的默认窗口，不能按相同标题误选隔离窗口。",
+      "owner": "ai",
+      "rationale": "macOS 已有 bundle identity 单实例优化，而 Windows 缺失会再次产生两个 HD 窗口。仅按窗口标题查找在并行 QA profile 下不安全；PID marker 让第二进程只激活持有默认 profile 的 Win32 根窗口。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-POWERWASH-V154",
+      "decision": "Android powerwash 只接受 Defined/Stopped、当前 revision 和精确实例名确认；userdata 通过同卷原子 rename 保留一个完整摘要备份，恢复时当前 overlay 变成新的 rollback backup，永久丢弃另行确认。每次文件变更前持久化 storage transaction，崩溃后只按无歧义文件组合提交或回滚。",
+      "owner": "ai",
+      "rationale": "直接删除 userdata 不满足发布级误操作恢复和崩溃一致性。单备份可逆交换避免复制大型稀疏镜像与无界磁盘增长，blocking 线程池避免完整 SHA-256 阻塞 Host 控制面；Windows/macOS 使用同一 portable contract。build154 已通过双端全目标 check/Clippy、逐字节一致的事务黑盒、macOS UI 契约、固定工具链 Web、61 项包校验和、严格签名、无 SwiftShader 与 release UUID 一致性审计。"
+    },
+    {
+      "id": "D-AOSP-ANDROID-TOUCHPAD-UPSTREAM-GAP-V154",
+      "decision": "不以屏幕 touchscreen 或 macOS 单端 socket 冒充独立 touchpad；在 Windows crosvm run-mp 支持调用方外部 Trackpad/MultiTouchTrackpad 数据面并完成 Guest InputReader 回读前保持 blocked。",
+      "owner": "ai",
+      "rationale": "AOSP/crosvm 源码审计确认 macOS 支持独立 trackpad 输入端点，而 Windows broker 当前只处理 MultiTouch/Mouse 并把事件绑定 GPU 原生窗口，忽略 Trackpad 类型及其 path。"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "B-AOSP-ANDROID-RELEASE-CREDENTIALS",
+      "description": "Developer ID、公证、生产 Ed25519 信任材料和 metadata-encrypted Android release bundle 尚未提供；不阻止开发/QA 功能对齐，但阻止正式发布签发。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "B-AOSP-ANDROID-HARDWARE-KEYMINT",
+      "description": "当前 macOS Guest 缺少持久硬件 KeyMint 与 rollback resistance；不阻止普通设备功能验证，但阻止生产级密钥保护声明。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "B-AOSP-ANDROID-WINDOWS-RUNTIME-INPUTS",
+      "description": "已由用户提供的 AOSP all-targets 制品与 Windows GNU 运行包解除。隔离 R4 真实 Android 15 Guest 已到 Ready，完成四方向旋转、导航/音量/Power、位置动作、电池、网络、Bluetooth、NFC 和 1 次停启生命周期；Microdroid runtime 修复后的 R5 又在同一制品上复验全部控制。R6 进一步用 Android framework disable/enable 产生真实 H4 并通过 6 秒有界 btsnoop 门；R9 从 Android 设置完成 HOGP 发现、配对、加密订阅和 KEY_A DOWN/UP Guest 输入回读，并再次通过 HCI 门。固定 r14 的三轴姿态由 Guest 内置 AOSP motion injector 提供，不再把外置 sensor-injector 视为该 profile 的缺失项。各门残留进程均为 0。",
+      "scope": "external",
+      "state": "resolved"
+    }
+  ],
+  "human_decisions_needed": [],
+  "next_iteration": "build148 已包含 AOSP Microdroid extra APK/idsig 的实例级 portable config、受管上传、vm/virtmgr caller-opened descriptor override、主 Payload `assets/vm_config.json` 的 64 KiB 有界 inspection、UI 声明/已选数量、能力未选满阻断，以及 Worker 启动前的 `microdroid_extra_apk_count_mismatch` 复验。Windows GNU 全目标 check/Clippy/release/ai-cycle 和 stored/deflated/损坏/超限/空路径黑盒通过；Mac 原生 check/Clippy/release、UI 契约、61 项应用校验和、签名和包内语义审计通过，20 个本轮文件 SHA-256 双端一致。build149 进一步把单次 run 的 `microdroid-extra-0.idsig` 至 `microdroid-extra-7.idsig` 纳入已完成 run 的精确可再生文件清理，Windows/macOS runtime-storage 黑盒均证明活动 run 受保护、0–7 已删除、越界名称保留。专用 `macos-microdroid-extra-apk-smoke.sh` 已编写并通过 Mac `sh -n`、jq 表达式、必需语义 token 与进程作用域合成/当前状态审查；最终包与私有 data root、少/多/重复/摘要/签名负向、两次真实 Guest 的受管 descriptor manifest、顺序 asset SHA、dm-verity root、停止状态、删除 FD/进程/idsig 均有强断言。build149 development QA 应用已用固定 runtime/products/toolchain 打包，61 项相对校验和、严格 codesign、build=149、清理事件和二进制 idsig 前后缀均通过。`microdroid-extra-apk-materials.sh` 已固定使用调用方 JDK/build-tools，并在 Mac 生成 `microdroid-extra-materials-v149-r2`：主 Payload SHA-256 `89b2c5a616e1d136fafd100230aea5fc5cf43409edc7a97c4bc513806081dc21`，两个 extra APK 为 `859fbed929cf5cf08d7af4b5db0b54904832fbfaa9bbbbd4b35478abcfe250a4` 与 `d0c8b4db019005bd2318fcd728a3dc748398056cef8a0f591c41b64caef5bb84`；三个 APK 的 v3 签名、zipalign、共同证书、两个不同资源摘要、未签名负例拒绝、0600、零私钥/符号链接均复核通过。build150 Host slice 把 AOSP `vm --console-in` 的普通 EOF 文件替换为按 run owner-only FIFO，只提供 Full-debug、显式确认、一次性的 32 字节随机 nonce 固定挑战，5 秒内精确验证同 challenge/nonce 响应；Android/None-debug/nil/第二次/任意文本均不开放，通用 Web UI 隐藏。Mac `microdroid-console-challenge-macos-v150.json` 合成消费者黑盒已证明 126 字节请求、0600、响应、超时、替换拒绝、audit 无原 nonce 和 FIFO 清理，UI contract v150-r2 通过；只有专用受信 Payload 的真实 Guest 消费证据仍待 HVF。build151 Host hardening 进一步完整解析 AOSP Payload 的 `apexes`、`prefer_staged` 与 `hugepages` 字段：非空 extra APEX、Host-staged APEX 和 macOS 无效 hugepage 请求均在上传和 Worker 启动复验阶段拒绝，不受宿主环境影响；Windows GNU 与 macOS 原生 check/Clippy/新增 stored/deflated/APEX/platform 黑盒均通过。build152 统一传感器持续/定时恢复语义；build153 进一步交付与 AOSP Cuttlefish 一致的三轴姿态原子运动帧，Windows GNU 与 macOS 原生 check/Clippy、精确向量黑盒、UI contract、固定工具链 Web、61 项包校验和、严格签名、包内 capability/UI token 和 release UUID 均通过。日常显示仍为零拷贝；用户明确启动录屏时允许最高 30fps 的有界非零拷贝读回，停止或失败立即注销且不改变 Player 显示链。Windows R37 已在用户提供的 AOSP x86_64 产品闭包完成三轴姿态、字段级固定定位与 KML 路线 framework 回读；Windows 标题栏已改为 winit 壳内 Win32 原生控件并与 macOS AppKit 共享 11 动作合同，React/WebView 不再实现标题栏。Windows R43 又在同一真实 Guest run 完成按实例屏幕录制与 Guest 虚拟相机拍照，停止/拍照后 run ID 不变、实例与 ADB 均 Ready。Windows R9 已关闭 Win32 crosvm 初始单显示限制并完成主屏+副屏冷启动、稳定 UUID→scanout→Android display/input viewport、四向旋转、导航/电源和完整设备控制矩阵，后端窗口与退出残留均为 0。下一步执行 Windows 原生标题栏实际点击切屏与逐屏真实鼠标事件黑盒、双端按键/点击对等矩阵，并在不影响受保护实例的 HVF 资源窗口复验 Mac 录屏/相机以及补齐 FiRa、路线和 Microdroid finite/extra APK 真 Guest 门。Mac 三个既有 crosvm 受保护进程未受影响；Windows Microdroid 真实 Guest 继续使用已提供产品闭包执行独立门禁。"
+}

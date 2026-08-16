@@ -5,7 +5,7 @@
   "status": "complete",
   "scope": {
     "repositories": ["hd", "external/crosvm", "hardware/google/gfxstream"],
-    "owned_paths": ["hd/", "external/crosvm/", "hardware/google/gfxstream/host/vulkan/"],
+    "owned_paths": ["hd/", "external/crosvm/", "hardware/google/gfxstream/host/"],
     "excluded_paths": ["out/", "target/", "third_party/minijail/"]
   },
   "constraints": [
@@ -34,6 +34,11 @@
       "id": "INT-004",
       "criterion": "crosvm 与 gfxstream 当前 diff 不含 whitespace error。",
       "evidence": ["gate:crosvm-diff-check", "gate:gfxstream-diff-check"]
+    },
+    {
+      "id": "INT-005",
+      "criterion": "Windows gfxstream 录屏使用实际硬件 H.264 MFT 生成并复验完整 MP4，且清理临时产物。",
+      "evidence": ["gate:windows-host-recorder-smoke"]
     }
   ],
   "required_gates": [
@@ -41,6 +46,7 @@
     "crosvm-windows-gnu-check",
     "crosvm-test-targets-compile",
     "gfxstream-mingw-build",
+    "windows-host-recorder-smoke",
     "crosvm-diff-check",
     "gfxstream-diff-check"
   ],

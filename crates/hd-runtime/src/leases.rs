@@ -4,7 +4,10 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use hd_core::{AdbModeV2, InstanceSpecV2, LeaseKindV2, LeaseOwnerV2, LeaseV2, WorkerIdentityV2};
+use hd_core::{
+    AdbModeV2, GuestKindV2, InstanceSpecV2, LeaseKindV2, LeaseOwnerV2, LeaseV2,
+    MicrodroidCpuTopologyV2, WorkerIdentityV2,
+};
 use hd_platform::DataPaths;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -29,6 +32,22 @@ pub(crate) const fn host_cpu_reserve(logical_cpus: usize) -> usize {
 
 pub(crate) const fn guest_cpu_capacity(logical_cpus: usize) -> usize {
     logical_cpus.saturating_sub(host_cpu_reserve(logical_cpus))
+}
+
+pub(crate) fn uses_match_host_cpu_topology(spec: &InstanceSpecV2) -> bool {
+    spec.guest_kind == GuestKindV2::Microdroid
+        && spec
+            .microdroid
+            .as_ref()
+            .is_some_and(|config| config.cpu_topology == MicrodroidCpuTopologyV2::MatchHost)
+}
+
+pub(crate) fn requested_cpu_count(spec: &InstanceSpecV2, logical_cpus: usize) -> usize {
+    if uses_match_host_cpu_topology(spec) {
+        logical_cpus
+    } else {
+        usize::from(spec.cpu_count)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -78,14 +97,9 @@ impl LeaseManager {
         let _allocation = self.allocation.lock();
         let existing = self.store.list_leases()?;
         let occupied_cids = resources(&existing, LeaseKindV2::GuestCid);
-        let occupied_gpu = resources(&existing, LeaseKindV2::GpuSlot);
         let occupied_adb = resources(&existing, LeaseKindV2::AdbPort);
         let capacity = validate_host_capacity(&existing, spec)?;
         let guest_cid = choose_guest_cid(spec.id, &occupied_cids)?;
-        let gpu_slot = (0..self.gpu_slots)
-            .map(|slot| slot.to_string())
-            .find(|slot| !occupied_gpu.contains(slot))
-            .ok_or(LeaseError::GpuCapacity(self.gpu_slots))?;
         let now = OffsetDateTime::now_utc();
         let owner = LeaseOwnerV2 {
             instance_id: spec.id,
@@ -109,14 +123,6 @@ impl LeaseManager {
                 now,
             ),
             lease(LeaseKindV2::GuestCid, guest_cid.to_string(), &owner, 1, now),
-            lease(LeaseKindV2::GpuSlot, gpu_slot, &owner, 1, now),
-            lease(
-                LeaseKindV2::DiskOverlay,
-                self.paths.disk_overlay(spec.id).display().to_string(),
-                &owner,
-                1,
-                now,
-            ),
             lease(
                 LeaseKindV2::WorkerEndpoint,
                 worker_endpoint(spec.id)?,
@@ -132,6 +138,21 @@ impl LeaseManager {
                 now,
             ),
         ];
+        if spec.guest_kind == GuestKindV2::Android {
+            let occupied_gpu = resources(&existing, LeaseKindV2::GpuSlot);
+            let gpu_slot = (0..self.gpu_slots)
+                .map(|slot| slot.to_string())
+                .find(|slot| !occupied_gpu.contains(slot))
+                .ok_or(LeaseError::GpuCapacity(self.gpu_slots))?;
+            leases.push(lease(LeaseKindV2::GpuSlot, gpu_slot, &owner, 1, now));
+            leases.push(lease(
+                LeaseKindV2::DiskOverlay,
+                self.paths.disk_overlay(spec.id).display().to_string(),
+                &owner,
+                1,
+                now,
+            ));
+        }
         if matches!(spec.adb.mode, AdbModeV2::Loopback) {
             let port = match spec.adb.host_port {
                 Some(port) => {
@@ -384,9 +405,29 @@ fn validate_host_capacity(
 ) -> Result<CapacityReservation, LeaseError> {
     let host = hd_platform::host_resources()?;
     let reserved_cpu = leased_quantity(existing, LeaseKindV2::CpuCapacity)?;
-    let requested_cpu = u64::from(spec.cpu_count);
-    let cpu_capacity = u64::try_from(guest_cpu_capacity(host.logical_cpus))
-        .map_err(|_| LeaseError::Corrupt("guest CPU capacity overflows u64".to_owned()))?;
+    let match_host = uses_match_host_cpu_topology(spec);
+    if match_host && host.logical_cpus == 0 {
+        return Err(LeaseError::CpuCapacity {
+            requested: 1,
+            available: 0,
+        });
+    }
+    let requested_cpu = u64::try_from(requested_cpu_count(spec, host.logical_cpus))
+        .map_err(|_| LeaseError::Corrupt("requested CPU capacity overflows u64".to_owned()))?;
+    let cpu_capacity = u64::try_from(if match_host {
+        host.logical_cpus
+    } else {
+        guest_cpu_capacity(host.logical_cpus)
+    })
+    .map_err(|_| LeaseError::Corrupt("guest CPU capacity overflows u64".to_owned()))?;
+    // AOSP MATCH_HOST exposes every host logical CPU to the VM. Admit it only as an exclusive
+    // workload; its full-host lease then prevents any normal instance from starting alongside it.
+    if match_host && reserved_cpu != 0 {
+        return Err(LeaseError::CpuCapacity {
+            requested: requested_cpu,
+            available: 0,
+        });
+    }
     if reserved_cpu.saturating_add(requested_cpu) > cpu_capacity {
         return Err(LeaseError::CpuCapacity {
             requested: requested_cpu,
@@ -413,7 +454,7 @@ fn scoped_quantity(instance_id: Uuid, quantity: u64) -> String {
     format!("{instance_id}:{quantity}")
 }
 
-fn leased_quantity(leases: &[LeaseV2], kind: LeaseKindV2) -> Result<u64, LeaseError> {
+pub(crate) fn leased_quantity(leases: &[LeaseV2], kind: LeaseKindV2) -> Result<u64, LeaseError> {
     leases
         .iter()
         .filter(|lease| lease.kind == kind)

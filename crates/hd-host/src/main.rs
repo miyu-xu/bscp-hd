@@ -4,8 +4,12 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use hd_platform::DataPaths;
-use hd_runtime::{HostService, run_host_http};
+use hd_runtime::{
+    HostService, clear_host_startup_failure, install_bundled_release_materials,
+    record_host_startup_failure, run_host_http,
+};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(about = "HD authenticated per-user host control plane")]
@@ -16,6 +20,8 @@ struct Arguments {
     worker_executable: Option<PathBuf>,
     #[arg(long)]
     port: Option<u16>,
+    #[arg(long)]
+    startup_attempt_id: Option<Uuid>,
 }
 
 #[tokio::main]
@@ -36,10 +42,56 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+    if let Some(startup_attempt_id) = arguments.startup_attempt_id
+        && let Err(error) = clear_host_startup_failure(&paths, startup_attempt_id)
+    {
+        let error = anyhow::Error::msg(error).context("clear stale Host startup failure");
+        report_startup_failure(
+            &paths,
+            arguments.startup_attempt_id,
+            "startup_state_invalid",
+            &error,
+        );
+        return Err(error);
+    }
+    let installed_release_materials = match install_bundled_release_materials(&paths)
+        .map_err(anyhow::Error::msg)
+        .context("install bundled release trust materials")
+    {
+        Ok(installed) => installed,
+        Err(error) => {
+            report_startup_failure(
+                &paths,
+                arguments.startup_attempt_id,
+                "release_materials_invalid",
+                &error,
+            );
+            return Err(error);
+        }
+    };
+    if !installed_release_materials.is_empty() {
+        tracing::info!(
+            event = "release.materials.installed",
+            count = installed_release_materials.len(),
+            "installed signed release trust materials on first launch"
+        );
+    }
 
-    let host = HostService::open(paths, arguments.worker_executable)
+    let host = match HostService::open(paths.clone(), arguments.worker_executable)
         .await
-        .context("open HD host service")?;
+        .context("open HD host service")
+    {
+        Ok(host) => host,
+        Err(error) => {
+            report_startup_failure(
+                &paths,
+                arguments.startup_attempt_id,
+                "host_service_initialization_failed",
+                &error,
+            );
+            return Err(error);
+        }
+    };
     tracing::info!(
         event = "host.started",
         pid = std::process::id(),
@@ -58,4 +110,29 @@ async fn main() -> Result<()> {
     }
     tracing::info!(event = "host.stopped", "HD host control plane stopped");
     Ok(())
+}
+
+fn report_startup_failure(
+    paths: &DataPaths,
+    startup_attempt_id: Option<Uuid>,
+    code: &'static str,
+    error: &anyhow::Error,
+) {
+    tracing::error!(
+        event = "host.startup.failed",
+        error_code = code,
+        error = %error,
+        "HD Host startup failed"
+    );
+    let Some(startup_attempt_id) = startup_attempt_id else {
+        return;
+    };
+    if let Err(record_error) = record_host_startup_failure(paths, startup_attempt_id, code, error) {
+        tracing::error!(
+            event = "host.startup.failure_record.failed",
+            error_code = code,
+            error = %record_error,
+            "persist HD Host startup failure failed"
+        );
+    }
 }

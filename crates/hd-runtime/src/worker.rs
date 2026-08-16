@@ -3,20 +3,26 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt as _;
 use hd_core::{
-    AdbModeV2, ApiErrorV2, COMPONENT_PROTOCOL_VERSION, DEVICE_GUEST_ENDPOINT_ROLES_V2,
-    DeviceControlCommandV2, DeviceControlRequestV2, DeviceControlTokenV2, DeviceSerialEndpointV2,
-    DisplayConfigV2, DisplayViewportV2, FRAME_PROTOCOL_VERSION, FormalComponentConfigurationV2,
-    FormalComponentLaunchV2, FormalComponentReadyV2, FrameMetricsV2, FrameReadyMarkerV2,
-    InstanceActionV2, InstanceSpecV2, KeyActionV2, LaunchPlanV2, LeaseKindV2, LeaseV2,
+    AdbModeV2, AndroidBugreportRecordV2, ApiErrorV2, BluetoothHciCaptureRecordV2,
+    BluetoothPeerActionV2, BluetoothPeerKindV2, BluetoothPeerStateV2, COMPONENT_PROTOCOL_VERSION,
+    DEVICE_GUEST_ENDPOINT_ROLES_V2, DeviceControlCommandV2, DeviceControlRequestV2,
+    DeviceControlTokenV2, DeviceSerialEndpointV2, DisplayConfigV2, DisplayIdV2, DisplayViewportV2,
+    FRAME_PROTOCOL_VERSION, FormalComponentConfigurationV2, FormalComponentLaunchV2,
+    FormalComponentReadyV2, FrameMetricsV2, FrameReadyMarkerV2, GuestKindV2, InstanceActionV2,
+    InstanceSpecV2, KeyActionV2, LaunchPlanV2, LeaseKindV2, LeaseV2, LocationRouteFinishReasonV2,
+    LocationRoutePlaybackStateV2, LocationRouteRecordV2, LocationRouteStatusV2, LocationRouteV2,
+    MAX_SECONDARY_DISPLAYS, MicrodroidCpuTopologyV2, MicrodroidDebugLevelV2, MicrodroidPayloadV2,
     NativeDisplayTargetV2, ObservedStateV2, PreparedNativeDisplayV2, RunManifestV2, RunResultV2,
-    ScreenshotRecordV2, StopModeV2, WORKER_PROTOCOL_VERSION, WorkerCommandV2, WorkerDescriptorV2,
-    WorkerIdentityV2, WorkerPayloadV2, WorkerRequestV2, WorkerResponseV2, WorkerStatusV2,
-    device_component_guest_roles_v2,
+    RuntimeDisplayV2, ScreenRecordingRecordV2, ScreenRecordingStatusV2, ScreenshotRecordV2,
+    SecondaryDisplayConfigV2, StopModeV2, WORKER_PROTOCOL_VERSION, WorkerCommandV2,
+    WorkerDescriptorV2, WorkerIdentityV2, WorkerPayloadV2, WorkerRequestV2, WorkerResponseV2,
+    WorkerStatusV2, device_component_guest_roles_v2,
 };
 use hd_platform::{
     DataPaths, DiskProvisioner as _, ProcessSpec, ProcessSupervisor as _, VmBackend as _,
@@ -28,15 +34,29 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
+#[cfg(not(any(windows, target_os = "macos")))]
+use crate::AdbScreenRecording;
+#[cfg(any(windows, target_os = "macos"))]
+use crate::host_recorder::{HostRecording, endpoint_for_run as host_recorder_endpoint_for_run};
 use crate::{
     AdbClient, AdbError, AndroidDeviceRuntimeHealth, AndroidNetworkHealth, CapabilityDiscovery,
-    CrosvmBackend, DISK_LOW_WATERMARK_BYTES, ManagedProcess, NativeDiskProvisioner, RunJournalV2,
-    TokioProcessSupervisor, available_runtime_disk_bytes, enforce_run_retention,
-    expected_frame_transport, send_device_control_request, spawn_run_log_maintenance,
+    CrosvmBackend, ManagedProcess, NativeDiskProvisioner, RunJournalV2, TokioProcessSupervisor,
+    available_runtime_disk_bytes, enforce_run_retention, expected_frame_transport,
+    microdroid_exit::{MicrodroidLauncherCompletion, inspect_microdroid_launcher_completion},
+    remove_finished_run_ephemeral_artifacts, resolve_microdroid_runtime_paths,
+    runtime_disk_requirement, send_device_control_request, spawn_run_log_maintenance,
+    write_json_atomic,
+};
+#[cfg(unix)]
+use crate::{
+    MICRODROID_CONSOLE_CHALLENGE_TIMEOUT, MicrodroidConsoleChallengeChannel,
+    MicrodroidConsoleChallengeError,
 };
 
 const FRAME_READY_TIMEOUT: Duration = Duration::from_secs(90);
 const COMPONENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BLUETOOTH_HCI_CAPTURE_BYTES: u64 = 4 * 1024 * 1024;
+const MICRODROID_IDSIG_TIMEOUT: Duration = Duration::from_mins(10);
 const ADBD_LOG_READY_TIMEOUT: Duration = Duration::from_mins(3);
 const DEV_BOOT_LOG_READY_TIMEOUT: Duration = Duration::from_secs(150);
 const DEV_BOOT_LOG_SCAN_LIMIT: u64 = 32 * 1024 * 1024;
@@ -46,10 +66,36 @@ const DEV_BOOT_LOG_SCAN_LIMIT: u64 = 32 * 1024 * 1024;
 const INITIAL_DISPLAY_ATTACH_RETRY_WINDOW: Duration = Duration::from_mins(3);
 const INITIAL_DISPLAY_ATTACH_RETRY_MIN: Duration = Duration::from_millis(100);
 const INITIAL_DISPLAY_ATTACH_RETRY_MAX: Duration = Duration::from_millis(500);
+const DEFERRED_INTERACTIVE_POLICY_TIMEOUT: Duration = Duration::from_mins(5);
+const DEFERRED_INTERACTIVE_POLICY_RETRY_DELAY: Duration = Duration::from_secs(2);
 const CROSVM_DISPLAY_PARENT_HWND_ENV: &str = "CROSVM_DISPLAY_PARENT_HWND";
 const CROSVM_DISPLAY_WIDTH_ENV: &str = "CROSVM_DISPLAY_WIDTH";
 const CROSVM_DISPLAY_HEIGHT_ENV: &str = "CROSVM_DISPLAY_HEIGHT";
 const CROSVM_COCOA_CONTEXT_ENDPOINT_ENV: &str = "CROSVM_COCOA_CONTEXT_ENDPOINT";
+#[cfg(any(windows, target_os = "macos"))]
+const HD_HOST_RECORDER_ENDPOINT_ENV: &str = "HD_HOST_RECORDER_ENDPOINT";
+
+#[derive(Debug, Clone)]
+struct DeferredAdbReadinessPolicy {
+    display: DisplayConfigV2,
+    bluetooth_enabled: bool,
+    nfc_enabled: bool,
+    modem_enabled: bool,
+    network_enabled: bool,
+}
+
+impl DeferredAdbReadinessPolicy {
+    async fn apply(&self, adb: &AdbClient, instance_id: Uuid, run_id: Uuid, serial: &str) {
+        adb.apply_runtime_device_policy(
+            serial,
+            self.bluetooth_enabled,
+            self.nfc_enabled,
+            self.modem_enabled,
+        )
+        .await;
+        refresh_network_validation(adb, self.network_enabled, instance_id, run_id, serial).await;
+    }
+}
 
 fn log_network_validation(
     instance_id: Uuid,
@@ -189,155 +235,8 @@ async fn guest_network_diagnostic(
 const BOOTCONFIG_MAGIC: &[u8] = b"#BOOTCONFIG\n";
 
 #[cfg(target_os = "macos")]
-fn append_newc_entry(
-    archive: &mut Vec<u8>,
-    name: &str,
-    data: &[u8],
-    mode: u32,
-    inode: u32,
-) -> std::io::Result<()> {
-    let name_size = u32::try_from(name.len() + 1).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Android initramfs member name is too long: {error}"),
-        )
-    })?;
-    let file_size = u32::try_from(data.len()).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Android initramfs member is too large: {error}"),
-        )
-    })?;
-    let fields = [inode, mode, 0, 0, 1, 0, file_size, 0, 0, 0, 0, name_size, 0];
-    archive.extend_from_slice(b"070701");
-    for value in fields {
-        archive.extend_from_slice(format!("{value:08x}").as_bytes());
-    }
-    archive.extend_from_slice(name.as_bytes());
-    archive.push(0);
-    archive.resize(archive.len().next_multiple_of(4), 0);
-    archive.extend_from_slice(data);
-    archive.resize(archive.len().next_multiple_of(4), 0);
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn normalize_android_fstab_for_nonsecure_keymint(source: &Path) -> std::io::Result<Vec<u8>> {
-    let text = std::fs::read_to_string(source)?;
-    let mut output = String::new();
-    let mut saw_data = false;
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            output.push_str(raw_line);
-            output.push('\n');
-            continue;
-        }
-        let mut columns = line
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if columns.len() != 5 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unsupported Android fstab line: {raw_line}"),
-            ));
-        }
-        if columns[1] == "/data" {
-            saw_data = true;
-            let mut flags = columns[4]
-                .split(',')
-                .filter(|flag| {
-                    !flag.starts_with("keydirectory=")
-                        && !flag.starts_with("fileencryption=")
-                        && *flag != "latemount"
-                })
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            if !flags.iter().any(|flag| flag == "first_stage_mount") {
-                flags.push("first_stage_mount".to_owned());
-            }
-            columns[4] = flags.join(",");
-        }
-        output.push_str(&columns.join("\t"));
-        output.push('\n');
-    }
-    if !saw_data {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Android fstab has no /data entry",
-        ));
-    }
-    Ok(output.into_bytes())
-}
-
-#[cfg(target_os = "macos")]
-fn write_android_fstab_for_nonsecure_keymint(
-    source: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
-    std::fs::write(
-        destination,
-        normalize_android_fstab_for_nonsecure_keymint(source)?,
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn make_android_fstab_override_cpio(source: &Path) -> std::io::Result<Vec<u8>> {
-    let normalized = normalize_android_fstab_for_nonsecure_keymint(source)?;
-    let normalized = std::str::from_utf8(&normalized).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("normalized Android fstab is not UTF-8: {error}"),
-        )
-    })?;
-    let mut fstab = String::new();
-    for raw_line in normalized.lines() {
-        if raw_line.split_whitespace().nth(1) != Some("/data") {
-            fstab.push_str(raw_line);
-            fstab.push('\n');
-        }
-    }
-    let mut archive = Vec::new();
-    let mut inode = 1_u32;
-    for name in [
-        ".",
-        "first_stage_ramdisk",
-        "first_stage_ramdisk/system",
-        "first_stage_ramdisk/system/etc",
-        "system",
-        "system/etc",
-    ] {
-        append_newc_entry(&mut archive, name, &[], 0o040_755, inode)?;
-        inode += 1;
-    }
-    for prefix in [
-        "",
-        "first_stage_ramdisk/",
-        "first_stage_ramdisk/system/etc/",
-        "system/etc/",
-    ] {
-        append_newc_entry(
-            &mut archive,
-            &format!("{prefix}fstab.hd"),
-            fstab.as_bytes(),
-            0o100_644,
-            inode,
-        )?;
-        inode += 1;
-    }
-    append_newc_entry(&mut archive, "TRAILER!!!", &[], 0, inode)?;
-    archive.resize(archive.len().next_multiple_of(512), 0);
-    Ok(archive)
-}
-
-#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_lines)]
-fn patch_android_initrd_bootconfig(
-    source: &Path,
-    android_fstab: &Path,
-    destination: &Path,
-) -> std::io::Result<bool> {
+fn patch_android_initrd_bootconfig(source: &Path, destination: &Path) -> std::io::Result<()> {
     let data = std::fs::read(source)?;
     let (prefix, existing) = if data.ends_with(BOOTCONFIG_MAGIC) {
         let trailer_start = data.len() - BOOTCONFIG_MAGIC.len();
@@ -406,29 +305,6 @@ fn patch_android_initrd_bootconfig(
     } else {
         entries.push((key.to_owned(), value.to_owned()));
     }
-    let nonsecure_keymint = entries.iter().any(|(key, entry)| {
-        key == "androidboot.vendor.apex.com.android.hardware.keymint"
-            && entry == "androidboot.vendor.apex.com.android.hardware.keymint=com.android.hardware.keymint.rust_nonsecure"
-    });
-    let fstab_override = if nonsecure_keymint {
-        let key = "androidboot.fstab_suffix";
-        let value = "androidboot.fstab_suffix=hd";
-        if let Some((_, entry)) = entries.iter_mut().find(|(entry, _)| entry == key) {
-            value.clone_into(entry);
-        } else {
-            entries.push((key.to_owned(), value.to_owned()));
-        }
-        // The nonsecure KeyMint profile has no host-backed persistent root secret. Cuttlefish's
-        // keydirectory and file-encryption keys therefore succeed only on blank userdata and
-        // cannot be reopened after a VM power cycle. Project a dedicated unencrypted development
-        // fstab; the initramfs view deliberately omits /data so Android's native late-fs phase
-        // mounts it from the FDT view and emits `nonencrypted`. Persistent encryption requires a
-        // future host-backed secure KeyMint profile.
-        Some(make_android_fstab_override_cpio(android_fstab)?)
-    } else {
-        None
-    };
-
     let mut bootconfig = String::new();
     for (_, entry) in entries {
         bootconfig.push_str(&entry);
@@ -438,13 +314,8 @@ fn patch_android_initrd_bootconfig(
     let checksum = bootconfig
         .iter()
         .fold(0_u32, |sum, byte| sum.wrapping_add(u32::from(*byte)));
-    let mut patched = Vec::with_capacity(
-        prefix.len()
-            + fstab_override.as_ref().map_or(0, Vec::len)
-            + bootconfig.len()
-            + 8
-            + BOOTCONFIG_MAGIC.len(),
-    );
+    let mut patched =
+        Vec::with_capacity(prefix.len() + bootconfig.len() + 8 + BOOTCONFIG_MAGIC.len());
     let bootconfig_len = u32::try_from(bootconfig.len()).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -452,15 +323,12 @@ fn patch_android_initrd_bootconfig(
         )
     })?;
     patched.extend_from_slice(prefix);
-    if let Some(fstab_override) = fstab_override {
-        patched.extend_from_slice(&fstab_override);
-    }
     patched.extend_from_slice(&bootconfig);
     patched.extend_from_slice(&bootconfig_len.to_le_bytes());
     patched.extend_from_slice(&checksum.to_le_bytes());
     patched.extend_from_slice(BOOTCONFIG_MAGIC);
     std::fs::write(destination, patched)?;
-    Ok(nonsecure_keymint)
+    Ok(())
 }
 
 fn inject_initial_display_environment(
@@ -485,6 +353,107 @@ fn inject_initial_display_environment(
                 endpoint.clone(),
             );
         }
+    }
+}
+
+fn configured_runtime_displays(spec: &InstanceSpecV2) -> Vec<RuntimeDisplayV2> {
+    if spec.guest_kind != GuestKindV2::Android {
+        return Vec::new();
+    }
+    let mut displays = vec![RuntimeDisplayV2 {
+        display_id: DisplayIdV2::Primary,
+        scanout_id: 0,
+        name: "主屏".to_owned(),
+        width: spec.display.width,
+        height: spec.display.height,
+        dpi: spec.display.dpi,
+        refresh_rate_hz: spec.display.refresh_rate_hz,
+    }];
+    displays.extend(
+        spec.display
+            .secondary_displays
+            .iter()
+            .enumerate()
+            .map(|(index, display)| {
+                runtime_display_for_secondary(
+                    display,
+                    u32::try_from(index + 1).expect("bounded secondary display index"),
+                )
+            }),
+    );
+    displays
+}
+
+fn runtime_display_for_secondary(
+    display: &SecondaryDisplayConfigV2,
+    scanout_id: u32,
+) -> RuntimeDisplayV2 {
+    RuntimeDisplayV2 {
+        display_id: DisplayIdV2::Secondary { id: display.id },
+        scanout_id,
+        name: display.name.clone(),
+        width: display.width,
+        height: display.height,
+        dpi: display.dpi,
+        refresh_rate_hz: display.refresh_rate_hz,
+    }
+}
+
+fn secondary_display_geometry_changed(
+    current: &SecondaryDisplayConfigV2,
+    next: &SecondaryDisplayConfigV2,
+) -> bool {
+    current.width != next.width
+        || current.height != next.height
+        || current.dpi != next.dpi
+        || current.refresh_rate_hz != next.refresh_rate_hz
+}
+
+// Crosvm acknowledges the virtio-gpu control command before Android's HWC hotplug event has
+// crossed SurfaceFlinger. On the pinned Android 15/macOS stack, issuing `wm density -d` during
+// that window can leave the new logical display permanently at 0x0 / density -1. Keep every
+// guest display query behind one bounded settling window after add/remove/replace.
+const ANDROID_DISPLAY_HOTPLUG_SETTLE_DELAY: Duration = Duration::from_secs(4);
+
+async fn rollback_secondary_display_transaction(
+    backend: &CrosvmBackend,
+    control_endpoint: &str,
+    added: &[(u32, SecondaryDisplayConfigV2)],
+    removed: &[(u32, SecondaryDisplayConfigV2)],
+    changed: &[(u32, SecondaryDisplayConfigV2)],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (scanout_id, _) in added.iter().rev() {
+        if let Err(error) = backend.remove_display(control_endpoint, *scanout_id).await {
+            errors.push(format!("remove added scanout {scanout_id}: {error}"));
+        }
+    }
+    let mut removed = removed.to_vec();
+    removed.sort_by_key(|(scanout_id, _)| *scanout_id);
+    for (expected_scanout, display) in removed {
+        match backend
+            .add_secondary_display(control_endpoint, expected_scanout, &display)
+            .await
+        {
+            Ok(()) => {}
+            Err(error) => errors.push(format!(
+                "restore display {} on scanout {expected_scanout}: {error}",
+                display.id
+            )),
+        }
+    }
+    for (scanout_id, display) in changed.iter().rev() {
+        if let Err(error) = backend
+            .replace_secondary_display(control_endpoint, *scanout_id, display)
+            .await
+        {
+            errors.push(format!("restore scanout {scanout_id}: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -527,18 +496,59 @@ struct WorkerMutable {
     journal: Option<Arc<RunJournalV2>>,
     started_at: Option<OffsetDateTime>,
     display_session: Option<ActiveDisplaySession>,
+    #[cfg(any(windows, target_os = "macos"))]
+    host_recorder_endpoint: Option<PathBuf>,
+    active_screen_recording: Option<ActiveScreenRecording>,
+    active_location_route: Option<ActiveLocationRoute>,
     #[cfg(unix)]
     device_output_files: Vec<std::fs::File>,
     #[cfg(unix)]
     device_input_fifos: Vec<std::fs::File>,
+    #[cfg(unix)]
+    microdroid_console_challenge: Option<MicrodroidConsoleChallengeChannel>,
 }
 
 #[derive(Debug)]
 struct ActiveDisplaySession {
     id: Uuid,
     generation: u64,
+    display_id: DisplayIdV2,
     target: NativeDisplayTargetV2,
     viewport: DisplayViewportV2,
+}
+
+#[derive(Debug)]
+struct ActiveScreenRecording {
+    status: ScreenRecordingStatusV2,
+    output_path: PathBuf,
+    backend: ActiveScreenRecordingBackend,
+    started: Instant,
+}
+
+#[derive(Debug)]
+enum ActiveScreenRecordingBackend {
+    #[cfg(not(any(windows, target_os = "macos")))]
+    Guest {
+        adb: AdbClient,
+        serial: String,
+        process: AdbScreenRecording,
+    },
+    #[cfg(any(windows, target_os = "macos"))]
+    Host(HostRecording),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocationRouteControl {
+    Playing,
+    Paused,
+    Stop,
+}
+
+#[derive(Debug)]
+struct ActiveLocationRoute {
+    status: LocationRouteStatusV2,
+    control: watch::Sender<LocationRouteControl>,
+    paused_by_instance: bool,
 }
 
 pub struct WorkerService {
@@ -550,6 +560,7 @@ pub struct WorkerService {
     _instance_lock: std::fs::File,
     mutable: Mutex<WorkerMutable>,
     operation: Mutex<()>,
+    display_operation: Mutex<()>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -639,6 +650,16 @@ impl WorkerService {
                     adb_ready: false,
                     frame_generation: 0,
                     frame_metrics: FrameMetricsV2::default(),
+                    runtime_displays: Vec::new(),
+                    screen_recording: None,
+                    last_screen_recording: None,
+                    location_route: None,
+                    last_location_route: None,
+                    uwb_ranging: None,
+                    modem_state: None,
+                    sensor_pose: None,
+                    bluetooth_peers: Vec::new(),
+                    last_bluetooth_hci_capture: None,
                     last_error: None,
                 },
                 active_spec: None,
@@ -652,12 +673,19 @@ impl WorkerService {
                 journal: None,
                 started_at: None,
                 display_session: None,
+                #[cfg(any(windows, target_os = "macos"))]
+                host_recorder_endpoint: None,
+                active_screen_recording: None,
+                active_location_route: None,
                 #[cfg(unix)]
                 device_output_files: Vec::new(),
                 #[cfg(unix)]
                 device_input_fifos: Vec::new(),
+                #[cfg(unix)]
+                microdroid_console_challenge: None,
             }),
             operation: Mutex::new(()),
+            display_operation: Mutex::new(()),
             shutdown,
         }))
     }
@@ -674,6 +702,14 @@ impl WorkerService {
         let mutable = self.mutable.lock().await;
         let mut status = mutable.status.clone();
         status.adb_ready = mutable.adb_ready;
+        status.screen_recording = mutable
+            .active_screen_recording
+            .as_ref()
+            .map(|recording| recording.status.clone());
+        status.location_route = mutable
+            .active_location_route
+            .as_ref()
+            .map(|route| route.status.clone());
         drop(mutable);
         if let Some(run_id) = status.run_id {
             let metrics_path = self
@@ -742,7 +778,7 @@ impl WorkerService {
                 ApiErrorV2::new("worker_unauthorized", "worker authentication failed"),
             );
         }
-        let result = self.dispatch_command(request.command).await;
+        let result = Box::pin(self.dispatch_command(request.command)).await;
         match result {
             Ok(payload) => WorkerResponseV2::success(request_id, payload),
             Err(error) => {
@@ -758,6 +794,7 @@ impl WorkerService {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_command(
         self: &Arc<Self>,
         command: WorkerCommandV2,
@@ -807,10 +844,11 @@ impl WorkerService {
             WorkerCommandV2::AttachDisplay {
                 session_id,
                 generation,
+                display_id,
                 target,
                 viewport,
             } => self
-                .attach_display(session_id, generation, target, viewport)
+                .attach_display(session_id, generation, display_id, target, viewport)
                 .await
                 .map(|()| WorkerPayloadV2::Empty),
             WorkerCommandV2::ResizeDisplay {
@@ -832,11 +870,38 @@ impl WorkerService {
                 .capture_screenshot(&output_path)
                 .await
                 .map(WorkerPayloadV2::Screenshot),
+            WorkerCommandV2::CollectAndroidBugreport {
+                bugreport_id,
+                output_path,
+            } => self
+                .collect_android_bugreport(bugreport_id, &output_path)
+                .await
+                .map(WorkerPayloadV2::AndroidBugreport),
+            WorkerCommandV2::StartScreenRecording {
+                recording_id,
+                display_id,
+                output_path,
+                max_duration_seconds,
+            } => self
+                .start_screen_recording(
+                    recording_id,
+                    display_id,
+                    &output_path,
+                    max_duration_seconds,
+                )
+                .await
+                .map(WorkerPayloadV2::ScreenRecordingStatus),
+            WorkerCommandV2::StopScreenRecording { recording_id } => self
+                .stop_screen_recording(recording_id)
+                .await
+                .map(WorkerPayloadV2::ScreenRecording),
             WorkerCommandV2::CollectGuestLogs => self
                 .collect_guest_logs()
                 .await
                 .map(WorkerPayloadV2::GuestLog),
-            WorkerCommandV2::Diagnose => Ok(WorkerPayloadV2::Diagnostics(self.diagnostics().await)),
+            WorkerCommandV2::Diagnose => Ok(WorkerPayloadV2::Diagnostics(
+                Box::pin(self.diagnostics()).await,
+            )),
             WorkerCommandV2::Shutdown => {
                 let status = self.status().await;
                 if status.observed.is_active() {
@@ -900,6 +965,25 @@ impl WorkerService {
         })
         .await
         .map_err(|error| WorkerError::Task(format!("join run retention task: {error}")))??;
+        for path in &retention.removed_ephemeral {
+            tracing::info!(
+                event = "runtime.run.ephemeral_artifact.removed",
+                instance_id = %self.instance_id,
+                path = %path.display(),
+                maintenance = "pre_start_retention",
+                "removed a reproducible launch artifact retained by a finalized run"
+            );
+        }
+        for compacted in &retention.compacted {
+            tracing::info!(
+                event = "runtime.run.log_compacted",
+                instance_id = %self.instance_id,
+                path = %compacted.path.display(),
+                previous_bytes = compacted.previous_bytes,
+                retained_tail_bytes = compacted.retained_tail_bytes,
+                "compacted an oversized log from a finalized run"
+            );
+        }
         for pruned in &retention.pruned {
             tracing::info!(
                 event = "runtime.run.pruned",
@@ -912,18 +996,20 @@ impl WorkerService {
             );
         }
         let available_disk_bytes = available_runtime_disk_bytes(&self.paths)?;
-        if available_disk_bytes < DISK_LOW_WATERMARK_BYTES {
+        let required_disk_bytes =
+            runtime_disk_requirement(&self.paths, Some(&spec)).required_free_bytes;
+        if available_disk_bytes < required_disk_bytes {
             tracing::error!(
                 event = "runtime.disk.low_watermark",
                 error_code = "disk_low_watermark",
                 instance_id = %self.instance_id,
                 available_disk_bytes,
-                required_disk_bytes = DISK_LOW_WATERMARK_BYTES,
+                required_disk_bytes,
                 "runtime data volume is below the start low-watermark"
             );
             return Err(WorkerError::DiskLowWatermark {
                 available: available_disk_bytes,
-                required: DISK_LOW_WATERMARK_BYTES,
+                required: required_disk_bytes,
             });
         }
         let run_dir = self.paths.run_dir(self.instance_id, run_id);
@@ -949,21 +1035,58 @@ impl WorkerService {
             let mut mutable = self.mutable.lock().await;
             mutable.status.run_id = Some(run_id);
             mutable.status.cleanup_pending = false;
+            mutable.status.screen_recording = None;
+            mutable.status.last_screen_recording = None;
+            mutable.active_screen_recording = None;
+            mutable.status.location_route = None;
+            mutable.status.last_location_route = None;
+            mutable.active_location_route = None;
+            mutable.status.uwb_ranging = (spec.guest_kind == GuestKindV2::Android
+                && spec.devices.uwb)
+                .then_some(hd_core::UwbRangingV2 { distance_cm: 250 });
+            mutable.status.modem_state = (spec.guest_kind == GuestKindV2::Android
+                && spec.devices.modem)
+                .then(hd_core::ModemStateV2::default);
+            mutable.status.bluetooth_peers.clear();
+            mutable.status.last_bluetooth_hci_capture = None;
+            mutable.status.runtime_displays = configured_runtime_displays(&spec);
+            #[cfg(unix)]
+            {
+                mutable.microdroid_console_challenge = None;
+            }
             mutable.active_spec = Some(spec.clone());
             mutable.journal = Some(Arc::clone(&journal));
             mutable.started_at = Some(started_at);
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                mutable.host_recorder_endpoint = None;
+            }
             mutable.display_session =
                 initial_display
                     .as_ref()
                     .map(|display| ActiveDisplaySession {
                         id: display.session_id,
                         generation: frame_generation,
+                        display_id: display.display_id,
                         target: display.target.clone(),
                         viewport: display.viewport.clone(),
                     });
         }
         self.transition(ObservedStateV2::Preparing, None).await?;
         let start_result: Result<(), WorkerError> = async {
+            if spec.guest_kind == GuestKindV2::Microdroid {
+                return self
+                    .start_microdroid(
+                        &spec,
+                        run_id,
+                        &run_dir,
+                        &leases,
+                        frame_generation,
+                        expected_capabilities,
+                        &journal,
+                    )
+                    .await;
+            }
             journal.boundary_started("capability.discovery", BTreeMap::new())?;
             let discovery = CapabilityDiscovery::discover_defaults(self.paths.clone(), None)
                 .discover(Some(&spec))
@@ -992,6 +1115,8 @@ impl WorkerService {
             let bundles = discovery.bundles.ok_or_else(|| {
                 WorkerError::CapabilityBlocked(vec!["artifact.bundles".to_owned()])
             })?;
+            crate::disk::validate_android_fstab(&bundles.artifacts.android_fstab)
+                .map_err(WorkerError::Platform)?;
             let dev_display_copy_fallback = crate::dev::allow_display_copy_fallback_enabled();
             let native_display_direct = crate::dev::native_display_direct_enabled();
             let frame_tool = if dev_display_copy_fallback || native_display_direct {
@@ -1045,16 +1170,15 @@ impl WorkerService {
             backend
                 .prepare_keyboard_endpoint(&endpoints.keyboard)
                 .await?;
-            let mut artifacts = bundles.artifacts.clone();
+            if let Some(endpoint) = endpoints.trackpad.as_deref() {
+                backend.prepare_trackpad_endpoint(endpoint).await?;
+            }
+            let artifacts = bundles.artifacts.clone();
             #[cfg(target_os = "macos")]
-            {
+            let artifacts = {
+                let mut artifacts = artifacts;
                 let patched_initrd = run_dir.join("initrd-android-hd.img");
-                let nonsecure_keymint = patch_android_initrd_bootconfig(
-                    &artifacts.initrd,
-                    &artifacts.android_fstab,
-                    &patched_initrd,
-                )
-                .map_err(
+                patch_android_initrd_bootconfig(&artifacts.initrd, &patched_initrd).map_err(
                     |source| WorkerError::Io {
                         operation: "patch Android initrd bootconfig",
                         path: patched_initrd.clone(),
@@ -1062,25 +1186,8 @@ impl WorkerService {
                     },
                 )?;
                 artifacts.initrd = patched_initrd;
-                if nonsecure_keymint {
-                    // The same fstab must also populate the FDT passed to crosvm. Android's
-                    // first-stage init reads the initramfs copy, while `mount_all --late`
-                    // consults the device tree after /vendor has replaced the ramdisk paths.
-                    // Mixing the projected unencrypted fstab with the source encrypted FDT
-                    // makes late-fs attempt to remount /data and suppresses `nonencrypted`.
-                    let patched_fstab = run_dir.join("android_fstab-hd.dt");
-                    write_android_fstab_for_nonsecure_keymint(
-                        &artifacts.android_fstab,
-                        &patched_fstab,
-                    )
-                    .map_err(|source| WorkerError::Io {
-                        operation: "project Android fstab for nonsecure KeyMint",
-                        path: patched_fstab.clone(),
-                        source,
-                    })?;
-                    artifacts.android_fstab = patched_fstab;
-                }
-            }
+                artifacts
+            };
             let context = VmLaunchContextV2 {
                 spec: spec.clone(),
                 run_id,
@@ -1091,6 +1198,7 @@ impl WorkerService {
                 control_endpoint: endpoints.control,
                 frame_endpoint: endpoints.frame,
                 keyboard_endpoint: endpoints.keyboard,
+                trackpad_endpoint: endpoints.trackpad,
                 device_endpoints: endpoints.devices,
                 device_control_endpoints: endpoints.device_controls,
                 adb_host_port: adb_port,
@@ -1132,7 +1240,15 @@ impl WorkerService {
             self.transition(ObservedStateV2::LaunchingGuest, None)
                 .await?;
             let mut process_environment = launch.environment.clone();
-            #[cfg(target_os = "macos")]
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                let host_recorder_endpoint = host_recorder_endpoint_for_run(run_id);
+                process_environment.insert(
+                    HD_HOST_RECORDER_ENDPOINT_ENV.to_owned(),
+                    host_recorder_endpoint.to_string_lossy().into_owned(),
+                );
+            }
+            #[cfg(any(windows, target_os = "macos"))]
             {
                 process_environment.insert(
                     "HD_FRAME_METRICS_PATH".to_owned(),
@@ -1157,6 +1273,7 @@ impl WorkerService {
                     working_directory: launch.working_directory.clone(),
                     stdout_path: run_dir.join("crosvm.stdout.log"),
                     stderr_path: run_dir.join("crosvm.stderr.log"),
+                    latency_sensitive: cfg!(windows),
                     kill_on_drop: true,
                 })
                 .await?;
@@ -1167,6 +1284,10 @@ impl WorkerService {
                 mutable.status.frame_generation = frame_generation;
                 mutable.status.frame_metrics.generation = frame_generation;
                 mutable.process = Some(process);
+                #[cfg(any(windows, target_os = "macos"))]
+                {
+                    mutable.host_recorder_endpoint = Some(host_recorder_endpoint_for_run(run_id));
+                }
             }
 
             self.start_device_components(
@@ -1197,6 +1318,33 @@ impl WorkerService {
             } else {
                 self.wait_frame_ready(&run_dir, run_id, frame_generation)
                     .await?;
+            }
+            #[cfg(windows)]
+            if !spec.display.secondary_displays.is_empty() {
+                let display_started = Instant::now();
+                journal.boundary_started(
+                    "display.secondary.cold_start",
+                    BTreeMap::from([(
+                        "count".to_owned(),
+                        spec.display.secondary_displays.len().to_string(),
+                    )]),
+                )?;
+                for (index, secondary) in spec.display.secondary_displays.iter().enumerate() {
+                    let scanout_id = u32::try_from(index + 1)
+                        .expect("configured secondary display count fits in u32");
+                    backend
+                        .add_secondary_display(&launch.control_endpoint, scanout_id, secondary)
+                        .await?;
+                }
+                tokio::time::sleep(ANDROID_DISPLAY_HOTPLUG_SETTLE_DELAY).await;
+                journal.boundary_succeeded(
+                    "display.secondary.cold_start",
+                    elapsed_ms(display_started),
+                    BTreeMap::from([(
+                        "scanouts".to_owned(),
+                        format!("1..={}", spec.display.secondary_displays.len()),
+                    )]),
+                )?;
             }
             self.transition(ObservedStateV2::GuestBooting, None).await?;
 
@@ -1272,6 +1420,7 @@ impl WorkerService {
                         serial,
                         spec.devices.bluetooth,
                         spec.devices.nfc,
+                        spec.devices.modem,
                     )
                     .await;
                     refresh_network_validation(
@@ -1298,14 +1447,18 @@ impl WorkerService {
             if native_display_direct {
                 self.spawn_deferred_adb_readiness(
                     run_id,
+                    run_dir.clone(),
                     launch
                         .adb_serial
                         .clone()
                         .ok_or(WorkerError::ReadinessUnavailable)?,
-                    spec.display.clone(),
-                    spec.devices.bluetooth,
-                    spec.devices.nfc,
-                    spec.devices.network,
+                    DeferredAdbReadinessPolicy {
+                        display: spec.display.clone(),
+                        bluetooth_enabled: spec.devices.bluetooth,
+                        nfc_enabled: spec.devices.nfc,
+                        modem_enabled: spec.devices.modem,
+                        network_enabled: spec.devices.network,
+                    },
                 );
             }
             self.spawn_exit_monitor();
@@ -1329,6 +1482,410 @@ impl WorkerService {
                 Err(error)
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn start_microdroid(
+        self: &Arc<Self>,
+        spec: &InstanceSpecV2,
+        run_id: Uuid,
+        run_dir: &Path,
+        leases: &[LeaseV2],
+        frame_generation: u64,
+        expected_capabilities: &str,
+        journal: &RunJournalV2,
+    ) -> Result<(), WorkerError> {
+        if !(cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            || cfg!(all(target_os = "windows", target_arch = "x86_64")))
+        {
+            return Err(WorkerError::CapabilityBlocked(vec![
+                "microdroid.host_platform".to_owned(),
+            ]));
+        }
+        journal.boundary_started("microdroid.capability.discovery", BTreeMap::new())?;
+        let discovery = CapabilityDiscovery::discover_defaults(self.paths.clone(), None)
+            .discover(Some(spec))
+            .await;
+        if discovery.capabilities.fingerprint != expected_capabilities {
+            return Err(WorkerError::CapabilityChanged {
+                expected: expected_capabilities.to_owned(),
+                actual: discovery.capabilities.fingerprint,
+            });
+        }
+        if !discovery.capabilities.can_start() {
+            return Err(WorkerError::CapabilityBlocked(
+                discovery
+                    .capabilities
+                    .probes
+                    .iter()
+                    .filter(|probe| {
+                        probe.required
+                            && !matches!(probe.status, hd_core::CapabilityStatusV2::Supported)
+                    })
+                    .map(|probe| probe.id.clone())
+                    .collect(),
+            ));
+        }
+        journal.boundary_succeeded("microdroid.capability.discovery", 0, BTreeMap::new())?;
+
+        let config = spec
+            .microdroid
+            .as_ref()
+            .ok_or_else(|| WorkerError::CapabilityBlocked(vec!["microdroid.config".to_owned()]))?;
+        let guest_cid = lease_number::<u32>(leases, LeaseKindV2::GuestCid)?;
+        let adb_port = if matches!(spec.adb.mode, AdbModeV2::Loopback) {
+            Some(lease_number::<u16>(leases, LeaseKindV2::AdbPort)?)
+        } else {
+            None
+        };
+        let runtime = resolve_microdroid_runtime_paths();
+        let vm = runtime.vm();
+        let virtmgr = runtime.virtmgr();
+        let crosvm = runtime.crosvm();
+        let bin = runtime.bin_dir.clone();
+        #[cfg(target_os = "macos")]
+        let lib = runtime.lib_dir.clone();
+        let apex_tree = runtime.product_root.join("apex_dir");
+        let apex_root = apex_tree.join("apex");
+        let instance_root = self.paths.instance_dir(spec.id).join("microdroid");
+        let work_dir = instance_root.join("work");
+        let temp_dir = run_dir.join("microdroid-temp");
+        for path in [&instance_root, &work_dir, &temp_dir] {
+            hd_platform::ensure_owner_only_directory(path)?;
+        }
+        let console = run_dir.join("microdroid-console.txt");
+        #[cfg(unix)]
+        let console_in = run_dir.join("microdroid-console-in.fifo");
+        #[cfg(not(unix))]
+        let console_in = run_dir.join("microdroid-console-in.txt");
+        let guest_log = run_dir.join("microdroid-guest.log");
+        let trace_file = run_dir.join("microdroid-virtmgr-trace.log");
+        let client_trace = run_dir.join("microdroid-vmclient-trace.log");
+        // AOSP `vm` opens this path as the console input FD. On Unix keep an owner-only FIFO
+        // open on both ends so it does not become an EOF-only launch file. The product API only
+        // writes one fixed, random nonce challenge and never accepts arbitrary console text.
+        #[cfg(unix)]
+        let console_challenge = MicrodroidConsoleChallengeChannel::create(
+            &console_in,
+            &console,
+            run_dir.join("microdroid-console-challenge.json"),
+        )?;
+        #[cfg(not(unix))]
+        hd_platform::write_owner_only(&console_in, &[])?;
+        let mut environment = BTreeMap::from([
+            (
+                "VIRTMGR_PATH".to_owned(),
+                virtmgr.to_string_lossy().into_owned(),
+            ),
+            (
+                "VIRTMGR_CROSVM_PATH".to_owned(),
+                crosvm.to_string_lossy().into_owned(),
+            ),
+            (
+                "VIRTMGR_APEX_ROOT".to_owned(),
+                apex_root.to_string_lossy().into_owned(),
+            ),
+            (
+                "VIRTMGR_SYSTEM_ROOT".to_owned(),
+                apex_tree.join("system").to_string_lossy().into_owned(),
+            ),
+            (
+                "VIRTMGR_SYSTEM_EXT_ROOT".to_owned(),
+                apex_tree.join("system_ext").to_string_lossy().into_owned(),
+            ),
+            (
+                "ANDROID_PROP_RO_BUILD_VERSION_SDK".to_owned(),
+                "35".to_owned(),
+            ),
+            (
+                "VIRTMGR_TRACE_FILE".to_owned(),
+                trace_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "VMCLIENT_TRACE_FILE".to_owned(),
+                client_trace.to_string_lossy().into_owned(),
+            ),
+            ("VIRTMGR_GUEST_CID".to_owned(), guest_cid.to_string()),
+            ("VIRTMGR_KEEP_TEMP".to_owned(), "1".to_owned()),
+            ("TMPDIR".to_owned(), temp_dir.to_string_lossy().into_owned()),
+        ]);
+        #[cfg(target_os = "macos")]
+        environment.insert(
+            "DYLD_LIBRARY_PATH".to_owned(),
+            lib.to_string_lossy().into_owned(),
+        );
+        if let Some(parent_path) = std::env::var_os("PATH") {
+            #[cfg(windows)]
+            let separator = ";";
+            #[cfg(not(windows))]
+            let separator = ":";
+            environment.insert(
+                "PATH".to_owned(),
+                format!(
+                    "{}{separator}{}",
+                    bin.display(),
+                    PathBuf::from(parent_path).display()
+                ),
+            );
+        } else {
+            environment.insert("PATH".to_owned(), bin.to_string_lossy().into_owned());
+        }
+        let mut arguments = match &config.payload {
+            MicrodroidPayloadV2::Empty => vec![
+                "run-microdroid".to_owned(),
+                "--work-dir".to_owned(),
+                work_dir.to_string_lossy().into_owned(),
+            ],
+            MicrodroidPayloadV2::Uploaded {
+                upload_id,
+                sha256,
+                config_path,
+            } => {
+                let apk = self.paths.upload_path(*upload_id);
+                verify_upload_digest(&apk, sha256)?;
+                let inspection =
+                    crate::inspect_microdroid_payload_apk(&apk)
+                        .await
+                        .map_err(|error| {
+                            WorkerError::ComponentContract(format!(
+                                "Microdroid Payload APK is invalid: {error}"
+                            ))
+                        })?;
+                let declared = usize::from(inspection.declared_extra_apk_count);
+                let selected = config.extra_apks.len();
+                if declared != selected {
+                    return Err(WorkerError::MicrodroidExtraApkCountMismatch {
+                        declared,
+                        selected,
+                    });
+                }
+                let idsig = instance_root.join("payload.idsig");
+                create_microdroid_idsig(spec.id, run_id, &vm, &apk, &idsig, &environment, run_dir)
+                    .await?;
+                vec![
+                    "run-app".to_owned(),
+                    apk.to_string_lossy().into_owned(),
+                    idsig.to_string_lossy().into_owned(),
+                    instance_root
+                        .join("instance.img")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "--config-path".to_owned(),
+                    config_path.clone(),
+                ]
+            }
+        };
+        for (index, extra) in config.extra_apks.iter().enumerate() {
+            let apk = self.paths.upload_path(extra.upload_id);
+            verify_upload_digest(&apk, &extra.sha256)?;
+            crate::validate_microdroid_extra_apk(&apk)
+                .await
+                .map_err(|error| {
+                    WorkerError::ComponentContract(format!(
+                        "Microdroid extra APK #{index} is invalid: {error}"
+                    ))
+                })?;
+            let idsig = run_dir.join(format!("microdroid-extra-{index}.idsig"));
+            let idsig_file = hd_platform::open_owner_only_rw(&idsig)?;
+            idsig_file.set_len(0).map_err(|source| WorkerError::Io {
+                operation: "truncate Microdroid extra APK idsig",
+                path: idsig.clone(),
+                source,
+            })?;
+            arguments.extend([
+                "--extra-apk-override".to_owned(),
+                apk.to_string_lossy().into_owned(),
+                "--extra-idsig".to_owned(),
+                idsig.to_string_lossy().into_owned(),
+            ]);
+        }
+        arguments.extend([
+            "--name".to_owned(),
+            format!("HD-{}-{}", spec.name, &spec.id.simple().to_string()[..8]),
+            "--mem".to_owned(),
+            spec.memory_mib.to_string(),
+            "--cpu-topology".to_owned(),
+            match config.cpu_topology {
+                MicrodroidCpuTopologyV2::OneCpu => "one_cpu",
+                MicrodroidCpuTopologyV2::MatchHost => "match_host",
+            }
+            .to_owned(),
+            "--debug".to_owned(),
+            match config.debug_level {
+                MicrodroidDebugLevelV2::None => "none",
+                MicrodroidDebugLevelV2::Full => "full",
+            }
+            .to_owned(),
+            "--console".to_owned(),
+            console.to_string_lossy().into_owned(),
+            "--console-in".to_owned(),
+            console_in.to_string_lossy().into_owned(),
+            "--log".to_owned(),
+            guest_log.to_string_lossy().into_owned(),
+        ]);
+        if let Some(port) = adb_port {
+            arguments.extend(["--adb-tcp-port".to_owned(), port.to_string()]);
+        }
+        if let Some(size_mib) = config.encrypted_storage_mib {
+            let storage = instance_root.join("storage.img");
+            validate_existing_microdroid_storage(&storage, size_mib)?;
+            arguments.extend([
+                "--storage".to_owned(),
+                storage.to_string_lossy().into_owned(),
+                "--storage-size".to_owned(),
+                (u64::from(size_mib) * 1024 * 1024).to_string(),
+            ]);
+        }
+        let endpoints = RuntimeEndpoints::create(spec, run_id)?;
+        let launch = LaunchPlanV2 {
+            schema_version: 2,
+            instance_id: spec.id,
+            run_id,
+            executable: vm.clone(),
+            arguments,
+            environment,
+            working_directory: run_dir.to_owned(),
+            control_endpoint: endpoints.control,
+            frame_endpoint: endpoints.frame,
+            keyboard_endpoint: endpoints.keyboard,
+            trackpad_endpoint: endpoints.trackpad,
+            device_endpoints: BTreeMap::new(),
+            device_control_endpoints: BTreeMap::new(),
+            adb_serial: adb_port.map(|port| format!("127.0.0.1:{port}")),
+            guest_cid,
+        };
+        journal.write_manifest(&RunManifestV2 {
+            schema_version: 2,
+            run_id,
+            instance: spec.clone(),
+            artifact_bundles: Vec::new(),
+            capabilities_fingerprint: expected_capabilities.to_owned(),
+            launch: Some(launch.clone()),
+            toolchain: toolchain_fingerprint(Some(&vm)),
+        })?;
+        {
+            let mut mutable = self.mutable.lock().await;
+            mutable.launch = Some(launch.clone());
+            mutable.display_session = None;
+            #[cfg(unix)]
+            {
+                mutable.microdroid_console_challenge = Some(console_challenge);
+            }
+        }
+        self.transition(ObservedStateV2::StartingWorker, None)
+            .await?;
+        self.transition(ObservedStateV2::LaunchingGuest, None)
+            .await?;
+        tracing::info!(
+            event = "microdroid.vm.created",
+            instance_id = %spec.id,
+            %run_id,
+            guest_cid,
+            adb_port,
+            payload = ?config.payload,
+            "starting isolated Microdroid workload"
+        );
+        let process = TokioProcessSupervisor
+            .spawn(&ProcessSpec {
+                executable: launch.executable.clone(),
+                arguments: launch.arguments.clone(),
+                environment: launch.environment.clone(),
+                working_directory: launch.working_directory.clone(),
+                stdout_path: run_dir.join("microdroid.stdout.log"),
+                stderr_path: run_dir.join("microdroid.stderr.log"),
+                latency_sensitive: false,
+                kill_on_drop: true,
+            })
+            .await?;
+        {
+            let mut mutable = self.mutable.lock().await;
+            mutable.status.child_pid = Some(process.id());
+            mutable.status.adb_serial.clone_from(&launch.adb_serial);
+            mutable.status.frame_generation = frame_generation;
+            mutable.process = Some(process);
+        }
+        self.transition(ObservedStateV2::GuestBooting, None).await?;
+        match self.wait_microdroid_payload_ready(run_dir).await? {
+            MicrodroidPayloadReadiness::Ready => {}
+            MicrodroidPayloadReadiness::Completed(payload_exit_code) => {
+                tracing::info!(
+                    event = "microdroid.payload.finished_during_start",
+                    instance_id = %spec.id,
+                    %run_id,
+                    payload_exit_code,
+                    "finite Microdroid payload completed before the first Ready sample"
+                );
+                // `start` already owns the instance operation lock. Reuse the same exact cleanup
+                // implementation directly instead of trying to reacquire that lock through the
+                // asynchronous exit monitor.
+                self.stop_locked(StopModeV2::Force, Duration::ZERO, Some(payload_exit_code))
+                    .await?;
+                return Ok(());
+            }
+        }
+        tracing::info!(
+            event = "microdroid.payload.ready",
+            instance_id = %spec.id,
+            %run_id,
+            guest_cid,
+            "Microdroid payload reported ready"
+        );
+        if let Some(serial) = launch.adb_serial.clone() {
+            let adb = AdbClient::new(discovery.adb, None);
+            {
+                let mut mutable = self.mutable.lock().await;
+                mutable.adb = Some(adb.clone());
+            }
+            self.spawn_microdroid_deferred_adb_readiness(run_id, serial, adb);
+        }
+        self.transition(ObservedStateV2::Ready, None).await?;
+        self.spawn_exit_monitor();
+        Ok(())
+    }
+
+    async fn wait_microdroid_payload_ready(
+        &self,
+        run_dir: &Path,
+    ) -> Result<MicrodroidPayloadReadiness, WorkerError> {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_mins(3) {
+            for name in [
+                "microdroid.stdout.log",
+                "microdroid-guest.log",
+                "microdroid-virtmgr-trace.log",
+            ] {
+                let path = run_dir.join(name);
+                if !path.is_file() {
+                    continue;
+                }
+                let text = read_log_tail_lossy(&path)?;
+                if text.contains("notifyPayloadReady")
+                    || text.contains("Notified host payload ready successfully")
+                    || text.contains("payload is ready")
+                {
+                    return Ok(MicrodroidPayloadReadiness::Ready);
+                }
+            }
+            // A finite workload can notify Ready and finish before the next 250 ms
+            // polling interval. Consume the durable Ready marker first so the exit
+            // monitor can classify its host launcher completion after Start returns.
+            if let Some(exit) = self.poll_process().await? {
+                return match classify_microdroid_exit_disposition_after_log_settle(
+                    run_dir, exit.code,
+                )
+                .await
+                {
+                    MicrodroidExitDisposition::Completed(payload_exit_code) => {
+                        Ok(MicrodroidPayloadReadiness::Completed(payload_exit_code))
+                    }
+                    MicrodroidExitDisposition::Failed(error) => Err(error),
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Err(WorkerError::ComponentTimeout(
+            "microdroid-payload".to_owned(),
+        ))
     }
 
     async fn start_component(
@@ -1527,6 +2084,7 @@ impl WorkerService {
                 working_directory: spec.run_dir,
                 stdout_path: directory.join(format!("{component}.stdout.log")),
                 stderr_path: directory.join(format!("{component}.stderr.log")),
+                latency_sensitive: false,
                 kill_on_drop: true,
             })
             .await?;
@@ -1750,9 +2308,14 @@ impl WorkerService {
         &self,
         session_id: Uuid,
         generation: u64,
+        display_id: DisplayIdV2,
         target: NativeDisplayTargetV2,
         viewport: DisplayViewportV2,
     ) -> Result<(), WorkerError> {
+        // Native child reparenting is process-global for this VM. Keep explicit Player
+        // replacement ordered with startup's deferred attach so an old target cannot reappear
+        // after a newer session has already won.
+        let _display_operation = self.display_operation.lock().await;
         if !viewport.is_valid() {
             return Err(WorkerError::DisplaySession(
                 "viewport is outside supported bounds".to_owned(),
@@ -1769,6 +2332,21 @@ impl WorkerService {
                 "display generation is stale".to_owned(),
             ));
         }
+        let runtime_display = status
+            .runtime_displays
+            .iter()
+            .find(|display| display.display_id == display_id)
+            .ok_or_else(|| {
+                WorkerError::DisplaySession(
+                    "requested display is not configured for the active Android run".to_owned(),
+                )
+            })?;
+        if target.scanout_id() != runtime_display.scanout_id {
+            return Err(WorkerError::DisplaySession(
+                "native display target scanout does not match the requested product display"
+                    .to_owned(),
+            ));
+        }
         let child_pid = status.child_pid.ok_or(WorkerError::NotRunning)?;
         let debug_toplevel = hd_platform::native_display_toplevel_debug_enabled();
         tracing::info!(
@@ -1782,10 +2360,17 @@ impl WorkerService {
             viewport_height = viewport.height_px,
             "attaching crosvm native display"
         );
-        hd_platform::attach_native_display(child_pid, &target, &viewport)?;
+        hd_platform::attach_native_display(
+            child_pid,
+            &target,
+            &viewport,
+            runtime_display.width,
+            runtime_display.height,
+        )?;
         self.mutable.lock().await.display_session = Some(ActiveDisplaySession {
             id: session_id,
             generation,
+            display_id,
             target,
             viewport,
         });
@@ -1801,6 +2386,7 @@ impl WorkerService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_deferred_initial_display(
         self: &Arc<Self>,
         prepared: PreparedNativeDisplayV2,
@@ -1813,6 +2399,7 @@ impl WorkerService {
             let mut retry_delay = INITIAL_DISPLAY_ATTACH_RETRY_MIN;
             let mut next_progress_log = Duration::from_secs(15);
             loop {
+                let display_operation = worker.display_operation.lock().await;
                 let status = worker.status().await;
                 let session_is_current = worker
                     .mutable
@@ -1841,10 +2428,25 @@ impl WorkerService {
                     return;
                 }
                 let child_pid = status.child_pid.expect("checked above");
+                let Some(runtime_display) = status
+                    .runtime_displays
+                    .iter()
+                    .find(|display| display.display_id == prepared.display_id)
+                else {
+                    tracing::warn!(
+                        event = "worker.display.initial_attach.cancelled",
+                        instance_id = %worker.instance_id,
+                        session_id = %prepared.session_id,
+                        "configured display disappeared before native attach"
+                    );
+                    return;
+                };
                 match hd_platform::attach_native_display(
                     child_pid,
                     &prepared.target,
                     &prepared.viewport,
+                    runtime_display.width,
+                    runtime_display.height,
                 ) {
                     Ok(()) => {
                         tracing::info!(
@@ -1873,6 +2475,9 @@ impl WorkerService {
                             next_progress_log =
                                 next_progress_log.saturating_add(Duration::from_secs(15));
                         }
+                        // Do not make a boot-time retry delay block a newer Player session. The
+                        // next iteration re-enters the lock and revalidates session ownership.
+                        drop(display_operation);
                         tokio::time::sleep(retry_delay).await;
                         retry_delay = retry_delay
                             .saturating_mul(2)
@@ -1904,6 +2509,7 @@ impl WorkerService {
         generation: u64,
         viewport: DisplayViewportV2,
     ) -> Result<(), WorkerError> {
+        let _display_operation = self.display_operation.lock().await;
         if !viewport.is_valid() {
             return Err(WorkerError::DisplaySession(
                 "viewport is outside supported bounds".to_owned(),
@@ -1923,7 +2529,11 @@ impl WorkerService {
                 "display session identity or generation mismatch".to_owned(),
             ));
         }
-        if viewport.revision <= session.viewport.revision {
+        if viewport.revision < session.viewport.revision {
+            return Ok(());
+        }
+        if viewport.revision == session.viewport.revision {
+            hd_platform::ensure_native_display(child_pid, &session.target, &viewport)?;
             return Ok(());
         }
         let geometry_changed = viewport.width_px != session.viewport.width_px
@@ -1932,13 +2542,26 @@ impl WorkerService {
         if geometry_changed {
             hd_platform::resize_native_display(child_pid, &session.target, &viewport)?;
         } else if viewport.visible != session.viewport.visible {
-            hd_platform::set_native_display_visibility(child_pid, viewport.visible)?;
+            hd_platform::set_native_display_visibility(
+                child_pid,
+                &session.target,
+                viewport.visible,
+            )?;
         }
+        tracing::debug!(
+            event = "worker.display.resize.succeeded",
+            instance_id = %self.instance_id,
+            display_id = ?session.display_id,
+            scanout_id = session.target.scanout_id(),
+            viewport_revision = viewport.revision,
+            "native display viewport updated"
+        );
         session.viewport = viewport;
         Ok(())
     }
 
     async fn detach_display(&self, session_id: Uuid, generation: u64) -> Result<(), WorkerError> {
+        let _display_operation = self.display_operation.lock().await;
         let child_pid = self
             .status()
             .await
@@ -1952,7 +2575,9 @@ impl WorkerService {
                 "display session identity or generation mismatch".to_owned(),
             ));
         }
-        hd_platform::detach_native_display(child_pid)?;
+        if let Some(session) = &mutable.display_session {
+            hd_platform::detach_native_display(child_pid, &session.target)?;
+        }
         mutable.display_session = None;
         Ok(())
     }
@@ -1970,6 +2595,7 @@ impl WorkerService {
         hd_platform::ensure_owner_only_directory(&screenshot_dir)?;
         let (adb, serial) = {
             let mutable = self.mutable.lock().await;
+            #[cfg(not(target_os = "macos"))]
             if !mutable.adb_ready {
                 return Err(WorkerError::AdbNotReady);
             }
@@ -1994,15 +2620,359 @@ impl WorkerService {
         })
     }
 
+    async fn collect_android_bugreport(
+        &self,
+        bugreport_id: Uuid,
+        output_path: &Path,
+    ) -> Result<AndroidBugreportRecordV2, WorkerError> {
+        let _operation = self.operation.lock().await;
+        if self.status().await.observed != ObservedStateV2::Ready {
+            return Err(WorkerError::NotReady);
+        }
+        let directory = &self.paths.diagnostics;
+        let expected_name = format!(
+            "android-bugreport-{}-{}.zip",
+            self.instance_id,
+            bugreport_id.simple()
+        );
+        if output_path.parent() != Some(directory.as_path())
+            || output_path.file_name().and_then(|name| name.to_str()) != Some(&expected_name)
+        {
+            return Err(WorkerError::Unsupported(
+                "Android bugreport path is outside the managed diagnostics directory",
+            ));
+        }
+        if output_path.exists() {
+            return Err(WorkerError::Busy(
+                "Android bugreport artifact already exists",
+            ));
+        }
+        hd_platform::ensure_owner_only_directory(directory)?;
+        let (adb, serial, run_id) = {
+            let mutable = self.mutable.lock().await;
+            if !mutable.adb_ready {
+                return Err(WorkerError::AdbNotReady);
+            }
+            if mutable
+                .active_spec
+                .as_ref()
+                .is_none_or(|spec| spec.guest_kind != GuestKindV2::Android)
+            {
+                return Err(WorkerError::Unsupported(
+                    "bugreport is only available for Android instances",
+                ));
+            }
+            (
+                mutable.adb.clone().ok_or(WorkerError::NotRunning)?,
+                mutable
+                    .status
+                    .adb_serial
+                    .clone()
+                    .ok_or(WorkerError::ReadinessUnavailable)?,
+                mutable.status.run_id.ok_or(WorkerError::NotRunning)?,
+            )
+        };
+        let result = adb.collect_android_bugreport(&serial, output_path).await;
+        let size_bytes = match result {
+            Ok(size_bytes) => size_bytes,
+            Err(error) => {
+                let _ = std::fs::remove_file(output_path);
+                return Err(error.into());
+            }
+        };
+        let sha256 = crate::sha256_file(output_path)
+            .map_err(|error| WorkerError::Task(format!("hash Android bugreport: {error}")))?;
+        Ok(AndroidBugreportRecordV2 {
+            id: bugreport_id,
+            instance_id: self.instance_id,
+            run_id,
+            path: output_path.to_owned(),
+            sha256,
+            size_bytes,
+            created_at: OffsetDateTime::now_utc(),
+            contains_sensitive_data: true,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn start_screen_recording(
+        &self,
+        recording_id: Uuid,
+        display_id: DisplayIdV2,
+        output_path: &Path,
+        max_duration_seconds: u16,
+    ) -> Result<ScreenRecordingStatusV2, WorkerError> {
+        let _operation = self.operation.lock().await;
+        if self.status().await.observed != ObservedStateV2::Ready {
+            return Err(WorkerError::NotReady);
+        }
+        let directory = self.paths.screen_recording_directory();
+        if output_path.parent() != Some(directory.as_path()) {
+            return Err(WorkerError::DisplaySession(
+                "screen recording path is outside the managed Videos/HD directory".to_owned(),
+            ));
+        }
+        hd_platform::ensure_owner_only_directory(&directory)?;
+        let scanout_id = {
+            let mutable = self.mutable.lock().await;
+            if mutable.active_screen_recording.is_some() {
+                return Err(WorkerError::Busy(
+                    "one screen recording is already active for this instance",
+                ));
+            }
+            if !mutable.adb_ready {
+                return Err(WorkerError::AdbNotReady);
+            }
+            if mutable
+                .active_spec
+                .as_ref()
+                .is_some_and(|spec| spec.guest_kind != GuestKindV2::Android)
+            {
+                return Err(WorkerError::Unsupported(
+                    "screen recording is only available for Android instances",
+                ));
+            }
+            mutable
+                .status
+                .runtime_displays
+                .iter()
+                .find(|display| display.display_id == display_id)
+                .map(|display| display.scanout_id)
+                .ok_or(WorkerError::Busy(
+                    "requested screen-recording display is not active in this Android run",
+                ))?
+        };
+        #[cfg(any(windows, target_os = "macos"))]
+        let backend = {
+            let endpoint = self
+                .mutable
+                .lock()
+                .await
+                .host_recorder_endpoint
+                .clone()
+                .ok_or_else(|| {
+                    WorkerError::HostRecorder(
+                        "gfxstream host-recorder endpoint is unavailable".to_owned(),
+                    )
+                })?;
+            ActiveScreenRecordingBackend::Host(
+                HostRecording::start(endpoint, scanout_id, output_path, max_duration_seconds)
+                    .await
+                    .map_err(WorkerError::HostRecorder)?,
+            )
+        };
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let backend = {
+            let (adb, serial) = {
+                let mutable = self.mutable.lock().await;
+                if !mutable.adb_ready {
+                    return Err(WorkerError::AdbNotReady);
+                }
+                (
+                    mutable.adb.clone().ok_or(WorkerError::NotRunning)?,
+                    mutable
+                        .status
+                        .adb_serial
+                        .clone()
+                        .ok_or(WorkerError::ReadinessUnavailable)?,
+                )
+            };
+            let process = adb
+                .start_screen_recording(&serial, recording_id, scanout_id, max_duration_seconds)
+                .await?;
+            ActiveScreenRecordingBackend::Guest {
+                adb,
+                serial,
+                process,
+            }
+        };
+        let status = ScreenRecordingStatusV2 {
+            id: recording_id,
+            instance_id: self.instance_id,
+            display_id,
+            max_duration_seconds,
+            started_at: OffsetDateTime::now_utc(),
+        };
+        let mut mutable = self.mutable.lock().await;
+        mutable.status.screen_recording = Some(status.clone());
+        mutable.active_screen_recording = Some(ActiveScreenRecording {
+            status: status.clone(),
+            output_path: output_path.to_owned(),
+            backend,
+            started: Instant::now(),
+        });
+        tracing::info!(
+            event = "worker.screen_recording.started",
+            instance_id = %self.instance_id,
+            %recording_id,
+            max_duration_seconds,
+            "Android screen recording started"
+        );
+        Ok(status)
+    }
+
+    async fn stop_screen_recording(
+        &self,
+        recording_id: Uuid,
+    ) -> Result<ScreenRecordingRecordV2, WorkerError> {
+        let _operation = self.operation.lock().await;
+        self.finish_active_screen_recording(Some(recording_id))
+            .await
+    }
+
+    async fn finish_active_screen_recording(
+        &self,
+        expected_id: Option<Uuid>,
+    ) -> Result<ScreenRecordingRecordV2, WorkerError> {
+        let mut active = {
+            let mut mutable = self.mutable.lock().await;
+            let active = mutable
+                .active_screen_recording
+                .take()
+                .ok_or(WorkerError::Busy("no screen recording is active"))?;
+            if expected_id.is_some_and(|id| id != active.status.id) {
+                mutable.active_screen_recording = Some(active);
+                return Err(WorkerError::Busy(
+                    "screen recording identity does not match the active recording",
+                ));
+            }
+            mutable.status.screen_recording = None;
+            active
+        };
+        match &mut active.backend {
+            #[cfg(not(any(windows, target_os = "macos")))]
+            ActiveScreenRecordingBackend::Guest {
+                adb,
+                serial,
+                process,
+            } => {
+                if let Err(error) = adb
+                    .finish_screen_recording(serial, process, &active.output_path)
+                    .await
+                {
+                    let _ = std::fs::remove_file(&active.output_path);
+                    return Err(WorkerError::Adb(error));
+                }
+            }
+            #[cfg(any(windows, target_os = "macos"))]
+            ActiveScreenRecordingBackend::Host(recording) => {
+                let stats = match recording.clone().finish().await {
+                    Ok(stats) => stats,
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&active.output_path);
+                        return Err(WorkerError::HostRecorder(error));
+                    }
+                };
+                tracing::info!(
+                    event = "worker.screen_recording.host_stats",
+                    instance_id = %self.instance_id,
+                    recording_id = %active.status.id,
+                    encoded_frames = stats.encoded_frames,
+                    dropped_frames = stats.dropped_frames,
+                    initial_static_frame = stats.initial_static_frame,
+                    initial_frame_y_direction = stats.initial_frame_y_direction,
+                    near_black_frames = stats.near_black_frames,
+                    max_consecutive_near_black_frames =
+                        stats.max_consecutive_near_black_frames,
+                    max_source_frame_gap_millis = stats.max_source_frame_gap_millis,
+                    source_frame_gaps_over_100_millis =
+                        stats.source_frame_gaps_over_100_millis,
+                    "gfxstream host recording finalized"
+                );
+            }
+        }
+        let (size_bytes, sha256) = match validate_screen_recording_mp4(&active.output_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let _ = std::fs::remove_file(&active.output_path);
+                return Err(error);
+            }
+        };
+        let record = ScreenRecordingRecordV2 {
+            id: active.status.id,
+            instance_id: self.instance_id,
+            display_id: active.status.display_id,
+            path: active.output_path,
+            sha256,
+            size_bytes,
+            duration_millis: u64::try_from(active.started.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
+            started_at: active.status.started_at,
+            finished_at: OffsetDateTime::now_utc(),
+        };
+        self.mutable.lock().await.status.last_screen_recording = Some(record.clone());
+        tracing::info!(
+            event = "worker.screen_recording.finished",
+            instance_id = %self.instance_id,
+            recording_id = %record.id,
+            size_bytes = record.size_bytes,
+            duration_millis = record.duration_millis,
+            "Android screen recording finished"
+        );
+        Ok(record)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn stop(&self, mode: StopModeV2, graceful_timeout: Duration) -> Result<(), WorkerError> {
         let _operation = self.operation.lock().await;
+        self.stop_locked(mode, graceful_timeout, None).await
+    }
+
+    async fn stop_after_microdroid_completion(
+        &self,
+        payload_exit_code: i32,
+    ) -> Result<(), WorkerError> {
+        let _operation = self.operation.lock().await;
+        if !self.status().await.observed.is_active() {
+            return Ok(());
+        }
+        self.stop_locked(StopModeV2::Force, Duration::ZERO, Some(payload_exit_code))
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn stop_locked(
+        &self,
+        mode: StopModeV2,
+        graceful_timeout: Duration,
+        completed_exit_code: Option<i32>,
+    ) -> Result<(), WorkerError> {
+        // Stop owns the display pipeline until the child is gone; otherwise a late heartbeat or
+        // deferred startup attach could reparent the render HWND during shutdown.
+        let _display_operation = self.display_operation.lock().await;
         let status = self.status().await;
         if matches!(status.observed, ObservedStateV2::Stopped) {
             return Ok(());
         }
         if matches!(status.observed, ObservedStateV2::Deleted) {
             return Err(WorkerError::Busy("deleted worker cannot be stopped"));
+        }
+        let graceful_shutdown_available = {
+            let mutable = self.mutable.lock().await;
+            let guest_kind = mutable
+                .active_spec
+                .as_ref()
+                .map_or(GuestKindV2::Android, |spec| spec.guest_kind);
+            microdroid_graceful_shutdown_available(
+                guest_kind,
+                mutable.adb_ready,
+                mutable.adb.is_some(),
+                mutable
+                    .launch
+                    .as_ref()
+                    .is_some_and(|launch| launch.adb_serial.is_some()),
+            )
+        };
+        if matches!(mode, StopModeV2::Graceful)
+            && matches!(
+                status.observed,
+                ObservedStateV2::Ready | ObservedStateV2::Paused
+            )
+            && !graceful_shutdown_available
+        {
+            return Err(WorkerError::Unsupported(
+                "Microdroid graceful shutdown requires a ready ADB service; use explicit force stop",
+            ));
         }
         let was_failed = matches!(
             status.observed,
@@ -2019,18 +2989,46 @@ impl WorkerService {
                 next: ObservedStateV2::Stopping,
             });
         }
+        let display_target = self
+            .mutable
+            .lock()
+            .await
+            .display_session
+            .as_ref()
+            .map(|session| session.target.clone());
         if let Some(child_pid) = status.child_pid
-            && self.mutable.lock().await.display_session.is_some()
+            && let Some(target) = display_target.as_ref()
         {
-            let _ = hd_platform::detach_native_display(child_pid);
+            let _ = hd_platform::detach_native_display(child_pid, target);
         }
-        let (process, backend, launch, adb) = {
+        if self.mutable.lock().await.active_screen_recording.is_some()
+            && let Err(error) = self.finish_active_screen_recording(None).await
+        {
+            tracing::warn!(
+                event = "worker.screen_recording.stop_cleanup.failed",
+                instance_id = %self.instance_id,
+                %error,
+                "instance stop continued after screen recording cleanup failed"
+            );
+        }
+        if self.mutable.lock().await.active_location_route.is_some()
+            && let Err(error) = self.stop_location_route(false).await
+        {
+            tracing::warn!(
+                event = "worker.location_route.stop_cleanup.failed",
+                instance_id = %self.instance_id,
+                %error,
+                "instance stop continued after location route cleanup failed"
+            );
+        }
+        let (process, backend, launch, adb, guest_kind) = {
             let mut mutable = self.mutable.lock().await;
             (
                 mutable.process.take(),
                 mutable.backend.clone(),
                 mutable.launch.clone(),
                 mutable.adb.clone(),
+                mutable.active_spec.as_ref().map(|spec| spec.guest_kind),
             )
         };
         let mut retained_process = None;
@@ -2038,19 +3036,24 @@ impl WorkerService {
         if let Some(mut process) = process {
             let mut exited = false;
             if matches!(mode, StopModeV2::Graceful)
-                && let (Some(backend), Some(launch)) = (&backend, &launch)
+                && let Some(launch) = &launch
             {
                 let adb_poweroff_requested = if let (Some(adb), Some(serial)) =
                     (&adb, launch.adb_serial.as_deref())
                 {
-                    match adb.power_off(serial).await {
+                    let power_off = if matches!(guest_kind, Some(GuestKindV2::Microdroid)) {
+                        adb.power_off_debuggable(serial).await
+                    } else {
+                        adb.power_off(serial).await
+                    };
+                    match power_off {
                         Ok(()) => true,
                         Err(error) => {
                             tracing::warn!(
                                 event = "worker.stop.adb_power_off.failed",
                                 instance_id = %self.instance_id,
                                 %error,
-                                "Android power-off request failed; falling back to crosvm power button"
+                                "Guest ADB power-off request failed; falling back to crosvm power button"
                             );
                             false
                         }
@@ -2060,8 +3063,12 @@ impl WorkerService {
                 };
                 let power_requested = if adb_poweroff_requested {
                     Ok(())
-                } else {
+                } else if let Some(backend) = &backend {
                     backend.power_button(&launch.control_endpoint).await
+                } else {
+                    Err(hd_platform::PlatformError::Process(
+                        "guest has no graceful power control backend".to_owned(),
+                    ))
                 };
                 match power_requested {
                     Ok(()) => {
@@ -2130,6 +3137,21 @@ impl WorkerService {
         {
             cleanup_error = Some(error);
         }
+        if let (Some(adb), Some(serial)) = (
+            &adb,
+            launch
+                .as_ref()
+                .and_then(|launch| launch.adb_serial.as_deref()),
+        ) && let Err(error) = adb.disconnect(serial).await
+        {
+            tracing::warn!(
+                event = "worker.stop.adb_disconnect.failed",
+                instance_id = %self.instance_id,
+                %serial,
+                %error,
+                "instance cleanup succeeded but the ADB server retained its transport"
+            );
+        }
 
         if let Some(error) = cleanup_error {
             {
@@ -2147,10 +3169,23 @@ impl WorkerService {
             return Err(error);
         }
 
+        if !was_failed
+            && completed_exit_code.is_some()
+            && let Err(error) = self
+                .finish_run(ObservedStateV2::Stopped, completed_exit_code, None)
+                .await
+        {
+            self.transition(ObservedStateV2::Failed, Some(&error))
+                .await?;
+            return Err(error);
+        }
         self.transition(ObservedStateV2::Stopped, None).await?;
         if !was_failed {
-            self.finish_run(ObservedStateV2::Stopped, None, None)
-                .await?;
+            if completed_exit_code.is_none() {
+                self.finish_run(ObservedStateV2::Stopped, None, None)
+                    .await?;
+            }
+            self.remove_finished_run_ephemeral_artifacts().await?;
         }
         let mut mutable = self.mutable.lock().await;
         mutable.status.run_id = None;
@@ -2158,12 +3193,23 @@ impl WorkerService {
         mutable.status.cleanup_pending = false;
         mutable.status.adb_serial = None;
         mutable.status.last_error = None;
+        mutable.status.runtime_displays.clear();
         mutable.active_spec = None;
         mutable.backend = None;
         mutable.launch = None;
         mutable.adb = None;
         mutable.adb_ready = false;
         mutable.display_session = None;
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            mutable.host_recorder_endpoint = None;
+        }
+        mutable.active_screen_recording = None;
+        mutable.active_location_route = None;
+        mutable.status.uwb_ranging = None;
+        mutable.status.modem_state = None;
+        mutable.status.sensor_pose = None;
+        mutable.status.bluetooth_peers.clear();
         mutable.components.clear();
         mutable.device_control_tokens.clear();
         mutable.journal = None;
@@ -2171,6 +3217,10 @@ impl WorkerService {
         mutable.device_output_files.clear();
         #[cfg(unix)]
         mutable.device_input_fifos.clear();
+        #[cfg(unix)]
+        {
+            mutable.microdroid_console_challenge = None;
+        }
         Ok(())
     }
 
@@ -2179,6 +3229,19 @@ impl WorkerService {
         if self.status().await.observed != ObservedStateV2::Ready {
             return Err(WorkerError::Busy("pause requires Ready"));
         }
+        if self
+            .mutable
+            .lock()
+            .await
+            .active_spec
+            .as_ref()
+            .is_some_and(|spec| spec.guest_kind == GuestKindV2::Microdroid)
+        {
+            return Err(WorkerError::Unsupported(
+                "pause is not available for Microdroid instances",
+            ));
+        }
+        let route_was_playing = self.pause_location_route_for_instance().await?;
         self.transition(ObservedStateV2::Pausing, None).await?;
         let (backend, endpoint) = self.backend_control().await?;
         if let Err(error) = backend
@@ -2186,6 +3249,9 @@ impl WorkerService {
             .await
             .map_err(WorkerError::Platform)
         {
+            if route_was_playing {
+                let _ = self.resume_location_route_for_instance().await;
+            }
             self.transition(ObservedStateV2::Ready, Some(&error))
                 .await?;
             return Err(error);
@@ -2198,6 +3264,18 @@ impl WorkerService {
         if self.status().await.observed != ObservedStateV2::Paused {
             return Err(WorkerError::Busy("resume requires Paused"));
         }
+        if self
+            .mutable
+            .lock()
+            .await
+            .active_spec
+            .as_ref()
+            .is_some_and(|spec| spec.guest_kind == GuestKindV2::Microdroid)
+        {
+            return Err(WorkerError::Unsupported(
+                "resume is not available for Microdroid instances",
+            ));
+        }
         self.transition(ObservedStateV2::Resuming, None).await?;
         let (backend, endpoint) = self.backend_control().await?;
         if let Err(error) = backend
@@ -2209,45 +3287,283 @@ impl WorkerService {
                 .await?;
             return Err(error);
         }
-        self.transition(ObservedStateV2::Ready, None).await
+        self.transition(ObservedStateV2::Ready, None).await?;
+        self.resume_location_route_for_instance().await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn reconfigure(
         &self,
         display: hd_core::DisplayConfigV2,
         adb_config: hd_core::AdbConfigV2,
     ) -> Result<(), WorkerError> {
         let _operation = self.operation.lock().await;
-        let (mut spec, adb, serial) = {
+        let (
+            mut spec,
+            adb,
+            serial,
+            backend,
+            control_endpoint,
+            runtime_displays,
+            selected_display,
+            recording_active,
+        ) = {
             let mutable = self.mutable.lock().await;
             (
                 mutable.active_spec.clone().ok_or(WorkerError::NotRunning)?,
                 mutable.adb_ready.then(|| mutable.adb.clone()).flatten(),
                 mutable.status.adb_serial.clone(),
+                mutable.backend.clone().ok_or(WorkerError::NotRunning)?,
+                mutable
+                    .launch
+                    .as_ref()
+                    .map(|launch| launch.control_endpoint.clone())
+                    .ok_or(WorkerError::NotRunning)?,
+                mutable.status.runtime_displays.clone(),
+                mutable
+                    .display_session
+                    .as_ref()
+                    .map(|session| session.display_id),
+                mutable.active_screen_recording.is_some(),
             )
         };
         if display == spec.display && adb_config == spec.adb {
             return Ok(());
         }
-        let mut restart_display = spec.display.clone();
-        restart_display.orientation = display.orientation;
-        if display != restart_display || adb_config != spec.adb {
+        let mut live_display = spec.display.clone();
+        live_display.orientation = display.orientation;
+        live_display.show_host_fps = display.show_host_fps;
+        live_display
+            .secondary_displays
+            .clone_from(&display.secondary_displays);
+        if display != live_display || adb_config != spec.adb {
             return Err(WorkerError::RestartRequired);
         }
+        let mut next_spec = spec.clone();
+        next_spec.display.clone_from(&display);
+        next_spec.adb.clone_from(&adb_config);
+        next_spec.validate()?;
+
         let previous = spec.display.clone();
-        if display.orientation != previous.orientation
-            && let (Some(adb), Some(serial)) = (&adb, serial.as_deref())
-            && let Err(error) = adb.set_display_configuration(serial, &display).await
+        let secondary_changed = display.secondary_displays != previous.secondary_displays;
+        if secondary_changed && self.status().await.observed != ObservedStateV2::Ready {
+            return Err(WorkerError::Busy(
+                "runtime display hotplug requires a Ready Android instance",
+            ));
+        }
+        let current_by_id = previous
+            .secondary_displays
+            .iter()
+            .map(|secondary| (secondary.id, secondary.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let next_by_id = display
+            .secondary_displays
+            .iter()
+            .map(|secondary| (secondary.id, secondary.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let scanout_by_id = runtime_displays
+            .iter()
+            .filter_map(|runtime| match runtime.display_id {
+                DisplayIdV2::Primary => None,
+                DisplayIdV2::Secondary { id } => Some((id, runtime.scanout_id)),
+            })
+            .collect::<BTreeMap<_, _>>();
+        if current_by_id
+            .keys()
+            .any(|display_id| !scanout_by_id.contains_key(display_id))
         {
-            return Err(WorkerError::Adb(error));
+            return Err(WorkerError::DisplaySession(
+                "active runtime display mapping does not match the saved instance specification"
+                    .to_owned(),
+            ));
+        }
+
+        let removed = current_by_id
+            .iter()
+            .filter(|(id, _)| !next_by_id.contains_key(id))
+            .map(|(id, secondary)| {
+                Ok((
+                    *scanout_by_id.get(id).ok_or_else(|| {
+                        WorkerError::DisplaySession(
+                            "removed display has no active scanout mapping".to_owned(),
+                        )
+                    })?,
+                    secondary.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, WorkerError>>()?;
+        let changed = current_by_id
+            .iter()
+            .filter_map(|(id, current)| {
+                next_by_id.get(id).and_then(|next| {
+                    (current != next).then(|| {
+                        scanout_by_id
+                            .get(id)
+                            .copied()
+                            .map(|scanout_id| (scanout_id, current.clone(), next.clone()))
+                    })
+                })
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        let added = display
+            .secondary_displays
+            .iter()
+            .filter(|secondary| !current_by_id.contains_key(&secondary.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let guest_display_changed = !removed.is_empty()
+            || !added.is_empty()
+            || changed
+                .iter()
+                .any(|(_, current, next)| secondary_display_geometry_changed(current, next));
+        if guest_display_changed && recording_active {
+            return Err(WorkerError::Busy(
+                "stop screen recording before changing runtime displays",
+            ));
+        }
+        if guest_display_changed && (adb.is_none() || serial.is_none()) {
+            return Err(WorkerError::AdbNotReady);
+        }
+
+        let selected_is_removed = selected_display.is_some_and(|selected| {
+            removed
+                .iter()
+                .any(|(_, secondary)| selected == DisplayIdV2::Secondary { id: secondary.id })
+        });
+        let selected_geometry_changes = selected_display.is_some_and(|selected| {
+            changed.iter().any(|(_, current, next)| {
+                selected == DisplayIdV2::Secondary { id: current.id }
+                    && secondary_display_geometry_changed(current, next)
+            })
+        });
+        if selected_is_removed || selected_geometry_changes {
+            return Err(WorkerError::Busy(
+                "switch Player to another display before removing or resizing the selected display",
+            ));
+        }
+
+        let mut removed_applied = Vec::new();
+        let mut changed_applied = Vec::new();
+        let mut added_applied = Vec::new();
+        let mut used_scanouts = scanout_by_id.values().copied().collect::<BTreeSet<_>>();
+        let transaction = async {
+            for (scanout_id, secondary) in &removed {
+                backend
+                    .remove_display(&control_endpoint, *scanout_id)
+                    .await?;
+                used_scanouts.remove(scanout_id);
+                removed_applied.push((*scanout_id, secondary.clone()));
+            }
+            for (scanout_id, current, next) in &changed {
+                if secondary_display_geometry_changed(current, next) {
+                    backend
+                        .replace_secondary_display(&control_endpoint, *scanout_id, next)
+                        .await?;
+                    changed_applied.push((*scanout_id, current.clone()));
+                }
+            }
+            for secondary in &added {
+                let scanout_id = (1..=u32::try_from(MAX_SECONDARY_DISPLAYS)
+                    .expect("bounded display capacity"))
+                    .find(|scanout_id| !used_scanouts.contains(scanout_id))
+                    .ok_or_else(|| {
+                        WorkerError::DisplaySession(
+                            "no free secondary display scanout is available".to_owned(),
+                        )
+                    })?;
+                backend
+                    .add_secondary_display(&control_endpoint, scanout_id, secondary)
+                    .await?;
+                used_scanouts.insert(scanout_id);
+                added_applied.push((scanout_id, secondary.clone()));
+            }
+
+            let added_scanouts = added_applied
+                .iter()
+                .map(|(scanout_id, secondary)| (secondary.id, *scanout_id))
+                .collect::<BTreeMap<_, _>>();
+            let mut next_runtime = runtime_displays
+                .iter()
+                .filter(|runtime| runtime.display_id == DisplayIdV2::Primary)
+                .cloned()
+                .collect::<Vec<_>>();
+            for secondary in &display.secondary_displays {
+                let scanout_id = scanout_by_id
+                    .get(&secondary.id)
+                    .or_else(|| added_scanouts.get(&secondary.id))
+                    .copied()
+                    .ok_or_else(|| {
+                        WorkerError::DisplaySession(
+                            "hotplugged display has no stable scanout mapping".to_owned(),
+                        )
+                    })?;
+                next_runtime.push(runtime_display_for_secondary(secondary, scanout_id));
+            }
+
+            if let (Some(adb), Some(serial)) = (&adb, serial.as_deref()) {
+                if guest_display_changed {
+                    tokio::time::sleep(ANDROID_DISPLAY_HOTPLUG_SETTLE_DELAY).await;
+                    for runtime in next_runtime.iter().skip(1) {
+                        adb.set_display_density(serial, runtime.scanout_id * 2, runtime.dpi)
+                            .await?;
+                    }
+                }
+                if display.orientation != previous.orientation {
+                    adb.set_display_configuration_orientation(serial, &display)
+                        .await?;
+                }
+            }
+            Ok::<_, WorkerError>(next_runtime)
+        }
+        .await;
+
+        let next_runtime = match transaction {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let rollback = rollback_secondary_display_transaction(
+                    &backend,
+                    &control_endpoint,
+                    &added_applied,
+                    &removed_applied,
+                    &changed_applied,
+                )
+                .await;
+                if let (Some(adb), Some(serial)) = (&adb, serial.as_deref()) {
+                    for runtime in runtime_displays.iter().skip(1) {
+                        let _ = adb
+                            .set_display_density(serial, runtime.scanout_id * 2, runtime.dpi)
+                            .await;
+                    }
+                    if display.orientation != previous.orientation {
+                        let _ = adb
+                            .set_display_configuration_orientation(serial, &previous)
+                            .await;
+                    }
+                }
+                if let Err(rollback_error) = rollback {
+                    return Err(WorkerError::Platform(hd_platform::PlatformError::Vm(
+                        format!(
+                            "runtime display reconfiguration failed ({error}); rollback also failed ({rollback_error})"
+                        ),
+                    )));
+                }
+                return Err(error);
+            }
+        };
+
+        if display.orientation != previous.orientation && (adb.is_none() || serial.is_none()) {
+            return Err(WorkerError::AdbNotReady);
         }
         spec.display = display;
-        self.mutable.lock().await.active_spec = Some(spec);
+        let mut mutable = self.mutable.lock().await;
+        mutable.active_spec = Some(spec);
+        mutable.status.runtime_displays = next_runtime;
         Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn action(&self, action: InstanceActionV2) -> Result<(), WorkerError> {
+    async fn action(self: &Arc<Self>, action: InstanceActionV2) -> Result<(), WorkerError> {
         action.validate()?;
         if self.status().await.observed != ObservedStateV2::Ready {
             return Err(WorkerError::NotReady);
@@ -2255,21 +3571,125 @@ impl WorkerService {
         match action {
             InstanceActionV2::Key { key } => {
                 if key == KeyActionV2::Power {
-                    // Match Android's ADB KEYCODE_POWER semantics through the always-connected
-                    // virtio keyboard. The crosvm powerbtn control is unsupported by HVF, while
-                    // KEY_POWER must remain available when ADB is connecting or reconnecting.
-                    let (backend, keyboard_endpoint) = {
+                    // Prefer the same Android framework keyevent path as every other toolbar key.
+                    // If ADB readiness is still converging, use the platform adapter's supported
+                    // native path: Windows crosvm powerbtn or the Unix virtio keyboard endpoint.
+                    let (adb_target, platform_target) = {
                         let mutable = self.mutable.lock().await;
-                        (
-                            mutable.backend.clone().ok_or(WorkerError::NotRunning)?,
-                            mutable
-                                .launch
-                                .as_ref()
-                                .map(|plan| plan.keyboard_endpoint.clone())
-                                .ok_or(WorkerError::NotRunning)?,
-                        )
+                        if mutable.adb_ready {
+                            (
+                                Some((
+                                    mutable
+                                        .adb
+                                        .clone()
+                                        .ok_or(WorkerError::ReadinessUnavailable)?,
+                                    mutable
+                                        .status
+                                        .adb_serial
+                                        .clone()
+                                        .ok_or(WorkerError::ReadinessUnavailable)?,
+                                )),
+                                None,
+                            )
+                        } else {
+                            let launch = mutable.launch.as_ref().ok_or(WorkerError::NotRunning)?;
+                            (
+                                None,
+                                Some((
+                                    mutable.backend.clone().ok_or(WorkerError::NotRunning)?,
+                                    launch.keyboard_endpoint.clone(),
+                                    launch.control_endpoint.clone(),
+                                )),
+                            )
+                        }
                     };
-                    backend.send_key(&keyboard_endpoint, key).await?;
+                    if let Some((adb, serial)) = adb_target {
+                        tracing::info!(
+                            event = "worker.key.power.started",
+                            instance_id = %self.instance_id,
+                            transport = "adb",
+                            "delivering Android power key"
+                        );
+                        match adb.send_key(&serial, key).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    event = "worker.key.power.succeeded",
+                                    instance_id = %self.instance_id,
+                                    transport = "adb",
+                                    "Android power key delivered"
+                                );
+                            }
+                            Err(error) if error.is_definitively_unavailable() => {
+                                tracing::warn!(
+                                    event = "worker.adb.stale",
+                                    instance_id = %self.instance_id,
+                                    %error,
+                                    "ADB transport is definitively unavailable; clearing stale readiness"
+                                );
+                                let (backend, keyboard_endpoint, control_endpoint) = {
+                                    let mut mutable = self.mutable.lock().await;
+                                    mutable.adb_ready = false;
+                                    mutable.status.adb_ready = false;
+                                    let launch =
+                                        mutable.launch.as_ref().ok_or(WorkerError::NotRunning)?;
+                                    (
+                                        mutable.backend.clone().ok_or(WorkerError::NotRunning)?,
+                                        launch.keyboard_endpoint.clone(),
+                                        launch.control_endpoint.clone(),
+                                    )
+                                };
+                                backend
+                                    .send_power_key(&keyboard_endpoint, &control_endpoint)
+                                    .await
+                                    .map_err(WorkerError::Platform)?;
+                                tracing::info!(
+                                    event = "worker.key.power.succeeded",
+                                    instance_id = %self.instance_id,
+                                    transport = "platform_recovery",
+                                    adb_error = %error,
+                                    "Android power key delivered after definitive ADB transport loss"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    event = "worker.key.power.failed",
+                                    instance_id = %self.instance_id,
+                                    transport = "adb",
+                                    %error,
+                                    "Android power key delivery failed without safe fallback"
+                                );
+                                return Err(WorkerError::Adb(error));
+                            }
+                        }
+                    } else if let Some((backend, keyboard_endpoint, control_endpoint)) =
+                        platform_target
+                    {
+                        tracing::info!(
+                            event = "worker.key.power.started",
+                            instance_id = %self.instance_id,
+                            transport = "platform_fallback",
+                            "delivering Android power key"
+                        );
+                        backend
+                            .send_power_key(&keyboard_endpoint, &control_endpoint)
+                            .await
+                            .map_err(|error| {
+                                tracing::warn!(
+                                    event = "worker.key.power.failed",
+                                    instance_id = %self.instance_id,
+                                    transport = "platform_fallback",
+                                    %error,
+                                    "Android power key delivery failed"
+                                );
+                                WorkerError::Platform(error)
+                            })?;
+                        tracing::info!(
+                            event = "worker.key.power.succeeded",
+                            instance_id = %self.instance_id,
+                            transport = "platform_fallback",
+                            "Android power key delivered"
+                        );
+                    }
                 } else {
                     let (adb, serial) = {
                         let mutable = self.mutable.lock().await;
@@ -2290,6 +3710,27 @@ impl WorkerService {
                     };
                     adb.send_key(&serial, key).await?;
                 }
+            }
+            InstanceActionV2::Trackpad { event } => {
+                let (backend, endpoint) = {
+                    let mutable = self.mutable.lock().await;
+                    let spec = mutable
+                        .active_spec
+                        .as_ref()
+                        .ok_or(WorkerError::NotRunning)?;
+                    if spec.guest_kind != GuestKindV2::Android || !spec.devices.touchpad {
+                        return Err(WorkerError::DeviceActionUnsupported("touchpad is disabled"));
+                    }
+                    let launch = mutable.launch.as_ref().ok_or(WorkerError::NotRunning)?;
+                    (
+                        mutable.backend.clone().ok_or(WorkerError::NotRunning)?,
+                        launch
+                            .trackpad_endpoint
+                            .clone()
+                            .ok_or(WorkerError::NotRunning)?,
+                    )
+                };
+                backend.send_trackpad(&endpoint, event).await?;
             }
             InstanceActionV2::Rotate { orientation } => {
                 let (adb, serial, mut display) = {
@@ -2316,7 +3757,8 @@ impl WorkerService {
                     )
                 };
                 display.orientation = orientation;
-                adb.set_display_configuration(&serial, &display).await?;
+                adb.set_display_configuration_orientation(&serial, &display)
+                    .await?;
                 self.mutable
                     .lock()
                     .await
@@ -2327,6 +3769,7 @@ impl WorkerService {
                     .orientation = orientation;
             }
             InstanceActionV2::SetLocation { location } => {
+                self.stop_location_route(false).await?;
                 self.call_device_component(
                     "hd-device-sim",
                     DeviceControlCommandV2::Action {
@@ -2336,27 +3779,20 @@ impl WorkerService {
                     },
                 )
                 .await?;
-                #[cfg(target_os = "macos")]
-                {
-                    let (adb, serial) = {
-                        let mutable = self.mutable.lock().await;
-                        if !mutable.adb_ready {
-                            return Err(WorkerError::AdbNotReady);
-                        }
-                        (
-                            mutable
-                                .adb
-                                .clone()
-                                .ok_or(WorkerError::ReadinessUnavailable)?,
-                            mutable
-                                .status
-                                .adb_serial
-                                .clone()
-                                .ok_or(WorkerError::ReadinessUnavailable)?,
-                        )
-                    };
-                    adb.set_location(&serial, &location).await?;
-                }
+            }
+            InstanceActionV2::StartLocationRoute { route } => {
+                self.start_location_route(route).await?;
+            }
+            InstanceActionV2::PauseLocationRoute => {
+                self.set_location_route_control(LocationRouteControl::Paused)
+                    .await?;
+            }
+            InstanceActionV2::ResumeLocationRoute => {
+                self.set_location_route_control(LocationRouteControl::Playing)
+                    .await?;
+            }
+            InstanceActionV2::StopLocationRoute => {
+                self.stop_location_route(true).await?;
             }
             InstanceActionV2::SetBattery { battery } => {
                 self.call_device_component(
@@ -2417,6 +3853,14 @@ impl WorkerService {
                 adb.set_network_condition(&serial, &condition).await?;
             }
             InstanceActionV2::InjectSensor { injection } => {
+                #[cfg(any(target_os = "macos", windows))]
+                {
+                    let _ = injection;
+                    return Err(WorkerError::Unsupported(
+                        "this Android 15 profile exposes AOSP three-axis motion injection, not independent or timed sensor overrides",
+                    ));
+                }
+                #[cfg(not(any(target_os = "macos", windows)))]
                 self.call_device_component(
                     "hd-device-sim",
                     DeviceControlCommandV2::Action {
@@ -2426,7 +3870,7 @@ impl WorkerService {
                     },
                 )
                 .await?;
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", windows)))]
                 {
                     let (adb, serial) = {
                         let mutable = self.mutable.lock().await;
@@ -2448,55 +3892,552 @@ impl WorkerService {
                     adb.inject_sensor(&serial, &injection).await?;
                 }
             }
-            InstanceActionV2::BluetoothPeer { action: _action } => {
-                #[cfg(target_os = "macos")]
+            InstanceActionV2::SetSensorPose { pose } => {
                 {
-                    tracing::warn!(
-                        event = "worker.device.action.unsupported",
-                        error_code = "device_action_unsupported",
-                        instance_id = %self.instance_id,
-                        device = "bluetooth",
-                        action = "bluetooth_peer",
-                        "macOS Bluetooth exposes the Android software surface without host peer injection"
-                    );
-                    return Err(WorkerError::DeviceActionUnsupported(
-                        "bluetooth host peer injection is unavailable on macOS",
-                    ));
+                    let (adb, serial, previous) = {
+                        let mutable = self.mutable.lock().await;
+                        if !mutable.adb_ready {
+                            return Err(WorkerError::AdbNotReady);
+                        }
+                        (
+                            mutable
+                                .adb
+                                .clone()
+                                .ok_or(WorkerError::ReadinessUnavailable)?,
+                            mutable
+                                .status
+                                .adb_serial
+                                .clone()
+                                .ok_or(WorkerError::ReadinessUnavailable)?,
+                            mutable.status.sensor_pose.unwrap_or_default(),
+                        )
+                    };
+                    adb.inject_sensor_pose(&serial, hd_core::sensor_motion_frame(previous, pose))
+                        .await?;
                 }
-                #[cfg(not(target_os = "macos"))]
+                self.call_device_component(
+                    "hd-device-sim",
+                    DeviceControlCommandV2::Action {
+                        action: InstanceActionV2::SetSensorPose { pose },
+                    },
+                )
+                .await?;
+                self.mutable.lock().await.status.sensor_pose = Some(pose);
+            }
+            InstanceActionV2::BluetoothPeer { action } => {
                 self.call_device_component(
                     "rootcanal-adapter",
                     DeviceControlCommandV2::Action {
-                        action: InstanceActionV2::BluetoothPeer { action: _action },
+                        action: InstanceActionV2::BluetoothPeer {
+                            action: action.clone(),
+                        },
                     },
                 )
                 .await?;
-            }
-            InstanceActionV2::NfcTag { action: _action } => {
-                #[cfg(target_os = "macos")]
+                let capture_record = if let BluetoothPeerActionV2::CaptureHci {
+                    capture_id,
+                    duration_ms,
+                } = &action
                 {
-                    tracing::warn!(
-                        event = "worker.device.action.unsupported",
-                        error_code = "device_action_unsupported",
-                        instance_id = %self.instance_id,
-                        device = "nfc",
-                        action = "nfc_tag",
-                        "macOS NFC exposes the Android software surface without host tag injection"
-                    );
-                    return Err(WorkerError::DeviceActionUnsupported(
-                        "NFC host tag injection is unavailable on macOS",
-                    ));
+                    let run_dir = self
+                        .mutable
+                        .lock()
+                        .await
+                        .journal
+                        .as_ref()
+                        .map(|journal| journal.run_dir().to_owned())
+                        .ok_or(WorkerError::NotRunning)?;
+                    Some(read_bluetooth_hci_capture_record(
+                        &run_dir,
+                        *capture_id,
+                        *duration_ms,
+                    )?)
+                } else {
+                    None
+                };
+                let mut mutable = self.mutable.lock().await;
+                match action {
+                    BluetoothPeerActionV2::CreateGattPeer { peer_id, name } => {
+                        mutable.status.bluetooth_peers.push(BluetoothPeerStateV2 {
+                            peer_id,
+                            name,
+                            kind: BluetoothPeerKindV2::Gatt,
+                            advertising: true,
+                            scripted_frame_count: None,
+                            repeat: false,
+                            keyboard_reports_sent: 0,
+                        });
+                    }
+                    BluetoothPeerActionV2::CreateBeacon { peer_id, name, .. } => {
+                        mutable.status.bluetooth_peers.push(BluetoothPeerStateV2 {
+                            peer_id,
+                            name,
+                            kind: BluetoothPeerKindV2::Beacon,
+                            advertising: true,
+                            scripted_frame_count: None,
+                            repeat: false,
+                            keyboard_reports_sent: 0,
+                        });
+                    }
+                    BluetoothPeerActionV2::CreateScriptedBeacon {
+                        peer_id,
+                        name,
+                        frames,
+                        repeat,
+                    } => {
+                        mutable.status.bluetooth_peers.push(BluetoothPeerStateV2 {
+                            peer_id,
+                            name,
+                            kind: BluetoothPeerKindV2::ScriptedBeacon,
+                            advertising: true,
+                            scripted_frame_count: u16::try_from(frames.len()).ok(),
+                            repeat,
+                            keyboard_reports_sent: 0,
+                        });
+                    }
+                    BluetoothPeerActionV2::CreateHidKeyboard { peer_id, name } => {
+                        mutable.status.bluetooth_peers.push(BluetoothPeerStateV2 {
+                            peer_id,
+                            name,
+                            kind: BluetoothPeerKindV2::HidKeyboard,
+                            advertising: true,
+                            scripted_frame_count: None,
+                            repeat: false,
+                            keyboard_reports_sent: 0,
+                        });
+                    }
+                    BluetoothPeerActionV2::SendHidKeyboardReport { peer_id, .. } => {
+                        if let Some(peer) = mutable
+                            .status
+                            .bluetooth_peers
+                            .iter_mut()
+                            .find(|peer| peer.peer_id == peer_id)
+                        {
+                            peer.keyboard_reports_sent =
+                                peer.keyboard_reports_sent.saturating_add(1);
+                        }
+                    }
+                    BluetoothPeerActionV2::RemovePeer { peer_id } => {
+                        mutable
+                            .status
+                            .bluetooth_peers
+                            .retain(|peer| peer.peer_id != peer_id);
+                    }
+                    BluetoothPeerActionV2::SetAdvertising { peer_id, enabled } => {
+                        if let Some(peer) = mutable
+                            .status
+                            .bluetooth_peers
+                            .iter_mut()
+                            .find(|peer| peer.peer_id == peer_id)
+                        {
+                            peer.advertising = enabled;
+                        }
+                    }
+                    BluetoothPeerActionV2::CaptureHci { .. } => {
+                        mutable.status.last_bluetooth_hci_capture = capture_record;
+                    }
                 }
-                #[cfg(not(target_os = "macos"))]
+            }
+            InstanceActionV2::NfcTag { action } => {
                 self.call_device_component(
                     "casimir-adapter",
                     DeviceControlCommandV2::Action {
-                        action: InstanceActionV2::NfcTag { action: _action },
+                        action: InstanceActionV2::NfcTag { action },
                     },
                 )
                 .await?;
             }
+            InstanceActionV2::SetUwbRanging { ranging } => {
+                self.call_device_component(
+                    "uwb-adapter",
+                    DeviceControlCommandV2::Action {
+                        action: InstanceActionV2::SetUwbRanging { ranging },
+                    },
+                )
+                .await?;
+                self.mutable.lock().await.status.uwb_ranging = Some(ranging);
+            }
+            InstanceActionV2::SetModemState { modem } => {
+                self.call_device_component(
+                    "modem-adapter",
+                    DeviceControlCommandV2::Action {
+                        action: InstanceActionV2::SetModemState {
+                            modem: modem.clone(),
+                        },
+                    },
+                )
+                .await?;
+                self.mutable.lock().await.status.modem_state = Some(modem);
+            }
+            InstanceActionV2::MicrodroidConsoleChallenge {
+                challenge_id,
+                confirmed,
+            } => {
+                #[cfg(unix)]
+                self.send_microdroid_console_challenge(challenge_id, confirmed)
+                    .await?;
+                #[cfg(not(unix))]
+                {
+                    let _ = (challenge_id, confirmed);
+                    return Err(WorkerError::Unsupported(
+                        "Microdroid console challenge requires a Unix FIFO",
+                    ));
+                }
+            }
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn send_microdroid_console_challenge(
+        &self,
+        challenge_id: Uuid,
+        confirmed: bool,
+    ) -> Result<(), WorkerError> {
+        let _operation = self.operation.lock().await;
+        let (run_id, mut channel) = {
+            let mut mutable = self.mutable.lock().await;
+            let spec = mutable
+                .active_spec
+                .as_ref()
+                .ok_or(WorkerError::NotRunning)?;
+            let microdroid = spec.microdroid.as_ref().ok_or(WorkerError::Unsupported(
+                "console challenge is available only for Microdroid",
+            ))?;
+            if spec.guest_kind != GuestKindV2::Microdroid {
+                return Err(WorkerError::Unsupported(
+                    "console challenge is available only for Microdroid",
+                ));
+            }
+            if microdroid.debug_level != MicrodroidDebugLevelV2::Full {
+                return Err(WorkerError::Unsupported(
+                    "console challenge requires Full-debug Microdroid",
+                ));
+            }
+            let run_id = mutable.status.run_id.ok_or(WorkerError::NotRunning)?;
+            let channel =
+                mutable
+                    .microdroid_console_challenge
+                    .take()
+                    .ok_or(WorkerError::Unsupported(
+                        "Microdroid console challenge channel is unavailable",
+                    ))?;
+            (run_id, channel)
+        };
+        let result = channel
+            .send_and_verify(
+                challenge_id,
+                confirmed,
+                MICRODROID_CONSOLE_CHALLENGE_TIMEOUT,
+            )
+            .await;
+        {
+            let mut mutable = self.mutable.lock().await;
+            if mutable.status.run_id == Some(run_id) {
+                mutable.microdroid_console_challenge = Some(channel);
+            }
+        }
+        let receipt = result?;
+        tracing::info!(
+            event = "microdroid.console_challenge.verified",
+            instance_id = %self.instance_id,
+            %run_id,
+            challenge_id = %receipt.challenge_id,
+            nonce_sha256 = %receipt.nonce_sha256,
+            request_size_bytes = receipt.request_size_bytes,
+            "trusted Microdroid Payload consumed and answered the typed console challenge"
+        );
+        Ok(())
+    }
+
+    async fn start_location_route(
+        self: &Arc<Self>,
+        route: LocationRouteV2,
+    ) -> Result<(), WorkerError> {
+        self.stop_location_route(false).await?;
+        let first = route.points.first().cloned().ok_or_else(|| {
+            WorkerError::Task("validated location route has no first point".to_owned())
+        })?;
+        self.call_device_component(
+            "hd-device-sim",
+            DeviceControlCommandV2::Action {
+                action: InstanceActionV2::SetLocation { location: first },
+            },
+        )
+        .await?;
+
+        let point_count = u32::try_from(route.points.len())
+            .map_err(|_| WorkerError::Task("location route point count exceeds u32".to_owned()))?;
+        let status = LocationRouteStatusV2 {
+            id: route.id,
+            name: route.name.clone(),
+            point_count,
+            current_point: 1,
+            interval_ms: route.interval_ms,
+            repeat: route.repeat,
+            state: LocationRoutePlaybackStateV2::Playing,
+            started_at: OffsetDateTime::now_utc(),
+        };
+        let (control, receiver) = watch::channel(LocationRouteControl::Playing);
+        self.mutable.lock().await.active_location_route = Some(ActiveLocationRoute {
+            status: status.clone(),
+            control,
+            paused_by_instance: false,
+        });
+        tracing::info!(
+            event = "worker.location_route.started",
+            instance_id = %self.instance_id,
+            route_id = %route.id,
+            point_count,
+            interval_ms = route.interval_ms,
+            repeat = route.repeat,
+            "location route playback started after the first Guest point was applied"
+        );
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            service.run_location_route(route, receiver).await;
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_location_route(
+        self: Arc<Self>,
+        route: LocationRouteV2,
+        mut control: watch::Receiver<LocationRouteControl>,
+    ) {
+        let mut index = 1_usize;
+        let mut applied_points = 1_u32;
+        let mut failure = None;
+        loop {
+            let current_control = *control.borrow();
+            match current_control {
+                LocationRouteControl::Stop => break,
+                LocationRouteControl::Paused => {
+                    if control.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                LocationRouteControl::Playing => {}
+            }
+
+            tokio::select! {
+                biased;
+                changed = control.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                () = tokio::time::sleep(Duration::from_millis(u64::from(route.interval_ms))) => {}
+            }
+            if *control.borrow() != LocationRouteControl::Playing {
+                continue;
+            }
+            if index == route.points.len() {
+                if route.repeat {
+                    index = 0;
+                } else {
+                    break;
+                }
+            }
+            let location = route.points[index].clone();
+            if let Err(error) = self
+                .call_device_component(
+                    "hd-device-sim",
+                    DeviceControlCommandV2::Action {
+                        action: InstanceActionV2::SetLocation { location },
+                    },
+                )
+                .await
+            {
+                failure = Some(error);
+                break;
+            }
+            let current_point = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            let mut mutable = self.mutable.lock().await;
+            if let Some(active) = mutable
+                .active_location_route
+                .as_mut()
+                .filter(|active| active.status.id == route.id)
+            {
+                active.status.current_point = current_point;
+            } else {
+                break;
+            }
+            drop(mutable);
+            index += 1;
+            applied_points = applied_points.saturating_add(1);
+            if index == route.points.len() && !route.repeat {
+                break;
+            }
+        }
+
+        let stopped = *control.borrow() == LocationRouteControl::Stop;
+        let reason = if failure.is_some() {
+            LocationRouteFinishReasonV2::Failed
+        } else if stopped {
+            LocationRouteFinishReasonV2::Stopped
+        } else {
+            LocationRouteFinishReasonV2::Completed
+        };
+        let record = LocationRouteRecordV2 {
+            id: route.id,
+            name: route.name.clone(),
+            point_count: u32::try_from(route.points.len()).unwrap_or(u32::MAX),
+            applied_points,
+            repeat: route.repeat,
+            reason,
+            error_code: failure.as_ref().map(|error| error.code().to_owned()),
+            started_at: self
+                .mutable
+                .lock()
+                .await
+                .active_location_route
+                .as_ref()
+                .filter(|active| active.status.id == route.id)
+                .map_or_else(OffsetDateTime::now_utc, |active| active.status.started_at),
+            finished_at: OffsetDateTime::now_utc(),
+        };
+        let mut mutable = self.mutable.lock().await;
+        let still_current = mutable
+            .active_location_route
+            .as_ref()
+            .is_some_and(|active| active.status.id == route.id);
+        if still_current {
+            mutable.active_location_route = None;
+            mutable.status.last_location_route = Some(record);
+        }
+        drop(mutable);
+        if let Some(error) = failure {
+            tracing::error!(
+                event = "worker.location_route.failed",
+                error_code = %error.code(),
+                instance_id = %self.instance_id,
+                route_id = %route.id,
+                %error,
+                "location route playback stopped after a Guest device action failed"
+            );
+        } else {
+            tracing::info!(
+                event = "worker.location_route.finished",
+                instance_id = %self.instance_id,
+                route_id = %route.id,
+                "location route playback finished"
+            );
+        }
+    }
+
+    async fn set_location_route_control(
+        &self,
+        control: LocationRouteControl,
+    ) -> Result<(), WorkerError> {
+        let mut mutable = self.mutable.lock().await;
+        let active = mutable
+            .active_location_route
+            .as_mut()
+            .ok_or(WorkerError::Busy("no location route is active"))?;
+        active
+            .control
+            .send(control)
+            .map_err(|_| WorkerError::Task("location route task is unavailable".to_owned()))?;
+        active.status.state = match control {
+            LocationRouteControl::Playing => LocationRoutePlaybackStateV2::Playing,
+            LocationRouteControl::Paused => LocationRoutePlaybackStateV2::Paused,
+            LocationRouteControl::Stop => {
+                return Err(WorkerError::Task(
+                    "stop must use the location route cleanup boundary".to_owned(),
+                ));
+            }
+        };
+        active.paused_by_instance = false;
+        tracing::info!(
+            event = "worker.location_route.controlled",
+            instance_id = %self.instance_id,
+            route_id = %active.status.id,
+            state = ?active.status.state,
+            "location route playback state changed"
+        );
+        Ok(())
+    }
+
+    async fn pause_location_route_for_instance(&self) -> Result<bool, WorkerError> {
+        let mut mutable = self.mutable.lock().await;
+        let Some(active) = mutable.active_location_route.as_mut() else {
+            return Ok(false);
+        };
+        if active.status.state == LocationRoutePlaybackStateV2::Paused {
+            return Ok(false);
+        }
+        active
+            .control
+            .send(LocationRouteControl::Paused)
+            .map_err(|_| WorkerError::Task("location route task is unavailable".to_owned()))?;
+        active.status.state = LocationRoutePlaybackStateV2::Paused;
+        active.paused_by_instance = true;
+        Ok(true)
+    }
+
+    async fn resume_location_route_for_instance(&self) -> Result<(), WorkerError> {
+        let mut mutable = self.mutable.lock().await;
+        let Some(active) = mutable.active_location_route.as_mut() else {
+            return Ok(());
+        };
+        if !active.paused_by_instance {
+            return Ok(());
+        }
+        active
+            .control
+            .send(LocationRouteControl::Playing)
+            .map_err(|_| WorkerError::Task("location route task is unavailable".to_owned()))?;
+        active.status.state = LocationRoutePlaybackStateV2::Playing;
+        active.paused_by_instance = false;
+        Ok(())
+    }
+
+    async fn stop_location_route(&self, require_active: bool) -> Result<(), WorkerError> {
+        let active = {
+            let mutable = self.mutable.lock().await;
+            mutable.active_location_route.as_ref().map(|active| {
+                let _ = active.control.send(LocationRouteControl::Stop);
+                active.status.id
+            })
+        };
+        let Some(route_id) = active else {
+            return if require_active {
+                Err(WorkerError::Busy("no location route is active"))
+            } else {
+                Ok(())
+            };
+        };
+        let stopped = tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if self
+                    .mutable
+                    .lock()
+                    .await
+                    .active_location_route
+                    .as_ref()
+                    .is_none_or(|active| active.status.id != route_id)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if stopped.is_err() {
+            return Err(WorkerError::Task(
+                "location route task did not stop within 6 seconds".to_owned(),
+            ));
+        }
+        tracing::info!(
+            event = "worker.location_route.stopped",
+            instance_id = %self.instance_id,
+            %route_id,
+            "location route playback stopped"
+        );
         Ok(())
     }
 
@@ -2533,6 +4474,30 @@ impl WorkerService {
         if self.status().await.observed != ObservedStateV2::Ready {
             return Err(WorkerError::NotReady);
         }
+        let microdroid_log = {
+            let mutable = self.mutable.lock().await;
+            mutable
+                .active_spec
+                .as_ref()
+                .filter(|spec| spec.guest_kind == GuestKindV2::Microdroid)
+                .zip(mutable.journal.clone())
+                .map(|(_, journal)| journal.run_dir().join("microdroid-guest.log"))
+        };
+        if let Some(path) = microdroid_log {
+            let metadata = std::fs::metadata(&path).map_err(|source| WorkerError::Io {
+                operation: "inspect Microdroid guest log",
+                path: path.clone(),
+                source,
+            })?;
+            return Ok(hd_core::DiagnosticFileV2 {
+                relative_path: path.clone(),
+                sha256: crate::sha256_file(&path).map_err(|error| {
+                    WorkerError::Task(format!("hash Microdroid guest log: {error}"))
+                })?,
+                size_bytes: metadata.len(),
+                truncated: false,
+            });
+        }
         let (adb, serial, journal) = {
             let mutable = self.mutable.lock().await;
             if !mutable.adb_ready {
@@ -2561,12 +4526,24 @@ impl WorkerService {
 
     async fn diagnostics(&self) -> Vec<hd_core::DiagnosticCheckV2> {
         let status = self.status().await;
-        let network = {
+        let (network, microdroid, payload, guest_cid) = {
             let mutable = self.mutable.lock().await;
-            mutable
-                .adb_ready
-                .then(|| Some((mutable.adb.clone()?, mutable.status.adb_serial.clone()?)))
-                .flatten()
+            (
+                mutable
+                    .adb_ready
+                    .then(|| Some((mutable.adb.clone()?, mutable.status.adb_serial.clone()?)))
+                    .flatten(),
+                mutable
+                    .active_spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.guest_kind == GuestKindV2::Microdroid),
+                mutable
+                    .active_spec
+                    .as_ref()
+                    .and_then(|spec| spec.microdroid.as_ref())
+                    .map(|config| format!("{:?}", config.payload)),
+                mutable.launch.as_ref().map(|launch| launch.guest_cid),
+            )
         };
         let mut checks = vec![
             hd_core::DiagnosticCheckV2 {
@@ -2593,9 +4570,42 @@ impl WorkerService {
                 fields: BTreeMap::new(),
             },
         ];
+        if microdroid {
+            checks.push(hd_core::DiagnosticCheckV2 {
+                id: "microdroid.payload".to_owned(),
+                status: if status.observed == ObservedStateV2::Ready {
+                    hd_core::DiagnosticStatusV2::Pass
+                } else {
+                    hd_core::DiagnosticStatusV2::Blocked
+                },
+                detail: payload.unwrap_or_else(|| "Microdroid payload configuration".to_owned()),
+                fields: guest_cid
+                    .map(|cid| BTreeMap::from([("guest_cid".to_owned(), cid.to_string())]))
+                    .unwrap_or_default(),
+            });
+            checks.push(hd_core::DiagnosticCheckV2 {
+                id: "microdroid.adb".to_owned(),
+                status: if status.adb_ready {
+                    hd_core::DiagnosticStatusV2::Pass
+                } else {
+                    hd_core::DiagnosticStatusV2::Blocked
+                },
+                detail: if status.adb_ready {
+                    "Microdroid ADB is ready".to_owned()
+                } else {
+                    "the active Payload does not expose an authenticated adbd service".to_owned()
+                },
+                fields: status
+                    .adb_serial
+                    .clone()
+                    .map(|serial| BTreeMap::from([("serial".to_owned(), serial)]))
+                    .unwrap_or_default(),
+            });
+            return checks;
+        }
         checks.push(guest_network_diagnostic(network.as_ref()).await);
         match network {
-            Some((adb, serial)) => match adb.device_runtime_health(&serial).await {
+            Some((adb, serial)) => match Box::pin(adb.device_runtime_health(&serial)).await {
                 Ok(devices) => checks.extend(devices.into_iter().map(device_runtime_diagnostic)),
                 Err(error) => checks.push(hd_core::DiagnosticCheckV2 {
                     id: "device.runtime_probe".to_owned(),
@@ -2625,12 +4635,68 @@ impl WorkerService {
                 }
                 match worker.poll_process().await {
                     Ok(Some(exit)) => {
-                        let _operation = worker.operation.lock().await;
-                        if !worker.status().await.observed.is_active() {
-                            break;
+                        let microdroid_run_dir = {
+                            let mutable = worker.mutable.lock().await;
+                            mutable
+                                .active_spec
+                                .as_ref()
+                                .is_some_and(|spec| spec.guest_kind == GuestKindV2::Microdroid)
+                                .then(|| {
+                                    mutable
+                                        .journal
+                                        .as_ref()
+                                        .map(|journal| journal.run_dir().to_owned())
+                                })
+                                .flatten()
+                        };
+                        let disposition = match microdroid_run_dir {
+                            Some(run_dir) => {
+                                classify_microdroid_exit_disposition_after_log_settle(
+                                    &run_dir, exit.code,
+                                )
+                                .await
+                            }
+                            None => MicrodroidExitDisposition::Failed(WorkerError::GuestExited(
+                                exit.code,
+                            )),
+                        };
+                        match disposition {
+                            MicrodroidExitDisposition::Completed(payload_exit_code) => {
+                                tracing::info!(
+                                    event = "microdroid.payload.finished",
+                                    instance_id = %worker.instance_id,
+                                    payload_exit_code,
+                                    process_exit_code = ?exit.code,
+                                    "Microdroid payload completed and the AOSP vm launcher shut down cleanly"
+                                );
+                                if let Err(error) = worker
+                                    .stop_after_microdroid_completion(payload_exit_code)
+                                    .await
+                                {
+                                    tracing::error!(
+                                        event = "microdroid.payload.finish_cleanup.failed",
+                                        instance_id = %worker.instance_id,
+                                        error_code = error.code(),
+                                        %error,
+                                        "Microdroid payload completed but exact runtime cleanup failed"
+                                    );
+                                }
+                            }
+                            MicrodroidExitDisposition::Failed(error) => {
+                                let _operation = worker.operation.lock().await;
+                                if !worker.status().await.observed.is_active() {
+                                    break;
+                                }
+                                tracing::warn!(
+                                    event = "worker.guest.exit.classified",
+                                    instance_id = %worker.instance_id,
+                                    error_code = error.code(),
+                                    exit_code = ?exit.code,
+                                    "unexpected Guest exit was classified from the active run evidence"
+                                );
+                                let _ = worker.fail_start(&error, false).await;
+                            }
                         }
-                        let error = WorkerError::GuestExited(exit.code);
-                        let _ = worker.fail_start(&error, false).await;
                         break;
                     }
                     Ok(None) => match worker.ensure_components_alive().await {
@@ -2660,11 +4726,9 @@ impl WorkerService {
     fn spawn_deferred_adb_readiness(
         self: &Arc<Self>,
         run_id: Uuid,
+        run_dir: PathBuf,
         serial: String,
-        display: DisplayConfigV2,
-        bluetooth_enabled: bool,
-        nfc_enabled: bool,
-        network_enabled: bool,
+        policy: DeferredAdbReadinessPolicy,
     ) {
         let worker = Arc::clone(self);
         tokio::spawn(async move {
@@ -2679,95 +4743,344 @@ impl WorkerService {
                 adb
             };
 
-            let connect = adb.connect(&serial);
-            tokio::pin!(connect);
-            let connect_result = loop {
-                tokio::select! {
-                    result = &mut connect => break result,
-                    () = tokio::time::sleep(Duration::from_millis(500)) => {
-                        if worker.status().await.run_id != Some(run_id) {
-                            return;
-                        }
+            worker.record_deferred_adb_readiness(
+                &run_dir,
+                run_id,
+                &serial,
+                "connect",
+                "waiting for the exact loopback ADB transport",
+            );
+            if !worker.connect_deferred_adb(&adb, run_id, &serial).await {
+                worker.record_deferred_adb_readiness(
+                    &run_dir,
+                    run_id,
+                    &serial,
+                    "failed",
+                    "loopback ADB transport did not connect",
+                );
+                return;
+            }
+
+            worker.record_deferred_adb_readiness(
+                &run_dir,
+                run_id,
+                &serial,
+                "android_readiness",
+                "waiting for stable boot, animation, user and interactive services",
+            );
+            if !worker
+                .wait_deferred_adb_readiness_stage(
+                    &adb,
+                    run_id,
+                    &serial,
+                    "worker.adb.deferred_readiness.failed",
+                    "initial Android readiness did not stabilize",
+                )
+                .await
+            {
+                worker.record_deferred_adb_readiness(
+                    &run_dir,
+                    run_id,
+                    &serial,
+                    "failed",
+                    "initial Android readiness did not stabilize",
+                );
+                return;
+            }
+            worker.record_deferred_adb_readiness(
+                &run_dir,
+                run_id,
+                &serial,
+                "device_and_network_policy",
+                "applying configured device policy and validating Android networking",
+            );
+            let policy_apply = policy.apply(&adb, worker.instance_id, run_id, &serial);
+            policy_apply.await;
+
+            worker.record_deferred_adb_readiness(
+                &run_dir,
+                run_id,
+                &serial,
+                "interactive_policy",
+                "converging keep-awake and Android display configuration",
+            );
+            if !worker
+                .converge_deferred_interactive_policy(&adb, run_id, &serial, &policy.display)
+                .await
+            {
+                worker.record_deferred_adb_readiness(
+                    &run_dir,
+                    run_id,
+                    &serial,
+                    "failed",
+                    "interactive Android display policy did not converge",
+                );
+                return;
+            }
+
+            worker
+                .publish_deferred_adb_ready(&run_dir, run_id, &serial)
+                .await;
+        });
+    }
+
+    async fn publish_deferred_adb_ready(&self, run_dir: &Path, run_id: Uuid, serial: &str) {
+        let mut mutable = self.mutable.lock().await;
+        if mutable.status.run_id == Some(run_id)
+            && matches!(
+                mutable.status.observed,
+                ObservedStateV2::Ready | ObservedStateV2::Paused
+            )
+        {
+            mutable.adb_ready = true;
+            drop(mutable);
+            self.record_deferred_adb_readiness(
+                run_dir,
+                run_id,
+                serial,
+                "complete",
+                "ADB-backed HD actions are ready",
+            );
+            tracing::info!(
+                event = "worker.adb.deferred_readiness.succeeded",
+                instance_id = %self.instance_id,
+                %run_id,
+                %serial,
+                "ADB-backed HD actions are ready"
+            );
+        } else {
+            drop(mutable);
+            self.record_deferred_adb_readiness(
+                run_dir,
+                run_id,
+                serial,
+                "cancelled",
+                "the active run changed before deferred ADB readiness completed",
+            );
+        }
+    }
+
+    fn record_deferred_adb_readiness(
+        &self,
+        run_dir: &Path,
+        run_id: Uuid,
+        serial: &str,
+        stage: &str,
+        detail: &str,
+    ) {
+        let marker = serde_json::json!({
+            "schema_version": 1,
+            "instance_id": self.instance_id,
+            "run_id": run_id,
+            "serial": serial,
+            "stage": stage,
+            "detail": detail,
+            "updated_at_unix_nanos": OffsetDateTime::now_utc().unix_timestamp_nanos(),
+        });
+        let path = run_dir.join("deferred-adb-readiness-v1.json");
+        if let Err(error) = write_json_atomic(&path, &marker) {
+            tracing::warn!(
+                event = "worker.adb.deferred_readiness.marker_failed",
+                instance_id = %self.instance_id,
+                %run_id,
+                %serial,
+                %stage,
+                %error,
+                path = %path.display(),
+                "failed to persist deferred ADB readiness diagnostics"
+            );
+        }
+    }
+
+    fn spawn_microdroid_deferred_adb_readiness(
+        self: &Arc<Self>,
+        run_id: Uuid,
+        serial: String,
+        adb: AdbClient,
+    ) {
+        let worker = Arc::clone(self);
+        tokio::spawn(async move {
+            // Microdroid has no Android framework, PackageManager or boot animation. Reusing the
+            // Android `wait_ready` conjunction would keep a real adbd transport false forever.
+            // `connect` already requires this exact serial to report the stable ADB `device`
+            // state, which is the complete Microdroid ADB readiness contract.
+            let readiness =
+                tokio::time::timeout(Duration::from_secs(30), adb.connect(&serial)).await;
+            let ready = match readiness {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        event = "microdroid.adb.deferred",
+                        instance_id = %worker.instance_id,
+                        %run_id,
+                        %error,
+                        "Microdroid Payload is Ready but did not expose adbd"
+                    );
+                    false
+                }
+                Err(_) => false,
+            };
+            if !ready {
+                return;
+            }
+            let mut mutable = worker.mutable.lock().await;
+            if mutable.status.run_id == Some(run_id)
+                && mutable.status.observed == ObservedStateV2::Ready
+            {
+                mutable.adb_ready = true;
+                tracing::info!(
+                    event = "microdroid.adb.ready",
+                    instance_id = %worker.instance_id,
+                    %run_id,
+                    %serial,
+                    "Microdroid ADB became ready after Payload readiness"
+                );
+            }
+        });
+    }
+
+    async fn connect_deferred_adb(&self, adb: &AdbClient, run_id: Uuid, serial: &str) -> bool {
+        let connect = adb.connect(serial);
+        tokio::pin!(connect);
+        let result = loop {
+            tokio::select! {
+                result = &mut connect => break result,
+                () = tokio::time::sleep(Duration::from_millis(500)) => {
+                    if self.status().await.run_id != Some(run_id) {
+                        return false;
                     }
                 }
-            };
-            if let Err(error) = connect_result {
+            }
+        };
+        match result {
+            Ok(()) => true,
+            Err(error) => {
                 tracing::warn!(
                     event = "worker.adb.deferred_connect.failed",
-                    instance_id = %worker.instance_id,
+                    instance_id = %self.instance_id,
                     %run_id,
                     %serial,
                     %error,
                     "deferred ADB connection failed; native display remains available"
                 );
-                return;
+                false
+            }
+        }
+    }
+
+    async fn converge_deferred_interactive_policy(
+        &self,
+        adb: &AdbClient,
+        run_id: Uuid,
+        serial: &str,
+        display: &DisplayConfigV2,
+    ) -> bool {
+        let started = Instant::now();
+        loop {
+            // Device and network policy can overlap the tail of Android boot. Require stable
+            // services before every idempotent attempt instead of publishing a stale sample.
+            if !self
+                .wait_deferred_adb_readiness_stage(
+                    adb,
+                    run_id,
+                    serial,
+                    "worker.adb.deferred_policy_readiness.failed",
+                    "Android was not interactive after startup policy reconciliation",
+                )
+                .await
+            {
+                return false;
             }
 
-            let readiness = adb.wait_ready(&serial);
-            tokio::pin!(readiness);
-            let readiness_result = loop {
-                tokio::select! {
-                    result = &mut readiness => break result,
-                    () = tokio::time::sleep(Duration::from_millis(500)) => {
-                        if worker.status().await.run_id != Some(run_id) {
-                            return;
-                        }
+            let (operation, result) = match adb.keep_display_awake(serial).await {
+                Ok(()) => (
+                    "set_display_configuration",
+                    adb.set_display_configuration(serial, display).await,
+                ),
+                Err(error) => ("keep_display_awake", Err(error)),
+            };
+            match result {
+                Ok(()) => {
+                    // Close the interval between the service probe and policy commands. Ready is
+                    // published only when the configured Guest still satisfies the full contract.
+                    return self
+                        .wait_deferred_adb_readiness_stage(
+                            adb,
+                            run_id,
+                            serial,
+                            "worker.adb.deferred_final_readiness.failed",
+                            "Android lost interactivity while finalizing startup policy",
+                        )
+                        .await;
+                }
+                Err(error) if started.elapsed() < DEFERRED_INTERACTIVE_POLICY_TIMEOUT => {
+                    tracing::warn!(
+                        event = "worker.adb.deferred_interactive_policy.retrying",
+                        instance_id = %self.instance_id,
+                        %run_id,
+                        %serial,
+                        %operation,
+                        %error,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "interactive Android startup policy encountered a transient service withdrawal"
+                    );
+                    tokio::time::sleep(DEFERRED_INTERACTIVE_POLICY_RETRY_DELAY).await;
+                    if self.status().await.run_id != Some(run_id) {
+                        return false;
                     }
                 }
-            };
-            if let Err(error) = readiness_result {
-                tracing::warn!(
-                    event = "worker.adb.deferred_readiness.failed",
-                    instance_id = %worker.instance_id,
-                    %run_id,
-                    %serial,
-                    %error,
-                    "deferred Android readiness failed; native display remains available"
-                );
-                return;
+                Err(error) => {
+                    tracing::warn!(
+                        event = "worker.adb.deferred_interactive_policy.failed",
+                        instance_id = %self.instance_id,
+                        %run_id,
+                        %serial,
+                        %operation,
+                        %error,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "interactive Android startup policy did not converge"
+                    );
+                    return false;
+                }
             }
-            adb.apply_runtime_device_policy(&serial, bluetooth_enabled, nfc_enabled)
-                .await;
-            refresh_network_validation(&adb, network_enabled, worker.instance_id, run_id, &serial)
-                .await;
-            if let Err(error) = adb.keep_display_awake(&serial).await {
-                tracing::warn!(
-                    event = "worker.adb.deferred_keep_awake.failed",
-                    instance_id = %worker.instance_id,
-                    %run_id,
-                    %serial,
-                    %error,
-                    "Android display keep-awake policy could not be applied"
-                );
-            }
-            if let Err(error) = adb.set_display_configuration(&serial, &display).await {
-                tracing::warn!(
-                    event = "worker.adb.deferred_orientation.failed",
-                    instance_id = %worker.instance_id,
-                    %run_id,
-                    %serial,
-                    %error,
-                    "initial Android orientation could not be applied"
-                );
-            }
+        }
+    }
 
-            let mut mutable = worker.mutable.lock().await;
-            if mutable.status.run_id == Some(run_id)
-                && matches!(
-                    mutable.status.observed,
-                    ObservedStateV2::Ready | ObservedStateV2::Paused
-                )
-            {
-                mutable.adb_ready = true;
-                tracing::info!(
-                    event = "worker.adb.deferred_readiness.succeeded",
-                    instance_id = %worker.instance_id,
+    async fn wait_deferred_adb_readiness_stage(
+        &self,
+        adb: &AdbClient,
+        run_id: Uuid,
+        serial: &str,
+        failure_event: &'static str,
+        failure_detail: &'static str,
+    ) -> bool {
+        let readiness = adb.wait_ready(serial);
+        tokio::pin!(readiness);
+        let result = loop {
+            tokio::select! {
+                result = &mut readiness => break result,
+                () = tokio::time::sleep(Duration::from_millis(500)) => {
+                    if self.status().await.run_id != Some(run_id) {
+                        return false;
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    event = failure_event,
+                    instance_id = %self.instance_id,
                     %run_id,
                     %serial,
-                    "ADB-backed HD actions are ready"
+                    %error,
+                    %failure_detail,
+                    "deferred Android readiness stage failed; native display remains available"
                 );
+                false
             }
-        });
+        }
     }
 
     async fn poll_process(&self) -> Result<Option<hd_platform::ProcessExit>, WorkerError> {
@@ -2864,6 +5177,16 @@ impl WorkerService {
         } else {
             ObservedStateV2::Failed
         };
+        if self.mutable.lock().await.active_location_route.is_some()
+            && let Err(route_error) = self.stop_location_route(false).await
+        {
+            tracing::warn!(
+                event = "worker.location_route.failure_cleanup.failed",
+                instance_id = %self.instance_id,
+                %route_error,
+                "runtime failure cleanup continued after location route cleanup failed"
+            );
+        }
         let (process, launch) = {
             let mut mutable = self.mutable.lock().await;
             (mutable.process.take(), mutable.launch.clone())
@@ -2903,7 +5226,12 @@ impl WorkerService {
             cleanup_error.get_or_insert(error);
         }
         let transition_result = self.transition(target, Some(error)).await;
-        let finish_result = self.finish_run(target, None, Some(error)).await;
+        let run_exit_code = match error {
+            WorkerError::GuestExited(exit_code) => *exit_code,
+            WorkerError::MicrodroidPayloadFailed(exit_code) => Some(*exit_code),
+            _ => None,
+        };
+        let finish_result = self.finish_run(target, run_exit_code, Some(error)).await;
         {
             let mut mutable = self.mutable.lock().await;
             mutable.status.cleanup_pending = cleanup_error.is_some();
@@ -2917,11 +5245,19 @@ impl WorkerService {
             if cleanup_error.is_none() {
                 mutable.backend = None;
                 mutable.launch = None;
+                #[cfg(any(windows, target_os = "macos"))]
+                {
+                    mutable.host_recorder_endpoint = None;
+                }
                 mutable.device_control_tokens.clear();
                 #[cfg(unix)]
                 mutable.device_output_files.clear();
                 #[cfg(unix)]
                 mutable.device_input_fifos.clear();
+                #[cfg(unix)]
+                {
+                    mutable.microdroid_console_challenge = None;
+                }
             }
         }
         transition_result?;
@@ -2958,6 +5294,28 @@ impl WorkerService {
         }
         Ok(())
     }
+
+    async fn remove_finished_run_ephemeral_artifacts(&self) -> Result<(), WorkerError> {
+        let run_dir = {
+            let mutable = self.mutable.lock().await;
+            mutable
+                .journal
+                .as_ref()
+                .map(|journal| journal.run_dir().to_owned())
+        };
+        let Some(run_dir) = run_dir else {
+            return Ok(());
+        };
+        for path in remove_finished_run_ephemeral_artifacts(&run_dir)? {
+            tracing::info!(
+                event = "runtime.run.ephemeral_artifact.removed",
+                instance_id = %self.instance_id,
+                path = %path.display(),
+                "removed reproducible launch artifact from finalized run"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -2965,6 +5323,7 @@ struct RuntimeEndpoints {
     control: String,
     frame: String,
     keyboard: String,
+    trackpad: Option<String>,
     devices: BTreeMap<String, DeviceSerialEndpointV2>,
     device_controls: BTreeMap<String, String>,
     #[cfg(unix)]
@@ -2973,10 +5332,91 @@ struct RuntimeEndpoints {
     input_fifos: Vec<std::fs::File>,
 }
 
+fn read_bluetooth_hci_capture_record(
+    run_dir: &Path,
+    capture_id: Uuid,
+    requested_duration_ms: u32,
+) -> Result<BluetoothHciCaptureRecordV2, WorkerError> {
+    let component_directory = run_dir.join("components");
+    let file_name = format!("rootcanal-hci-{capture_id}.btsnoop");
+    let metadata_name = format!("rootcanal-hci-{capture_id}.json");
+    let capture_path = component_directory.join(&file_name);
+    let metadata_path = component_directory.join(metadata_name);
+    let capture_metadata = std::fs::symlink_metadata(&capture_path).map_err(|error| {
+        WorkerError::ComponentContract(format!(
+            "inspect Bluetooth HCI capture {}: {error}",
+            capture_path.display()
+        ))
+    })?;
+    let record_metadata = std::fs::symlink_metadata(&metadata_path).map_err(|error| {
+        WorkerError::ComponentContract(format!(
+            "inspect Bluetooth HCI capture metadata {}: {error}",
+            metadata_path.display()
+        ))
+    })?;
+    if !capture_metadata.is_file()
+        || capture_metadata.file_type().is_symlink()
+        || !record_metadata.is_file()
+        || record_metadata.file_type().is_symlink()
+        || record_metadata.len() > 64 * 1024
+    {
+        return Err(WorkerError::ComponentContract(
+            "Bluetooth HCI capture outputs are not safe regular files".to_owned(),
+        ));
+    }
+    let record: BluetoothHciCaptureRecordV2 =
+        serde_json::from_slice(&std::fs::read(&metadata_path).map_err(|error| {
+            WorkerError::ComponentContract(format!("read Bluetooth HCI capture metadata: {error}"))
+        })?)
+        .map_err(|error| {
+            WorkerError::ComponentContract(format!(
+                "decode Bluetooth HCI capture metadata: {error}"
+            ))
+        })?;
+    if record.capture_id != capture_id
+        || record.file_name != file_name
+        || record.requested_duration_ms != requested_duration_ms
+        || record.output_size_bytes != capture_metadata.len()
+        || record.output_size_bytes < 16
+        || record.output_size_bytes > MAX_BLUETOOTH_HCI_CAPTURE_BYTES
+    {
+        return Err(WorkerError::ComponentContract(
+            "Bluetooth HCI capture metadata does not match the bounded output".to_owned(),
+        ));
+    }
+    let mut file = std::fs::File::open(&capture_path).map_err(|error| {
+        WorkerError::ComponentContract(format!("open Bluetooth HCI capture: {error}"))
+    })?;
+    let mut header = [0_u8; 16];
+    file.read_exact(&mut header).map_err(|error| {
+        WorkerError::ComponentContract(format!("read Bluetooth HCI capture header: {error}"))
+    })?;
+    if &header[..8] != b"btsnoop\0"
+        || u32::from_be_bytes(header[8..12].try_into().expect("fixed header")) != 1
+        || u32::from_be_bytes(header[12..16].try_into().expect("fixed header")) != 1_002
+    {
+        return Err(WorkerError::ComponentContract(
+            "Bluetooth HCI capture is not a btsnoop HCI UART artifact".to_owned(),
+        ));
+    }
+    Ok(record)
+}
+
 fn enabled_device_components(spec: &InstanceSpecV2) -> Vec<&'static str> {
     let mut components = Vec::new();
     if spec.devices.gnss || spec.devices.sensors || spec.devices.power || spec.devices.network {
         components.push("hd-device-sim");
+    }
+    #[cfg(target_os = "macos")]
+    for (enabled, component) in [
+        (spec.devices.bluetooth, "rootcanal-adapter"),
+        (spec.devices.nfc, "casimir-adapter"),
+        (spec.devices.uwb, "uwb-adapter"),
+        (spec.devices.modem, "modem-adapter"),
+    ] {
+        if enabled {
+            components.push(component);
+        }
     }
     #[cfg(not(target_os = "macos"))]
     for (enabled, component) in [
@@ -2996,7 +5436,10 @@ fn device_role_enabled(spec: &InstanceSpecV2, role: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         match role {
+            "bluetooth" => spec.devices.bluetooth,
             "gnss" | "location" => spec.devices.gnss,
+            "uwb" => spec.devices.uwb,
+            "nfc" => spec.devices.nfc,
             "sensors" => spec.devices.sensors,
             "mcu-control" | "mcu-uart" => spec.devices.power,
             _ => false,
@@ -3020,6 +5463,11 @@ impl RuntimeEndpoints {
         let control = runtime_endpoint(spec.id, run_id, "vm-control", "sock")?;
         let frame = runtime_endpoint(spec.id, run_id, "frame", "sock")?;
         let keyboard = runtime_endpoint(spec.id, run_id, "keyboard", "sock")?;
+        let trackpad = spec
+            .devices
+            .touchpad
+            .then(|| runtime_endpoint(spec.id, run_id, "trackpad", "sock"))
+            .transpose()?;
         let device_controls = enabled_device_components(spec)
             .into_iter()
             .map(|component| {
@@ -3076,6 +5524,7 @@ impl RuntimeEndpoints {
             control,
             frame,
             keyboard,
+            trackpad,
             devices,
             device_controls,
             #[cfg(unix)]
@@ -3151,6 +5600,7 @@ fn cleanup_runtime_endpoints(launch: &LaunchPlanV2) -> Result<(), WorkerError> {
             launch.frame_endpoint.clone(),
             launch.keyboard_endpoint.clone(),
         ]);
+        endpoints.extend(launch.trackpad_endpoint.iter().cloned());
         for endpoint in launch.device_endpoints.values() {
             endpoints.insert(endpoint.guest_output.clone());
             endpoints.insert(endpoint.guest_input.clone());
@@ -3273,6 +5723,153 @@ fn read_log_tail_lossy(path: &Path) -> Result<String, WorkerError> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+enum MicrodroidExitDisposition {
+    Completed(i32),
+    Failed(WorkerError),
+}
+
+enum MicrodroidPayloadReadiness {
+    Ready,
+    Completed(i32),
+}
+
+/// The AOSP `vm` launcher can exit while descendants that inherited its redirected stdout/stderr
+/// handles are still closing. On Windows, observing the process exit is therefore not sufficient
+/// to prove that the final callback and `VM ended` lines are already visible to a second reader.
+/// Keep the evidence rules strict, but give the authoritative launcher logs a short bounded window
+/// to settle before falling back to the generic `guest_exited` classification.
+async fn classify_microdroid_exit_disposition_after_log_settle(
+    run_dir: &Path,
+    exit_code: Option<i32>,
+) -> MicrodroidExitDisposition {
+    const LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+    const LOG_SETTLE_INTERVAL: Duration = Duration::from_millis(25);
+
+    let started = tokio::time::Instant::now();
+    loop {
+        let disposition = classify_microdroid_exit_disposition(run_dir, exit_code);
+        let evidence_incomplete = matches!(
+            &disposition,
+            MicrodroidExitDisposition::Failed(WorkerError::GuestExited(_))
+        );
+        if !evidence_incomplete || started.elapsed() >= LOG_SETTLE_TIMEOUT {
+            return disposition;
+        }
+        tokio::time::sleep(LOG_SETTLE_INTERVAL).await;
+    }
+}
+
+fn classify_microdroid_exit_disposition(
+    run_dir: &Path,
+    exit_code: Option<i32>,
+) -> MicrodroidExitDisposition {
+    let mut logs = String::new();
+    for name in [
+        "microdroid.stdout.log",
+        "microdroid.stderr.log",
+        "microdroid-guest.log",
+        "microdroid-virtmgr-trace.log",
+        "microdroid-vmclient-trace.log",
+    ] {
+        let path = run_dir.join(name);
+        if path.is_file()
+            && let Ok(text) = read_log_tail_lossy(&path)
+        {
+            logs.push_str(&text);
+            logs.push('\n');
+        }
+    }
+    if let Some(error) = classify_microdroid_failure_logs(&logs) {
+        return MicrodroidExitDisposition::Failed(error);
+    }
+    match inspect_microdroid_launcher_completion(run_dir, exit_code) {
+        Ok(Some(MicrodroidLauncherCompletion::Completed { payload_exit_code })) => {
+            MicrodroidExitDisposition::Completed(payload_exit_code)
+        }
+        Ok(Some(MicrodroidLauncherCompletion::PayloadFailed { payload_exit_code })) => {
+            MicrodroidExitDisposition::Failed(WorkerError::MicrodroidPayloadFailed(
+                payload_exit_code,
+            ))
+        }
+        Ok(None) | Err(_) => MicrodroidExitDisposition::Failed(WorkerError::GuestExited(exit_code)),
+    }
+}
+
+#[cfg(test)]
+fn classify_microdroid_exit_logs(logs: &str, exit_code: Option<i32>) -> WorkerError {
+    classify_microdroid_failure_logs(logs).unwrap_or(WorkerError::GuestExited(exit_code))
+}
+
+fn classify_microdroid_failure_logs(logs: &str) -> Option<WorkerError> {
+    // microdroid_manager reports a changed payload underneath the generic
+    // "Payload verification has failed" wrapper. Match the specific cause first so the UI
+    // does not incorrectly tell the user to replace a valid APK signature/idsig.
+    if [
+        "MicrodroidPayloadHasChanged",
+        "PayloadChanged",
+        "MICRODROID_PAYLOAD_HAS_CHANGED",
+        "PAYLOAD_CHANGED",
+        "Payload has changed",
+        "APEXes have changed",
+    ]
+    .iter()
+    .any(|marker| logs.contains(marker))
+    {
+        Some(WorkerError::MicrodroidPayloadChanged)
+    } else if [
+        "MicrodroidPayloadVerificationFailed",
+        "PayloadVerificationFailed",
+        "MICRODROID_PAYLOAD_VERIFICATION_FAILED",
+        "PAYLOAD_VERIFICATION_FAILED",
+        "Payload verification failed",
+        "Payload verification has failed",
+    ]
+    .iter()
+    .any(|marker| logs.contains(marker))
+    {
+        Some(WorkerError::MicrodroidPayloadVerificationFailed)
+    } else if [
+        "MicrodroidInvalidPayloadConfig",
+        "PayloadInvalidConfig",
+        "MICRODROID_INVALID_PAYLOAD_CONFIG",
+        "PAYLOAD_INVALID_CONFIG",
+    ]
+    .iter()
+    .any(|marker| logs.contains(marker))
+    {
+        Some(WorkerError::MicrodroidInvalidPayloadConfig)
+    } else if [
+        "MicrodroidFailedToConnectToVirtualizationService",
+        "MICRODROID_FAILED_TO_CONNECT_TO_VIRTUALIZATION_SERVICE",
+    ]
+    .iter()
+    .any(|marker| logs.contains(marker))
+    {
+        Some(WorkerError::MicrodroidServiceConnectionFailed)
+    } else if [
+        "MicrodroidUnknownRuntimeError",
+        "MICRODROID_UNKNOWN_RUNTIME_ERROR",
+        "VirtualizationServiceDied",
+        "InfrastructureError",
+        "StartFailed",
+        "WatchdogReboot",
+        "Unrecognised",
+        "VM ended: Crash",
+        "VM ended: Hangup",
+        "VM ended: Killed",
+        "reason=Crash",
+        "reason=Hangup",
+        "reason=Killed",
+    ]
+    .iter()
+    .any(|marker| logs.contains(marker))
+    {
+        Some(WorkerError::MicrodroidRuntimeFailed)
+    } else {
+        None
+    }
+}
+
 fn validate_start_leases(
     leases: &[LeaseV2],
     identity: &WorkerIdentityV2,
@@ -3294,11 +5891,14 @@ fn validate_start_leases(
             "CPU or memory lease does not exactly match the instance specification".to_owned(),
         ));
     }
-    let disk = lease_resource(leases, LeaseKindV2::DiskOverlay)?;
-    if disk != paths.disk_overlay(instance_id).to_string_lossy() {
-        return Err(WorkerError::LeaseContract(
-            "disk overlay lease does not match the instance path".to_owned(),
-        ));
+    if spec.guest_kind == GuestKindV2::Android {
+        let disk = lease_resource(leases, LeaseKindV2::DiskOverlay)?;
+        if disk != paths.disk_overlay(instance_id).to_string_lossy() {
+            return Err(WorkerError::LeaseContract(
+                "disk overlay lease does not match the instance path".to_owned(),
+            ));
+        }
+        let _gpu_slot = lease_number::<u32>(leases, LeaseKindV2::GpuSlot)?;
     }
     if lease_resource(leases, LeaseKindV2::WorkerEndpoint)? != worker_endpoint {
         return Err(WorkerError::LeaseContract(
@@ -3309,7 +5909,6 @@ fn validate_start_leases(
     if !(3..=i32::MAX as u32).contains(&guest_cid) {
         return Err(WorkerError::LeaseInvalid(LeaseKindV2::GuestCid));
     }
-    let _gpu_slot = lease_number::<u32>(leases, LeaseKindV2::GpuSlot)?;
     if let Some(port) = spec.adb.host_port
         && lease_number::<u16>(leases, LeaseKindV2::AdbPort)? != port
     {
@@ -3338,8 +5937,28 @@ fn validate_lease_set_shape(
         .into_iter()
         .map(|name| format!("{instance_id}:{name}"))
         .collect::<BTreeSet<_>>();
-    let expected_count =
-        7 + usize::from(matches!(spec.adb.mode, AdbModeV2::Loopback)) + expected_devices.len();
+    let required_kinds = if spec.guest_kind == GuestKindV2::Android {
+        &[
+            LeaseKindV2::CpuCapacity,
+            LeaseKindV2::MemoryBytes,
+            LeaseKindV2::GuestCid,
+            LeaseKindV2::DiskOverlay,
+            LeaseKindV2::GpuSlot,
+            LeaseKindV2::WorkerEndpoint,
+            LeaseKindV2::FrameGeneration,
+        ][..]
+    } else {
+        &[
+            LeaseKindV2::CpuCapacity,
+            LeaseKindV2::MemoryBytes,
+            LeaseKindV2::GuestCid,
+            LeaseKindV2::WorkerEndpoint,
+            LeaseKindV2::FrameGeneration,
+        ][..]
+    };
+    let expected_count = required_kinds.len()
+        + usize::from(matches!(spec.adb.mode, AdbModeV2::Loopback))
+        + expected_devices.len();
     if leases.len() != expected_count {
         return Err(WorkerError::LeaseContract(format!(
             "expected {expected_count} leases, received {}",
@@ -3348,15 +5967,7 @@ fn validate_lease_set_shape(
     }
     let mut ids = BTreeSet::new();
     let mut counts = BTreeMap::<LeaseKindV2, usize>::new();
-    for kind in [
-        LeaseKindV2::CpuCapacity,
-        LeaseKindV2::MemoryBytes,
-        LeaseKindV2::GuestCid,
-        LeaseKindV2::DiskOverlay,
-        LeaseKindV2::GpuSlot,
-        LeaseKindV2::WorkerEndpoint,
-        LeaseKindV2::FrameGeneration,
-    ] {
+    for &kind in required_kinds {
         let count = leases.iter().filter(|lease| lease.kind == kind).count();
         if count == 0 {
             return Err(WorkerError::LeaseMissing(kind));
@@ -3437,6 +6048,239 @@ where
         .map_err(|_| WorkerError::LeaseInvalid(kind))
 }
 
+fn verify_upload_digest(path: &Path, expected: &str) -> Result<(), WorkerError> {
+    let actual = crate::sha256_file(path)?;
+    if actual != expected {
+        return Err(WorkerError::UploadDigestMismatch {
+            expected: expected.to_owned(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn validate_existing_microdroid_storage(path: &Path, size_mib: u32) -> Result<(), WorkerError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(WorkerError::Io {
+                operation: "inspect Microdroid encrypted storage",
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(WorkerError::ComponentContract(
+            "Microdroid encrypted storage must be a regular non-symlink file".to_owned(),
+        ));
+    }
+    let expected = u64::from(size_mib).saturating_mul(1024 * 1024);
+    if metadata.len() != expected {
+        return Err(WorkerError::ComponentContract(format!(
+            "existing Microdroid encrypted storage is {} bytes but the instance requires {expected}; automatic resize is unsupported",
+            metadata.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_screen_recording_mp4(path: &Path) -> Result<(u64, String), WorkerError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| WorkerError::Io {
+        operation: "inspect Android screen recording",
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() || metadata.len() < 12 {
+        return Err(WorkerError::Task(
+            "Android screen recording did not produce a regular MP4 artifact".to_owned(),
+        ));
+    }
+    let mut file = std::fs::File::open(path).map_err(|source| WorkerError::Io {
+        operation: "open Android screen recording",
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut header = [0_u8; 12];
+    file.read_exact(&mut header)
+        .map_err(|source| WorkerError::Io {
+            operation: "read Android screen recording header",
+            path: path.to_owned(),
+            source,
+        })?;
+    if &header[4..8] != b"ftyp" {
+        return Err(WorkerError::Task(
+            "Android screen recording artifact is not an ISO base media MP4".to_owned(),
+        ));
+    }
+    let mut offset = 0_u64;
+    let mut has_media_data = false;
+    let mut has_movie_metadata = false;
+    while offset < metadata.len() {
+        if metadata.len().saturating_sub(offset) < 8 {
+            return Err(WorkerError::Task(
+                "Android screen recording MP4 has a truncated top-level box".to_owned(),
+            ));
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|source| WorkerError::Io {
+                operation: "seek Android screen recording MP4",
+                path: path.to_owned(),
+                source,
+            })?;
+        let mut box_header = [0_u8; 8];
+        file.read_exact(&mut box_header)
+            .map_err(|source| WorkerError::Io {
+                operation: "read Android screen recording MP4 box",
+                path: path.to_owned(),
+                source,
+            })?;
+        let compact_size =
+            u32::from_be_bytes([box_header[0], box_header[1], box_header[2], box_header[3]]);
+        let (box_size, header_size) = match compact_size {
+            0 => (metadata.len() - offset, 8_u64),
+            1 => {
+                let mut extended_size = [0_u8; 8];
+                file.read_exact(&mut extended_size)
+                    .map_err(|source| WorkerError::Io {
+                        operation: "read Android screen recording MP4 extended box",
+                        path: path.to_owned(),
+                        source,
+                    })?;
+                (u64::from_be_bytes(extended_size), 16_u64)
+            }
+            value => (u64::from(value), 8_u64),
+        };
+        if box_size < header_size || box_size > metadata.len() - offset {
+            return Err(WorkerError::Task(
+                "Android screen recording MP4 has an invalid top-level box size".to_owned(),
+            ));
+        }
+        match &box_header[4..8] {
+            b"mdat" if box_size > header_size => has_media_data = true,
+            b"moov" if box_size > header_size => has_movie_metadata = true,
+            _ => {}
+        }
+        offset += box_size;
+    }
+    if !has_media_data || !has_movie_metadata {
+        return Err(WorkerError::Task(
+            "Android screen recording MP4 is incomplete (missing media data or movie metadata)"
+                .to_owned(),
+        ));
+    }
+    let sha256 = crate::sha256_file(path)?;
+    Ok((metadata.len(), sha256))
+}
+
+const fn microdroid_graceful_shutdown_available(
+    guest_kind: GuestKindV2,
+    adb_ready: bool,
+    has_adb_client: bool,
+    has_adb_serial: bool,
+) -> bool {
+    !matches!(guest_kind, GuestKindV2::Microdroid)
+        || (adb_ready && has_adb_client && has_adb_serial)
+}
+
+async fn create_microdroid_idsig(
+    instance_id: Uuid,
+    run_id: Uuid,
+    vm: &Path,
+    apk: &Path,
+    idsig: &Path,
+    environment: &BTreeMap<String, String>,
+    run_dir: &Path,
+) -> Result<(), WorkerError> {
+    let started = Instant::now();
+    tracing::info!(
+        event = "microdroid.idsig.creation.started",
+        %instance_id,
+        %run_id,
+        "creating Microdroid payload idsig"
+    );
+    if let Some(parent) = idsig.parent() {
+        hd_platform::ensure_owner_only_directory(parent)?;
+    }
+    let stdout_path = run_dir.join("microdroid-idsig.stdout.log");
+    let stderr_path = run_dir.join("microdroid-idsig.stderr.log");
+    let stdout = hd_platform::open_owner_only_rw(&stdout_path)?;
+    stdout.set_len(0).map_err(|source| WorkerError::Io {
+        operation: "truncate Microdroid idsig stdout",
+        path: stdout_path.clone(),
+        source,
+    })?;
+    let stderr = hd_platform::open_owner_only_rw(&stderr_path)?;
+    stderr.set_len(0).map_err(|source| WorkerError::Io {
+        operation: "truncate Microdroid idsig stderr",
+        path: stderr_path.clone(),
+        source,
+    })?;
+    let mut command = tokio::process::Command::new(vm);
+    command
+        .args(["create-idsig"])
+        .arg(apk)
+        .arg(idsig)
+        .envs(environment)
+        .current_dir(run_dir)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|source| WorkerError::Io {
+        operation: "start Microdroid payload idsig creation",
+        path: vm.to_owned(),
+        source,
+    })?;
+    let status =
+        if let Ok(result) = tokio::time::timeout(MICRODROID_IDSIG_TIMEOUT, child.wait()).await {
+            result.map_err(|source| WorkerError::Io {
+                operation: "wait for Microdroid payload idsig creation",
+                path: vm.to_owned(),
+                source,
+            })?
+        } else {
+            let _ = child.kill().await;
+            tracing::error!(
+                event = "microdroid.idsig.creation.failed",
+                error_code = "microdroid_idsig_timeout",
+                %instance_id,
+                %run_id,
+                duration_ms = elapsed_ms(started),
+                "Microdroid payload idsig creation timed out"
+            );
+            return Err(WorkerError::ComponentContract(
+                "Microdroid idsig creation timed out".to_owned(),
+            ));
+        };
+    if !status.success() {
+        let stderr = hd_platform::read_regular_nofollow_limited(&stderr_path, 1024 * 1024)
+            .unwrap_or_else(|error| format!("read idsig stderr failed: {error}").into_bytes());
+        tracing::error!(
+            event = "microdroid.idsig.creation.failed",
+            error_code = "microdroid_idsig_failed",
+            %instance_id,
+            %run_id,
+            duration_ms = elapsed_ms(started),
+            exit_code = status.code(),
+            "Microdroid payload idsig creation failed"
+        );
+        return Err(WorkerError::ComponentContract(format!(
+            "Microdroid idsig creation failed with {:?}: {}",
+            status.code(),
+            String::from_utf8_lossy(&stderr).trim()
+        )));
+    }
+    tracing::info!(
+        event = "microdroid.idsig.creation.succeeded",
+        %instance_id,
+        %run_id,
+        duration_ms = elapsed_ms(started),
+        "Microdroid payload idsig created"
+    );
+    Ok(())
+}
+
 fn toolchain_fingerprint(crosvm: Option<&Path>) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -3504,6 +6348,8 @@ pub enum WorkerError {
     InstanceMismatch,
     #[error("worker is busy: {0}")]
     Busy(&'static str),
+    #[error("operation is unsupported for this guest type: {0}")]
+    Unsupported(&'static str),
     #[error("instance is not running")]
     NotRunning,
     #[error("instance is not Ready")]
@@ -3543,6 +6389,30 @@ pub enum WorkerError {
     ComponentCleanup(String),
     #[error("guest process exited unexpectedly with code {0:?}")]
     GuestExited(Option<i32>),
+    #[error("Microdroid Payload exited with nonzero code {0}")]
+    MicrodroidPayloadFailed(i32),
+    #[error(
+        "Microdroid rejected the Payload APK signature or idsig; use an Android 15 APK Signature Scheme v3-signed Payload and upload it again"
+    )]
+    MicrodroidPayloadVerificationFailed,
+    #[error(
+        "Microdroid detected that the Payload changed for this instance; restore the original Payload or recreate the instance"
+    )]
+    MicrodroidPayloadChanged,
+    #[error(
+        "Microdroid rejected assets/vm_config.json; verify the task type, command, APEX list and extra APK declarations"
+    )]
+    MicrodroidInvalidPayloadConfig,
+    #[error(
+        "Microdroid Payload declares {declared} extra APKs but this instance selected {selected}; add or remove extra APKs in the declared order"
+    )]
+    MicrodroidExtraApkCountMismatch { declared: usize, selected: usize },
+    #[error(
+        "Microdroid could not connect to the host VirtualizationService; verify that the packaged host tools and guest image are from the certified bundle"
+    )]
+    MicrodroidServiceConnectionFailed,
+    #[error("Microdroid manager reported a runtime failure; collect diagnostics for the Guest log")]
+    MicrodroidRuntimeFailed,
     #[error("device endpoint is unavailable for role {0}")]
     DeviceEndpoint(String),
     #[error("device action is unsupported by this host: {0}")]
@@ -3555,6 +6425,8 @@ pub enum WorkerError {
     DiskLowWatermark { available: u64, required: u64 },
     #[error("display session failed: {0}")]
     DisplaySession(String),
+    #[error("host screen recorder failed: {0}")]
+    HostRecorder(String),
     #[error("APK digest mismatch: expected {expected}, actual {actual}")]
     UploadDigestMismatch { expected: String, actual: String },
     #[error("runtime endpoint path is too long: {0}")]
@@ -3582,6 +6454,9 @@ pub enum WorkerError {
     DeviceIpc(#[from] crate::DeviceIpcError),
     #[error(transparent)]
     Storage(#[from] crate::RuntimeStorageError),
+    #[cfg(unix)]
+    #[error(transparent)]
+    MicrodroidConsoleChallenge(#[from] MicrodroidConsoleChallengeError),
     #[error("JSON operation failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("{operation} failed for {path}: {source}")]
@@ -3602,6 +6477,11 @@ impl WorkerError {
                 | Self::CapabilityBlocked(_)
                 | Self::FrameHandshake(_)
                 | Self::ComponentContract(_)
+                | Self::MicrodroidPayloadVerificationFailed
+                | Self::MicrodroidPayloadChanged
+                | Self::MicrodroidInvalidPayloadConfig
+                | Self::MicrodroidExtraApkCountMismatch { .. }
+                | Self::MicrodroidServiceConnectionFailed
                 | Self::Artifacts(_)
         )
     }
@@ -3613,6 +6493,7 @@ impl WorkerError {
             Self::Action(_) => "action_invalid",
             Self::InstanceMismatch => "worker_instance_mismatch",
             Self::Busy(_) => "worker_busy",
+            Self::Unsupported(_) => "unsupported",
             Self::NotRunning => "worker_not_running",
             Self::NotReady => "worker_not_ready",
             Self::RestartRequired => "restart_required",
@@ -3630,11 +6511,19 @@ impl WorkerError {
             Self::ComponentExited { .. } => "component_exited",
             Self::ComponentCleanup(_) => "component_cleanup",
             Self::GuestExited(_) => "guest_exited",
+            Self::MicrodroidPayloadFailed(_) => "microdroid_payload_failed",
+            Self::MicrodroidPayloadVerificationFailed => "microdroid_payload_verification_failed",
+            Self::MicrodroidPayloadChanged => "microdroid_payload_changed",
+            Self::MicrodroidInvalidPayloadConfig => "microdroid_invalid_payload_config",
+            Self::MicrodroidExtraApkCountMismatch { .. } => "microdroid_extra_apk_count_mismatch",
+            Self::MicrodroidServiceConnectionFailed => "microdroid_service_connection_failed",
+            Self::MicrodroidRuntimeFailed => "microdroid_runtime_failed",
             Self::DeviceEndpoint(_) => "device_endpoint",
             Self::DeviceActionUnsupported(_) => "device_action_unsupported",
             Self::DeviceRejected(_) => "device_rejected",
             Self::DiskLowWatermark { .. } => "disk_low_watermark",
             Self::DisplaySession(_) => "display_session",
+            Self::HostRecorder(_) => "host_screen_recorder",
             Self::UploadDigestMismatch { .. } => "upload_digest_mismatch",
             Self::EndpointTooLong(_) => "endpoint_too_long",
             Self::UnsafeEndpoint(_) => "unsafe_endpoint",
@@ -3647,6 +6536,8 @@ impl WorkerError {
             Self::Adb(_) => "adb",
             Self::DeviceIpc(_) => "device_ipc",
             Self::Storage(_) => "runtime_storage",
+            #[cfg(unix)]
+            Self::MicrodroidConsoleChallenge(error) => error.code(),
             Self::Json(_) => "json",
             Self::Io { .. } => "io",
         }
@@ -3655,7 +6546,11 @@ impl WorkerError {
     pub fn api_error(&self) -> ApiErrorV2 {
         ApiErrorV2::new(self.code(), self.to_string()).retryable(matches!(
             self,
-            Self::Busy(_) | Self::AdbNotReady | Self::CapabilityChanged { .. } | Self::DeviceIpc(_)
+            Self::Busy(_)
+                | Self::AdbNotReady
+                | Self::CapabilityChanged { .. }
+                | Self::DeviceIpc(_)
+                | Self::HostRecorder(_)
         ))
     }
 }
@@ -3689,9 +6584,72 @@ mod tests {
     }
 
     #[test]
+    fn microdroid_death_reasons_have_actionable_stable_codes() {
+        let cases = [
+            (
+                "VM ended: MicrodroidPayloadVerificationFailed",
+                "microdroid_payload_verification_failed",
+            ),
+            (
+                "MICRODROID_PAYLOAD_HAS_CHANGED",
+                "microdroid_payload_changed",
+            ),
+            (
+                "VM ended unexpectedly: MicrodroidInvalidPayloadConfig",
+                "microdroid_invalid_payload_config",
+            ),
+            (
+                "MICRODROID_FAILED_TO_CONNECT_TO_VIRTUALIZATION_SERVICE",
+                "microdroid_service_connection_failed",
+            ),
+            (
+                "MICRODROID_UNKNOWN_RUNTIME_ERROR",
+                "microdroid_runtime_failed",
+            ),
+            ("VirtualizationServiceDied", "microdroid_runtime_failed"),
+        ];
+        for (logs, expected) in cases {
+            assert_eq!(
+                classify_microdroid_exit_logs(logs, Some(0)).code(),
+                expected
+            );
+        }
+        assert!(matches!(
+            classify_microdroid_exit_logs("unclassified failure", Some(17)),
+            WorkerError::GuestExited(Some(17))
+        ));
+    }
+
+    #[test]
+    fn microdroid_graceful_shutdown_requires_a_ready_adb_channel() {
+        assert!(!microdroid_graceful_shutdown_available(
+            GuestKindV2::Microdroid,
+            false,
+            false,
+            false
+        ));
+        assert!(microdroid_graceful_shutdown_available(
+            GuestKindV2::Microdroid,
+            true,
+            true,
+            true
+        ));
+        assert!(microdroid_graceful_shutdown_available(
+            GuestKindV2::Android,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
     fn a_foreign_lease_owner_is_rejected() {
         let temporary = tempfile::tempdir().expect("temporary data root");
-        let paths = DataPaths::from_root(temporary.path().join("data"));
+        let temporary_root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical temp root");
+        let paths = DataPaths::from_root(temporary_root.join("data"));
         paths.ensure().expect("data paths");
         let store = crate::PersistentStore::open(&paths.database()).expect("store");
         let manager = crate::LeaseManager::new(store, paths.clone()).expect("lease manager");

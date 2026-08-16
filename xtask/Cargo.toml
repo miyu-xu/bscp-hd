@@ -23,6 +23,7 @@ tar.workspace = true
 time.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+reflink-copy.workspace = true
 hex.workspace = true
 uuid.workspace = true
 zstd.workspace = true

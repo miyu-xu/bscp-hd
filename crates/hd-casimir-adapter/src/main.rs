@@ -1,6 +1,4 @@
-#![cfg_attr(not(windows), allow(dead_code, clippy::unused_async))]
-
-// The formal Casimir runtime is Windows-only; non-Windows builds retain probe and parser coverage.
+// The formal Casimir runtime supports Windows named pipes and Unix file/FIFO serial bridges.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,19 +15,23 @@ use hd_core::{
 use pdl_runtime::Packet as _;
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
-use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
+#[cfg_attr(windows, allow(unused_imports))]
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
+#[cfg(windows)]
 const PIPE_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const TAG_START_TIMEOUT: Duration = Duration::from_secs(3);
 const TYPE_2_MEMORY_BYTES: usize = 1024;
 const TYPE_2_MAX_NDEF_BYTES: usize = TYPE_2_MEMORY_BYTES - 24;
 
 #[derive(Debug, Parser)]
-#[command(about = "Formal HD Windows adapter for the AOSP Casimir NFC emulator")]
+#[command(about = "Formal HD adapter for the AOSP Casimir NFC emulator")]
 struct Arguments {
     #[arg(long)]
     probe_v2: bool,
@@ -220,10 +222,52 @@ async fn bridge_guest_nci(
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let _ = (endpoint, nci_address);
-        bail!("Casimir Guest NCI bridge is currently implemented for Windows only")
+        let mut guest_output = tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(&endpoint.guest_output)
+            .await
+            .context("open Guest NFC output")?;
+        loop {
+            let mut guest_input = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&endpoint.guest_input)
+                .await
+                .context("open Guest NFC input")?;
+            let nci = TcpStream::connect(nci_address)
+                .await
+                .context("connect private Casimir NCI listener")?;
+            let (mut nci_read, mut nci_write) = nci.into_split();
+            let guest_to_casimir = async {
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let read = guest_output.read(&mut chunk).await?;
+                    if read == 0 {
+                        // crosvm appends to a regular file on Unix. EOF is temporary while the
+                        // Guest is idle, so keep following the file instead of disconnecting NCI.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        continue;
+                    }
+                    nci_write.write_all(&chunk[..read]).await?;
+                    nci_write.flush().await?;
+                }
+                #[allow(unreachable_code)]
+                Ok::<(), std::io::Error>(())
+            };
+            let casimir_to_guest = tokio::io::copy(&mut nci_read, &mut guest_input);
+            tokio::pin!(guest_to_casimir, casimir_to_guest);
+            let (direction, result) = tokio::select! {
+                result = &mut guest_to_casimir => ("guest_to_casimir", result.map(|()| 0)),
+                result = &mut casimir_to_guest => ("casimir_to_guest", result),
+            };
+            tracing::warn!(
+                direction,
+                ?result,
+                "Guest NFC bridge disconnected; reconnecting"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -302,10 +346,79 @@ async fn run_control_server(context: Arc<FormalContext>, launch_bytes: &[u8]) ->
             });
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let _ = (context, launch_bytes);
-        bail!("Casimir formal control server is currently implemented for Windows only")
+        let path = PathBuf::from(&context.control_endpoint);
+        let (listener, _guard) = bind_owner_only_unix_listener(&path).await?;
+        publish_ready(&context, launch_bytes)?;
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let connection_context = Arc::clone(&context);
+            tokio::spawn(async move {
+                if let Err(error) = serve_connection(stream, connection_context).await {
+                    tracing::warn!(%error, "Casimir control connection failed");
+                }
+            });
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn bind_owner_only_unix_listener(
+    path: &Path,
+) -> Result<(tokio::net::UnixListener, SocketGuard)> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        ensure!(
+            metadata.file_type().is_socket(),
+            "stale Casimir control endpoint is not a socket"
+        );
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(_) => bail!("Casimir control endpoint already has an active listener"),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                std::fs::remove_file(path)?;
+            }
+            Err(error) => return Err(error).context("validate stale Casimir control socket"),
+        }
+    }
+    let listener = tokio::net::UnixListener::bind(path).context("bind Casimir control socket")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok((
+        listener,
+        SocketGuard {
+            path: path.to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    ))
+}
+
+#[cfg(unix)]
+struct SocketGuard {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+            && metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 

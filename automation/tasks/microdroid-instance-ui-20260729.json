@@ -1,0 +1,692 @@
+{
+  "schema_version": 2,
+  "task_id": "microdroid-instance-ui-20260729",
+  "objective": "将 macOS arm64 Microdroid 作为独立无图形实例类型接入 HD，并把 Android 与 Microdroid 的配置、制品、运行时、UI 和会话状态严格按实例隔离。",
+  "status": "in_progress",
+  "scope": {
+    "repositories": [
+      "hd",
+      "packages/modules/Virtualization"
+    ],
+    "owned_paths": [
+      "hd/crates/hd-core/",
+      "hd/crates/hd-runtime/",
+      "hd/crates/hd-worker/",
+      "hd/crates/hd-ui/",
+      "hd/web/",
+      "hd/automation/",
+      "packages/modules/Virtualization/android/vm/",
+      "packages/modules/Virtualization/android/virtmgr/",
+      "packages/modules/Virtualization/libs/libvmclient/",
+      "packages/modules/Virtualization/libs/microdroid_payload_config/"
+    ],
+    "excluded_paths": [
+      "Windows 本地仓库",
+      "hardware/google/gfxstream 的用户未提交改动",
+      "当前运行 Android 实例的数据盘和日志",
+      "受保护 Microdroid 与 x86_64 发布路径"
+    ]
+  },
+  "constraints": [
+    "do_not_run_unittest",
+    "preserve_user_changes",
+    "do_not_push",
+    "do_not_interrupt_current_android_guest_without_need",
+    "macos_arm64_first",
+    "microdroid_is_headless",
+    "instance_settings_are_not_global"
+  ],
+  "acceptance": [
+    {
+      "id": "MD-CONFIG-001",
+      "criterion": "Android 与 Microdroid 使用可判别的实例配置；旧 Android 配置无损迁移，保存携带 expected revision，APK/Payload 与所有运行参数按实例隔离。",
+      "evidence": [
+        "gate:instance-settings-isolation",
+        "event:instance.settings.revision_conflict"
+      ]
+    },
+    {
+      "id": "MD-UI-002",
+      "criterion": "新建实例可选择类型；Android 保留 Player/设备工具，Microdroid 只展示工作负载、Shell、设置和诊断，不出现图形专属控制。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "artifact:microdroid-ui-contract.json",
+        "artifact:productization-v55/microdroid-ui-contract-v95.json",
+        "artifact:productization-v55/installed-microdroid-controls-v95/result.json"
+      ]
+    },
+    {
+      "id": "MD-RUNTIME-003",
+      "criterion": "HD 使用 macOS Mach-O vm/virtmgr/crosvm 和 products/microdroid/vsoc_arm64_only 制品启动非保护 Microdroid，自动生成 idsig，结构化上报创建、启动、Payload ready 与退出。",
+      "evidence": [
+        "gate:macos-microdroid-real-guest",
+        "event:microdroid.payload.ready",
+        "artifact:microdroid-run.json"
+      ]
+    },
+    {
+      "id": "MD-MULTI-004",
+      "criterion": "两个 Microdroid 实例使用独立 CID、ADB 端口、工作目录、Payload 和日志，可并行启动、独立停止且不影响 Android。",
+      "evidence": [
+        "gate:macos-microdroid-multi-instance",
+        "artifact:microdroid-multi-instance.json",
+        "artifact:productization-v56/installed-microdroid-controls-v103/multi/resources.tsv",
+        "artifact:productization-v56/installed-microdroid-controls-v103/result.json"
+      ]
+    },
+    {
+      "id": "MD-PACKAGE-005",
+      "criterion": "发布包声明 Microdroid 能力并校验 host 工具与 guest 制品兼容性；缺失时实例被明确阻断而非回退或假成功。",
+      "evidence": [
+        "gate:macos-package-smoke",
+        "event:microdroid.artifact.blocked"
+      ]
+    },
+    {
+      "id": "MD-RELEASE-006",
+      "criterion": "Microdroid 使用独立、可重现的 guest/host 制品身份和按 guest kind 区分的 HostCertificationV2；正式包首次启动只安装签名包内的信任根与证书，开发绕过不会进入正式包。",
+      "evidence": [
+        "gate:microdroid-release-identity",
+        "event:release.materials.installed",
+        "artifact:runtime-identity-v2.json"
+      ]
+    },
+    {
+      "id": "MD-DISTRIBUTION-007",
+      "criterion": "macOS 打包明确区分 development 与 release；release 强制 Developer ID、发布信任材料和可选公证，排除 Finder 元数据，输出稳定版本、完整校验和及可重现的 Microdroid 身份摘要。",
+      "evidence": [
+        "gate:macos-release-contract",
+        "artifact:HD.app.sha256"
+      ]
+    },
+    {
+      "id": "MD-PAYLOAD-008",
+      "criterion": "上传型 Microdroid Payload 使用标准 executable/microdroid_launcher 配置完成 idsig、run-app 和真实 Guest ready；短命令的 transient virtmgr 必须确定退出，任何阶段不得无限停留在 Preparing。",
+      "evidence": [
+        "gate:macos-microdroid-payload",
+        "event:microdroid.idsig.creation.succeeded",
+        "artifact:microdroid-payload-run.json"
+      ]
+    },
+    {
+      "id": "MD-DIAGNOSTICS-009",
+      "criterion": "AOSP Microdroid 的 Guest 异常退出原因必须从 worker、操作记录贯通到实例状态并保留稳定错误码；签名、Payload 配置和服务连接错误必须以可操作建议阻断启动，未知退出保留为运行时失败。",
+      "evidence": [
+        "gate:macos-microdroid-error-propagation",
+        "event:worker.command.failed",
+        "artifact:microdroid-error-propagation.json"
+      ]
+    },
+    {
+      "id": "MD-PAYLOAD-DIST-010",
+      "criterion": "每个 macOS 候选包必须携带版本化 Microdroid conformance Payload bundle；清单固定 channel、版本、大小、APK SHA-256 与唯一 signer certificate SHA-256，release 强制 v3/v3.1 密码学验签及期望 signer，development 制品不得冒充 release。CLI/UI 导入在保存实例设置前拒绝缺少 v3 signing block 的 Payload。",
+      "evidence": [
+        "gate:macos-microdroid-payload-bundle",
+        "artifact:payload-bundle-v1.plist",
+        "artifact:payload-v16-smoke/ready.json"
+      ]
+    },
+    {
+      "id": "MD-CLOSURE-011",
+      "criterion": "macOS 包不得复制完整 Cuttlefish product；必须从源码输入生成可重现、无符号链接和额外文件的 Microdroid v1 运行闭包，以逐文件摘要和 guest identity 双重封装。闭包限定 empty/uploaded 且无额外 APEX 的产品契约，并分别通过两类真实 Guest Ready；Host 启动时重算闭包全部文件并识别篡改。",
+      "evidence": [
+        "gate:macos-microdroid-runtime-closure",
+        "artifact:runtime-closure-v1.plist",
+        "artifact:package-v17-empty/ready.json",
+        "artifact:package-v17-uploaded/ready.json"
+      ]
+    },
+    {
+      "id": "MD-TOOLCHAIN-DIST-012",
+      "criterion": "macOS runner 必须使用固定摘要的 arm64 Node/npm、Temurin JDK 与 Android build-tools 从干净 npm ci 重建 Web；包内 provenance 不得触发 release trust 语义。应用清单使用可移植相对路径，压缩分发包必须携带 archive、应用树和身份 sidecar，解包后逐文件、codesign、闭包、Payload、工具链身份以及 empty/uploaded 两类真实 Guest Ready 全部通过。",
+      "evidence": [
+        "gate:macos-release-toolchain-distribution",
+        "artifact:toolchain-identity-v1.plist",
+        "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080213.tar.xz.distribution-v2.plist",
+        "artifact:installed-microdroid-readiness-v56/empty/ready.json",
+        "artifact:installed-microdroid-readiness-v56/uploaded/ready.json",
+        "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080332.tar.xz.distribution-v2.plist",
+        "artifact:productization-v56/installed-microdroid-controls-v100/result.json",
+        "artifact:productization-v56/installed-microdroid-controls-v102/result.json",
+        "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080335.tar.xz.distribution-v2.plist",
+      "artifact:productization-v56/installed-microdroid-controls-v103/result.json",
+      "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080336.tar.xz.distribution-v2.plist",
+      "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080341.tar.xz.distribution-v2.plist",
+      "artifact:productization-v56/distribution-v109-gates.json",
+      "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080343.tar.xz.distribution-v2.plist",
+      "sha256:dbabe490c4b2d412fe0fbd02cda69f4d66460a894513603e82b08c34b5b79e1d",
+      "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080344.tar.xz.distribution-v2.plist",
+      "sha256:1e9564aa600f8fbce84efab9ebd34fe73ee94de40e707a2e39048ae5f5c52f1a"
+      ]
+    },
+    {
+      "id": "MD-INSTALLED-GUEST-013",
+      "criterion": "每个候选归档必须在独立目录安全解包、确认 Android aggregate 保持稀疏并重新验证应用树后，使用包内 Host、Worker、AVF 工具、运行闭包和 conformance Payload 分别运行 Empty 与 uploaded Microdroid 到 Ready；development 绕过必须显式启用，停止、删除与 Host 关闭后不得残留进程。",
+      "evidence": [
+        "gate:macos-release-installed-guest",
+        "artifact:installed-microdroid-readiness-v56/result.json",
+        "artifact:installed-microdroid-readiness-v56/installed-guest-gates.json",
+        "artifact:productization-v56/installed-microdroid-controls-v100/result.json",
+        "artifact:productization-v56/installed-microdroid-controls-v100/installed-guest-gates.json",
+        "artifact:productization-v56/installed-microdroid-controls-v102/result.json",
+        "artifact:productization-v56/installed-microdroid-controls-v102/installed-guest-gates.json",
+        "artifact:productization-v56/installed-microdroid-controls-v103/result.json",
+        "artifact:productization-v56/installed-microdroid-controls-v103/installed-guest-gates.json"
+      ]
+    },
+    {
+      "id": "MD-STARTUP-UX-014",
+      "criterion": "Host 首启失败必须按启动尝试隔离并立即反馈稳定错误码；损坏的发布信任材料在并发启动下不得等待通用超时、不得半安装信任根或认证、不得遗留 Host 进程，Finder 启动 UI 必须使用原生错误对话框提供日志入口。",
+      "evidence": [
+        "gate:host-startup-release-bootstrap",
+        "event:host.startup.failed",
+        "artifact:startup-negative-v24/result.json"
+      ]
+    },
+    {
+      "id": "MD-SHUTDOWN-015",
+      "criterion": "`shutdown --stop-all` 必须是确定性的部署与清理边界：活动 Microdroid 没有 Ready ADB 时直接 force stop；其他 Guest 的 graceful stop 失败后自动 force fallback；只有全部 Guest 与空闲 Worker 回收后才关闭 Host，测试异常退出还必须按安装目录兜底终止子进程。",
+      "evidence": [
+        "gate:host-shutdown-stop-all",
+        "event:host.shutdown.force_fallback",
+        "artifact:installed-microdroid-readiness-v56/empty/shutdown-stop-all.stderr"
+      ]
+    },
+    {
+      "id": "MD-RECOVERY-016",
+      "criterion": "诊断导出必须在未选择实例时仍可生成 Host-only 包，UI 独立保留产物路径并支持复制和 Finder 定位；包写入必须具有磁盘余量预检、原子替换、并发串行化、陈旧临时文件清理、保留策略和脱敏。旧实例升级必须字节级备份且可重复执行，并拒绝目录 UUID 不匹配和符号链接逃逸。",
+      "evidence": [
+        "gate:diagnostics-product-contract",
+        "gate:legacy-migration-product-contract",
+        "gate:installed-host-only-diagnostics",
+        "artifact:installed-v29-final/host-only-diagnostics.json"
+      ]
+    },
+    {
+      "id": "MD-NETWORK-SERVICE-017",
+      "criterion": "macOS 网络兼容服务必须以普通用户权限提供严格版本化状态，区分基础 socket_vmnet NAT 与全隧道 VPN NAT；UI 只在用户确认后请求管理员安装、升级或修复。状态读取必须有截止时间，安装期间不得启动新轮询，安装前发出的旧代次响应不得覆盖安装后的状态；超时必须回收独立进程组中的完整父子进程树。管理员进程必须执行已签名 Mach-O 内嵌脚本的 root 私有快照而非用户可变路径；同一生产命令必须以无提权 status 模式验证资源绑定、并发读取、超时进程树回收、解码执行、staging 清理、篡改拒绝和 AppleScript 编译。安装必须校验系统路径并以 PF、helper、LaunchDaemon 和 PF token 快照事务回滚，当前网络可用时服务版本落后不得误报为离线。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:macos-network-product-contract",
+        "gate:macos-network-packaged-contract",
+        "artifact:macos-network-productization-20260731/network-v29-source-contract.json"
+      ]
+    },
+    {
+      "id": "MD-ANDROID-DIST-018",
+      "criterion": "development 候选必须通过 direct-linux 或 signed-artifact-store-v2 中严格互斥的一种方式自包含 Android 15、ADB、aapt2 与 gfxstream，并从稀疏 tar.xz 独立解包后在无外部路径覆盖的桌面壳中连续两次启动到 Ready；首次分配存储按完整容量准入，已有且尺寸兼容的数据盘重启只要求运行余量，不能重复预留完整容量。ADB、网络、userdata 持久化、单调 frame generation、零拷贝与进程清理必须通过。正式包必须拒绝 development-unencrypted，强制使用生产签名 store 与 metadata-encrypted 配置。",
+      "evidence": [
+        "gate:macos-android-installed-guest",
+        "artifact:installed-android-readiness-v56-r2/result.json",
+        "artifact:android-artifact-store-v47/index-v2.json"
+      ]
+    },
+    {
+      "id": "MD-ANDROID-STORE-019",
+      "criterion": "macOS Android 使用可迁移 signed-artifact-store-v2：索引必须绑定 channel、data profile、Guest/Host digest 与 rootfs 相对路径；包内 trust root 对 Guest/Host Ed25519 签名、逐文件摘要、fstab 和精确闭包做独立验证，拒绝额外文件、篡改、错误渠道/信任根及任意父目录符号链接。development 可显式使用签名未加密数据配置，release 强制 metadata-encrypted 与生产认证；应用只从已验证角色推导 crosvm/gfxstream/ANGLE/Vulkan 运行路径。最终签名 development 归档必须以包内闭包连续两次启动 Android 15 到 Ready。",
+      "evidence": [
+        "gate:macos-android-package-contract",
+        "gate:macos-android-artifact-store-contract",
+        "gate:macos-android-installed-guest",
+        "artifact:android-artifact-store-v47-contract/result.json",
+        "artifact:installed-android-readiness-v56-r2/result.json"
+      ]
+    },
+    {
+      "id": "MD-UPGRADE-020",
+      "criterion": "Host 运行时升级必须以不同的旧/新 hd-host SHA-256 为前提：旧 Host 空闲时，新客户端在五秒产品预算内完成摘要绑定接管；旧 Host 正承载 Ready Guest 时，新客户端继续复用旧 Host/Worker/run，直到显式 stop-all 后才切换到新 Host。相同二进制、符号链接应用或目标目录必须在创建 data root 和进程前拒绝，所有场景完成后不得遗留进程。",
+      "evidence": [
+        "gate:host-runtime-inactive-takeover",
+        "gate:host-runtime-active-deferral",
+        "gate:host-runtime-upgrade-contract",
+        "artifact:runtime-upgrade-inactive-v40/result.json",
+        "artifact:runtime-upgrade-active-v40/result.json",
+        "artifact:productization-v56/runtime-upgrade-inactive-v104-v109/result.json",
+        "artifact:productization-v56/runtime-upgrade-active-v104-v109/result.json",
+        "artifact:productization-v56/runtime-rollback-inactive-v109-v104/result.json",
+        "artifact:productization-v56/runtime-rollback-active-v109-v104/result.json"
+      ]
+    },
+    {
+      "id": "MD-UI-CONCURRENCY-021",
+      "criterion": "多 WebView UI 的 Host 快照必须按唯一代次串行化；实例选择、创建、设置保存、Payload 导入和实例操作完成后，旧快照或重复完成事件不得恢复旧选择或覆盖新状态。侧栏电源操作必须携带目标实例 ID，只有目标实例详情已同步时才允许执行；异步设置或 Payload 结果只能更新同一当前实例。",
+      "evidence": [
+        "gate:web-ui-concurrency",
+        "artifact:ui-concurrency-v41/macos-ui-interaction.json",
+        "event:ui.snapshot.stale_rejected",
+        "event:ui.instance_operation.target_rejected",
+        "event:ui.async_result.selection_changed"
+      ]
+    },
+    {
+      "id": "MD-SOAK-022",
+      "criterion": "最终安装应用必须在同一隔离 data root 连续完成至少 100 轮 Microdroid create、真实 Payload Ready、force stop 和 delete；每轮 Ready 不超过 90 秒，删除后 Worker/crosvm 必须归零。热身后 Host RSS 增长不得超过 128 MiB、文件描述符不得增长超过 16、线程不得增长超过 8、data root 不得增长超过 16 MiB，最终 shutdown 后不得遗留测试进程。",
+      "evidence": [
+        "gate:macos-microdroid-soak",
+        "artifact:microdroid-soak-v42-100/result.json",
+        "artifact:microdroid-soak-v42-100/cycles.jsonl",
+        "artifact:productization-v55/microdroid-soak-v95-100/result.json",
+        "artifact:productization-v55/microdroid-soak-v95-100/cycles.jsonl",
+        "artifact:productization-v56/microdroid-soak-v103-c10/result.json",
+        "artifact:productization-v56/microdroid-soak-v103-c10/cycles.jsonl",
+        "artifact:productization-v56/microdroid-soak-v104-c3/result.json",
+        "artifact:productization-v56/microdroid-soak-v104-c100/result.json",
+        "artifact:productization-v56/microdroid-soak-v104-c100/cycles.jsonl",
+        "artifact:productization-v56/microdroid-soak-v111-c3/result.json",
+        "artifact:productization-v56/microdroid-soak-v112-c3/result.json"
+      ]
+    },
+    {
+      "id": "MD-RESOURCE-023",
+      "criterion": "最终安装应用必须在隔离的 2 GiB APFS 卷上确定性拒绝需要 10 GiB 的新 Android 实例：能力响应不超过 10 秒、start 拒绝不超过 5 秒，并在资源恢复前以 capability.artifacts.deferred 跳过昂贵 Android bundle/device 探测。阻断发生在私有磁盘分配、Worker 和 crosvm 启动之前，实例进入 Blocked，shutdown 后无测试进程；资源满足后启动仍必须执行完整签名与逐文件哈希。",
+      "evidence": [
+        "gate:macos-resource-admission",
+        "artifact:resource-admission-v42/result.json",
+        "artifact:productization-v56/resource-admission-v104-direct/result.json",
+        "event:capability.artifacts.deferred"
+      ]
+    },
+    {
+      "id": "MD-HASH-PERF-024",
+      "criterion": "macOS 对签名 Android bundle 的严格生命周期准入必须继续以 no-follow 句柄完整读取并逐文件校验 SHA-256，不得使用摘要缓存或外部进程；16.5 GB 稀疏 rootfs 的单次完整哈希在发布 Mac 上必须不超过 20 秒，摘要与 manifest 精确一致。",
+      "evidence": [
+        "gate:macos-artifact-verification-performance",
+        "artifact:artifact-hash-performance-v42-candidate/result.json"
+      ]
+    },
+    {
+      "id": "MD-MACOS-NFC-025",
+      "criterion": "macOS 签名 Android 候选在实例启用 NFC 时必须启动正式 AOSP Casimir，并通过 /dev/hvc12 与 Guest 双向传输真实 NCI；Casimir 重连不得重放历史 NCI，活动 Unix 控制 socket 不得被接管。NFC HAL、Cuttlefish HAL 进程与 framework binder 必须在 Type 2、Type 4、移除动作后及第二次启动后保持存活。禁用 NFC 必须停止 HAL 并移除 package，不能以被动框架假实现或手工 workaround 冒充通过。",
+      "evidence": [
+        "gate:macos-nfc-real-guest",
+        "gate:host-worker-smoke",
+        "artifact:installed-android-readiness-v56-r2/result.json",
+        "artifact:installed-android-readiness-v56-r2/nfc-lifecycle.tsv"
+      ]
+    },
+    {
+      "id": "MD-MACOS-BLUETOOTH-026",
+      "criterion": "macOS 签名 Android 候选在实例启用 Bluetooth 时必须启动正式 AOSP RootCanal，并通过 Guest H4 串口双向传输真实 HCI；活动 Unix 控制 socket 不得被接管。Bluetooth HAL、framework binder 与 ON 状态必须在虚拟 GATT peer 创建、BLE 广告开关、移除动作后及第二次启动后保持存活。能力边界只声明确定性虚拟 BLE peer 和最小 GAP/GATT Device Name，不得以软件 surface、disabled 占位 artifact、物理 RF 声明或手工 svc workaround 冒充通过。",
+      "evidence": [
+        "gate:macos-bluetooth-real-guest",
+        "gate:host-worker-smoke",
+        "artifact:installed-android-readiness-v56-r2/result.json",
+        "artifact:installed-android-readiness-v56-r2/bluetooth-lifecycle.tsv"
+      ]
+    },
+    {
+      "id": "MD-MACOS-UWB-027",
+      "criterion": "macOS 签名 Android 候选在实例启用 UWB 时必须启动正式 FiRa v2 UCI component，并通过 Guest /dev/hvc9 双向传输真实 UCI；活动 Unix 控制 socket 不得被接管。android.hardware.uwb-service、AIDL HAL、framework service、READY 设备状态与实例国家码必须在首次和第二次启动后成立。能力边界只声明确定性 session 生命周期和短地址距离报告，不得以软件 baseline、Host Ping、物理 RF、角度或 CCC 声明冒充通过。",
+      "evidence": [
+        "gate:macos-uwb-real-guest",
+        "gate:host-worker-smoke",
+        "artifact:installed-android-readiness-v56-r2/result.json",
+        "artifact:installed-android-readiness-v56-r2/uwb-lifecycle.tsv"
+      ]
+    },
+    {
+      "id": "MD-MACOS-MODEM-028",
+      "criterion": "macOS 签名 Android 候选在实例启用 Modem 时必须启动正式 modem component，并通过按 Guest CID 隔离的 owner-only host-vsock 9697 Unix socket 与 Cuttlefish vendor RIL 双向传输 AT；活动或异用户 Unix socket 不得被接管，正常受管停止必须清理端点。vendor RIL、Radio HAL、telephony framework 与确定性测试运营商 00101 必须在首次和第二次启动后成立。能力边界只声明 SIM 身份、信号、运营商和注册查询，不得声明物理运营商、通话、短信、IMS、5G 或数据附着。",
+      "evidence": [
+        "gate:macos-modem-real-guest",
+        "gate:host-worker-smoke",
+        "artifact:installed-android-readiness-v56-r2/result.json",
+        "artifact:installed-android-readiness-v56-r2/modem-lifecycle.tsv"
+      ]
+    },
+    {
+      "id": "MD-RUNTIME-STORAGE-029",
+      "criterion": "每个实例的运行历史必须有确定性磁盘预算：启动前压缩已完成 run 中超过 64 MiB 的文本日志并仅保留最后 16 MiB，随后最多保留最近 20 轮且总逻辑大小不超过 2 GiB；即使超过预算也至少保留最近 5 轮。活动 run、缺少最终 result 的异常现场、其他实例和用户私有磁盘不得被维护任务修改，所有压缩和删除必须结构化记录；最终安装包还必须以包内 Worker 在真实 Android 重启前复现压缩和裁剪。",
+      "evidence": [
+        "gate:runtime-storage-smoke",
+        "gate:macos-installed-runtime-storage",
+        "event:runtime.run.log_compacted",
+        "event:runtime.run.pruned",
+        "artifact:ai-cycle-v54-network-poll-r2/artifacts/runtime-storage-smoke.json",
+        "artifact:installed-android-readiness-v56-r2/run-retention.tsv"
+      ]
+    },
+    {
+      "id": "MD-RESOURCE-UX-030",
+      "criterion": "Android 实例的性能设置必须展示当前已保存配置对应的主机资源准入快照，包括请求与可用 CPU、Guest 内存加 Host 保留、所需与可用磁盘以及新建/已有实例存储模式，并提供手动重新检测。界面快照仅用于解释，实际 start 必须原子重算并保持唯一授权边界；资源阻断错误必须给出可行动的 host.resources 根因和数值，折叠尚未执行的制品、设备与发布检查，不能把派生占位结果误报为独立故障。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:macos-resource-admission",
+        "artifact:ui-idle-poll-perf-v53.json",
+        "artifact:host-resource-admission-ui-poll-v53/result.json",
+        "artifact:macos-release-v53-ui-poll-gates.json"
+      ]
+    },
+    {
+      "id": "MD-CAPABILITY-PERF-031",
+      "criterion": "Player 初始选择、新建实例和性能页资源刷新必须使用 2 秒预算内的 resource-only 准入路径，只读取已保存规格及动态 CPU、内存、磁盘，不得加载信任材料、哈希 Android bundle、执行外部工具或设备探测；切换实例或保存设置必须以独立代次拒绝旧资源响应。完整设备能力只在设备界面按需发现，生命周期 start 仍必须在原子操作锁内执行完整签名、逐文件哈希、zero-copy、设备与认证发现，不能用资源快照授权启动。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:http-security-smoke",
+        "gate:macos-resource-admission",
+        "gate:macos-android-installed-guest",
+        "gate:macos-artifact-verification-performance",
+        "artifact:ui-idle-poll-perf-v53.json",
+        "artifact:host-resource-admission-ui-poll-v53/result.json",
+        "event:resource.admission.probed",
+        "event:ui.resource_admission.stale_rejected"
+      ]
+    },
+    {
+      "id": "MD-UI-POLL-PERF-032",
+      "criterion": "UI 实例状态刷新必须通过单次原子 Host 快照返回同一持久化枚举中的列表和选中详情，不能继续以 list/get 两个请求拼接可能撕裂的状态。生命周期命令或过渡状态保持 250ms 响应预算；稳定前台 Player 最多每秒一次，稳定设置/设备页或失焦窗口最多每两秒一次，最小化窗口最多每五秒一次。主事件循环必须使用原生定时唤醒而非独立 100ms ticker 线程；实例切换仍以代次拒绝旧快照，轮询路径不得触发信任加载、制品哈希、外部工具或设备探测。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:ui-snapshot-performance-smoke",
+        "artifact:ai-cycle-v54-network-poll-r2/artifacts/ui-snapshot-performance.json",
+        "endpoint:GET /v2/ui-snapshot",
+        "event:ui.snapshot.stale_rejected"
+      ]
+    },
+    {
+      "id": "MD-NETWORK-POLL-PERF-033",
+      "criterion": "macOS 网络状态检查会启动外部 shell，因此必须跟随设备页可见性而不是应用生命周期：应用启动、Player、设置、诊断、失焦和最小化状态不得探测；前台设备页只在缓存达到 30 秒后刷新且最多每 30 秒一次。手动刷新和安装完成后的强制复验必须保留并禁止重叠；离开设备页必须使旧代次响应失效，旧响应不得复活后台探测。稳定 Player 的网络 status 外部进程必须从旧实现每小时 120 次降为 0。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:ui-background-work-performance-smoke",
+        "artifact:productization-v39/ui-background-work-v54.json",
+        "artifact:productization-v39/ui-player-background-product-v54.json",
+        "artifact:installed-android-readiness-v56-r2/result.json",
+        "artifact:HD-0.2.0-development-signed-android-macos-arm64-2026080213.tar.xz.distribution-v2.plist",
+        "event:ui.network_status.probe.started",
+        "event:ui.network_status.hidden_refresh_rejected",
+        "event:ui.network_status.hidden_install_rejected"
+      ]
+    },
+    {
+      "id": "MD-MACOS-LIFECYCLE-034",
+      "criterion": "macOS 根 NSWindow、NativeDisplayHost 与 WebView 必须在 winit event handler 已安装后的首次 Resumed 中由 PendingShell 单向初始化为 RunningShell；重复恢复不得创建第二套界面。初始化失败必须退出事件循环并交给现有原生 fatal dialog，不能吞错或关闭 winit 日志掩盖。AppKit 必须监听 NSWorkspace sleep/wake：睡眠前隐藏并释放 DisplaySession、唤醒后重新计算 viewport 并立即附加；纯 Occluded 仍保留会话。最终安装包必须通过 Finder open -n 与隔离 data root 启动，UI/Host 在观察期存活，日志中 pre-handler 与 startup failure 均为 0，随后认证 shutdown 且无进程残留。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:macos-ui-native-lifecycle",
+        "artifact:productization-v42/ui-native-lifecycle-v59/result.json",
+        "artifact:productization-v56/ui-contract-v104-source-r2/macos-ui-interaction.json",
+        "artifact:productization-v56/ui-native-lifecycle-v104/result.json",
+        "event:ui.lifecycle.suspended",
+        "event:ui.lifecycle.resumed",
+        "event:ui.lifecycle.startup.failed"
+      ]
+    },
+    {
+      "id": "MD-ANDROID-READINESS-035",
+      "criterion": "Android 的 adb_ready 必须表示 Guest 已稳定可交互：sys.boot_completed=1、service.bootanim.exit=1、init.svc.bootanim=stopped、bootanimation 进程不存在、Package Manager、SurfaceFlinger、InputManager 与 WindowManager 必须连续满足；退出请求不能单独构成 Ready。Worker 在设备/网络策略和显示配置之后必须再次复验；keep-awake 与显示配置以幂等、有界事务收敛，瞬时服务撤销可重试，但失败不得发布 ADB 就绪。macOS 原生显示仍可提前呈现，但 ADB 动作和 APK 安装保持拒绝直到最终复验；安装包必须通过 20 轮启停 soak。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:macos-android-installed-guest",
+        "artifact:productization-v42/android-readiness-contract-v58.json",
+        "artifact:productization-v42/android-readiness-soak-v59/result.json",
+        "artifact:productization-v56/android-readiness-soak-v103-c5/result.json",
+        "artifact:productization-v56/android-readiness-soak-v104-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v104-c20/result.json",
+        "event:adb.readiness.succeeded",
+        "event:worker.adb.deferred_readiness.succeeded",
+        "property:init.svc.bootanim=stopped",
+        "service:input=found",
+        "service:window=found"
+      ]
+    },
+    {
+      "id": "MD-PROCESS-REAP-036",
+      "criterion": "Unix detached Host/Worker 必须由直接父进程主动回收。实例 Delete 后 Worker PID 必须彻底消失且不能残留 zombie；Host shutdown 后 Host PID 也必须由 UI 回收。20 轮 Android 启停 soak 必须同时证明同 Worker 复用、Delete/Shutdown 回收和隔离进程清零。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:macos-android-readiness-soak",
+        "artifact:productization-v42/android-readiness-soak-v59/result.json",
+        "artifact:productization-v56/android-readiness-soak-v103-c5/result.json",
+        "artifact:productization-v56/android-readiness-soak-v104-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v104-c20/result.json",
+        "event:worker.stopped",
+        "process:detached-zombie=0"
+      ]
+    },
+    {
+      "id": "MD-RUN-EPHEMERAL-037",
+      "criterion": "已完成 Android run 不得长期保留可从验签制品确定性再生成的 patched initrd。Worker 必须先写入最终 result，再只删除精确白名单 initrd-android-hd.img 并记录审计事件；新 run 启动前的 retention 维护还必须清理旧版本遗留的已完成 run。没有最终 result 的活动 run、符号链接、日志、manifest、events、实例私有磁盘和其他文件都不得被该路径修改。20 轮安装包 soak 从首轮热身到末轮的整个 data root 增长不得超过 512 MiB，gate 必须准确记录实际 cycles。",
+      "evidence": [
+        "gate:runtime-storage-smoke",
+        "gate:macos-android-readiness-soak",
+        "artifact:productization-v42/runtime-storage-v59/result.json",
+        "artifact:productization-v42/installed-android-readiness-v59/result.json",
+        "artifact:productization-v56/android-readiness-soak-v103-c5/result.json",
+        "artifact:productization-v56/android-readiness-soak-v104-c3/result.json",
+        "artifact:productization-v56/android-readiness-soak-v104-c20/result.json",
+        "artifact:productization-v42/installed-android-readiness-v59/run-retention.tsv",
+        "artifact:productization-v42/android-readiness-soak-v59/result.json",
+        "event:runtime.run.ephemeral_artifact.removed",
+        "maintenance:pre_start_retention",
+        "process:active-run-protected=true",
+        "metric:data_growth_kib=253876"
+      ]
+    },
+    {
+      "id": "MD-FIRST-PAINT-038",
+      "criterion": "macOS 根窗口在首屏 WebView ready 前必须保持隐藏，但不得形成永久不可见的健康进程。当前页面必需 surface 必须在 15 秒内聚合，显示请求后由原生窗口 API 确认可见并只记录一次 ready；可见性被拒绝或超时必须记录结构化失败、退出事件循环并交给现有 fatal dialog。正在关闭或已经显示的窗口不得被超时误判，Finder 安装包门必须证明首屏 ready 恰好一次且无 visibility rejection/timeout。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:macos-ui-native-lifecycle",
+        "artifact:productization-v42/ui-first-paint-contract-v60.json",
+        "artifact:productization-v42/ui-native-lifecycle-v60/result.json",
+        "event:ui.lifecycle.first_paint.ready",
+        "event:ui.lifecycle.first_paint.visibility_rejected=0",
+        "event:ui.lifecycle.first_paint.timed_out=0",
+        "metric:first_paint_timeout_ms=15000"
+      ]
+    },
+    {
+      "id": "MD-WINDOW-OCCLUSION-039",
+      "criterion": "macOS 根窗口被系统隐藏或完全遮挡时必须消费 winit 原生 Occluded 状态，不得继续按普通失焦频率刷新。稳定不可见态的原子 UI snapshot 间隔必须为 5 秒、网络外部 status 完全暂停，恢复可见后自动回到页面/焦点策略；遮挡只能降低控制面轮询，不能释放 DisplaySession、隐藏 gfxstream surface 或改变 Android 内部状态，以避免恢复黑屏。状态变化必须结构化记录，遮挡时展开的侧栏必须自动关闭。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "artifact:productization-v42/ui-occlusion-contract-v62.json",
+        "event:ui.window.occlusion.changed",
+        "metric:occluded_snapshot_interval_ms=5000",
+        "metric:occluded_snapshot_requests_per_minute=12",
+        "metric:occluded_network_probes_per_hour=0",
+        "process:display-session-preserved=true"
+      ]
+    },
+    {
+      "id": "MD-UI-SINGLE-040",
+      "criterion": "Windows 与 macOS 默认/Finder 第二次启动必须在制品、Host、NativeDisplayHost 和 WebView 初始化前激活已有 HD 原生窗口并退出，不得创建第二个 UI、Host 或 data root；显式 --data-root 是隔离 profile，必须允许并行发布 QA。Windows 必须用 PID owner marker 区分默认窗口与相同标题的隔离窗口；macOS NativeDisplayHost 的 CoreAnimation socket 必须按用户与 UI PID 隔离，使隔离 profile、不同 bundle identity 的升级验证和诊断会话可安全重叠，且不得争用或删除已有 UI 的 endpoint。",
+      "evidence": [
+        "gate:web-ui-contract",
+        "gate:windows-ui-single-instance",
+        "gate:macos-ui-native-lifecycle",
+        "artifact:productization-v55/ui-single-instance-v95/result.json",
+        "artifact:productization-v55/ui-native-lifecycle-v95-r5-unique/result.json",
+        "artifact:productization-v55/ui-profile-single-instance-contract-v97.json",
+        "artifact:productization-v55/ui-native-lifecycle-v98-unique/result.json",
+        "artifact:productization-v56/ui-native-lifecycle-v100/result.json",
+        "metric:secondary_ui_processes=0",
+        "metric:secondary_host_processes=0",
+        "metric:secondary_data_root_created=false"
+      ]
+    },
+    {
+      "id": "MD-FAULT-RECOVERY-041",
+      "criterion": "macOS 最终安装包必须在 restart_policy=on_failure 下通过真实故障注入：Microdroid Guest VM SIGKILL 后复用原 Worker 并生成新 run；Worker SIGKILL 后旧 vm/virtmgr/crosvm 进程组必须由内核事件 watchdog 全部回收，再由 Host 启动新 Worker/run；Host SIGKILL 后新 Host 必须认证并重连仍存活的 Worker/run。watchdog 注册必须在 VM exec 前握手成功，不得继承能力探针标准流形成 EOF 死锁，最终 shutdown 后不得遗留隔离进程。",
+      "evidence": [
+        "gate:macos-microdroid-fault-injection",
+        "artifact:productization-v56/microdroid-fault-injection-v109-r2/result.json",
+        "artifact:productization-v56/microdroid-fault-injection-v109-r2/scenarios/pre-worker-exit-process-group.txt",
+        "artifact:productization-v56/microdroid-fault-injection-v109-r2/scenarios/post-worker-recovery-process-group.txt",
+        "event:instance.runtime_failure.restart_scheduled",
+        "metric:process_cleanup=pass"
+      ]
+    },
+    {
+      "id": "MD-FINITE-PAYLOAD-042",
+      "criterion": "有限 Microdroid Payload 只有在宿主 vm stderr 精确报告唯一 Payload 退出码、stdout 报告 VM ended: Shutdown 且 vm 进程退出 0 时才能自然完成。返回 0 必须自动执行正式停止清理并保留 Stopped run 的退出码；非零必须进入 microdroid_payload_failed 并保留原始值。Guest 日志不得伪造成功，用户 stop 与自然退出竞态只能生成一个确定终态。",
+      "evidence": [
+        "gate:microdroid-exit-contract-smoke",
+        "gate:macos-microdroid-finite-payload",
+        "artifact:windows-microdroid-finite-exit0-real-guest-20260806-r3/result.json",
+        "artifact:windows-microdroid-finite-exit17-real-guest-20260806-r1/result.json",
+        "artifact:macos-microdroid-finite-payload-materials-20260806-r1/result.json",
+        "event:microdroid.payload.finished",
+        "error:microdroid_payload_failed"
+      ]
+    }
+  ],
+  "required_gates": [
+    "hd-quality",
+    "instance-settings-isolation",
+    "web-ui-contract",
+    "macos-microdroid-real-guest",
+    "macos-microdroid-multi-instance",
+    "macos-package-smoke",
+    "microdroid-release-identity",
+    "macos-release-contract",
+    "macos-microdroid-payload",
+    "macos-microdroid-error-propagation",
+    "macos-microdroid-payload-bundle",
+    "macos-microdroid-runtime-closure",
+    "macos-release-toolchain-distribution",
+    "macos-release-installed-guest",
+    "host-startup-release-bootstrap",
+    "host-shutdown-stop-all",
+    "diagnostics-product-contract",
+    "legacy-migration-product-contract",
+    "installed-host-only-diagnostics",
+    "macos-network-product-contract",
+    "macos-network-packaged-contract",
+    "macos-android-installed-guest",
+    "macos-bluetooth-real-guest",
+    "macos-uwb-real-guest",
+    "macos-modem-real-guest",
+    "macos-nfc-real-guest",
+    "macos-android-package-contract",
+    "macos-android-artifact-store-contract",
+    "host-runtime-inactive-takeover",
+    "host-runtime-active-deferral",
+    "host-runtime-upgrade-contract",
+    "web-ui-concurrency",
+    "macos-microdroid-soak",
+    "macos-resource-admission",
+    "macos-artifact-verification-performance",
+    "runtime-storage-smoke",
+    "macos-installed-runtime-storage",
+    "http-security-smoke",
+    "ui-snapshot-performance-smoke",
+    "ui-background-work-performance-smoke",
+    "macos-ui-native-lifecycle",
+    "macos-android-readiness-soak",
+    "microdroid-exit-contract-smoke",
+    "macos-microdroid-finite-payload",
+    "macos-microdroid-fault-injection"
+  ],
+  "evidence_state": {
+    "code_present": true,
+    "tests_authored": true,
+    "contract_smoke_verified": true,
+    "real_guest_verified": true
+  },
+  "direction_decisions": [
+    {
+      "id": "D-MD-HEADLESS",
+      "decision": "Microdroid 在 HD 中是独立无图形实例类型，不复用 Android Player、显示分辨率、旋转、FPS 或设备模拟 UI。",
+      "owner": "human",
+      "rationale": "Microdroid 是面向隔离工作负载的轻量虚拟机，复用 Android 图形界面会形成错误产品边界。"
+    },
+    {
+      "id": "D-MD-PER-INSTANCE",
+      "decision": "实例类型、资源、Payload、调试级别、ADB、制品和加密存储全部跟随实例；只有 HD 应用偏好属于全局。",
+      "owner": "human",
+      "rationale": "用户明确要求解决统一设置导致不同实例相互覆盖的问题。"
+    },
+    {
+      "id": "D-MD-AVF",
+      "decision": "macOS arm64 首版复用现有 AVF 的 vm -> virtmgr -> crosvm(HVF) 真机链路和 products/microdroid 镜像。",
+      "owner": "ai",
+      "rationale": "仓库已有已验证 Mach-O host 工具与 Microdroid 制品，直接复用风险最低。"
+    },
+    {
+      "id": "D-MD-ERRORS",
+      "decision": "Microdroid 错误以稳定机器码作为产品契约；签名验证、Payload 变更、配置与服务连接失败进入 blocked，未知 Guest 异常进入 failed，底层日志只作为诊断证据。",
+      "owner": "ai",
+      "rationale": "防止不同 AOSP 日志文本或跨层包装把可修复问题退化为含糊的 worker_rejected。"
+    },
+    {
+      "id": "D-MD-PAYLOAD-CHANNEL",
+      "decision": "Microdroid conformance Payload 使用 development/release 不可混淆的版本化 bundle；release runner 必须用显式 signer 摘要验证唯一 v3/v3.1 signer，运行时导入另做轻量 signing block 预检并保留 AVF 完整验签。",
+      "owner": "ai",
+      "rationale": "把临时 QA APK 变为可审计制品，同时避免轻量 Host 预检被误当成 Guest 密码学信任边界。"
+    },
+    {
+      "id": "D-MD-CLOSURE",
+      "decision": "macOS arm64 Microdroid v1 发布闭包只包含 EmptyPayload APK、normal/debuggable initrd、microdroid.json、kernel、super 与 vbmeta；支持 empty/uploaded 且 apexes 为空。任何额外 APEX 能力必须升级闭包 schema 并重新认证。",
+      "owner": "ai",
+      "rationale": "源码路径与真机运行证明其余 system/vendor/APEX 树未被当前产品契约访问；显式闭包把 1.5 GB 隐式依赖缩成 59 MB 可审计输入。"
+    },
+    {
+      "id": "D-MD-BUILD-PROVENANCE",
+      "decision": "macOS 发布构建固定 Node 22.23.1/npm 10.9.8、Temurin 21.0.12+8 arm64 与 Android build-tools 36.0.0 的版本和摘要；Web 只接受干净 npm ci 产物。构建溯源放入 Resources/provenance，Resources/release 仅保留生产信任材料。",
+      "owner": "ai",
+      "rationale": "消除 ambient PATH 和旧 dist 依赖，同时避免 development 包因为普通构建证据目录而误声明已携带生产信任材料。"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "APPLE-DEVELOPER-ID",
+      "description": "当前 Mac 钥匙串没有有效 Developer ID Application 身份，无法执行 hardened runtime 签名、公证与 Gatekeeper 最终门禁。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "WINDOWS-GNU-CI",
+      "description": "macOS 主机不能替代 Windows GNU 发布流水线的 xtask ai-cycle、PE audit 与物理 GUI 输入门禁。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "RELEASE-TRUST-ROOT",
+      "description": "正式发布 Ed25519 信任根及离线签名密钥需要发布负责人托管；本任务不得生成并冒充生产密钥。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "ANDROID-SIGNED-ARTIFACT-STORE",
+      "description": "signed-artifact-store-v2 的索引、Guest/Host Ed25519 验签、逐文件摘要、精确闭包、渠道/data-profile、路径防逃逸、macOS 打包/UI 自动选择和最终归档双启动门禁已实现并通过 QA；release 仍只接受 metadata-encrypted 与生产信任输入。",
+      "scope": "current_task",
+      "state": "resolved"
+    },
+    {
+      "id": "ANDROID-PRODUCTION-ARTIFACT-INPUTS",
+      "description": "尚未获得由生产离线密钥签发、channel=release、data_profile=metadata-encrypted 的 Android Guest/Host bundle、生产 Ed25519 trust root 与对应 HostCertificationV2；QA development store 不得升级或复制为生产输入。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "ANDROID-HARDWARE-KEYMINT",
+      "description": "当前 macOS Android Guest 报告 HARDWARE_TYPE_UNAVAILABLE，缺少持久硬件支持的 KeyMint、安全 secret storage 与 rollback resistance；开发包可运行，但不能据此声明生产级密钥保护。",
+      "scope": "external",
+      "state": "open"
+    },
+    {
+      "id": "MACOS-NODE-TOOLCHAIN",
+      "description": "已安装并校验项目级 arm64 Node 22.23.1/npm 10.9.8 与 Temurin 21.0.12+8，结合 Android build-tools 36.0.0 从干净 npm ci 重建 Web，并将输入/输出摘要封入包内 provenance。",
+      "scope": "current_task",
+      "state": "resolved"
+    }
+  ],
+  "human_decisions_needed": [
+    {
+      "id": "D-RELEASE-CREDENTIALS",
+      "question": "提供 Developer ID / notary profile 和正式 Ed25519 发布信任根，还是指定企业内部分发渠道？",
+      "impact": "决定能否把当前通过 QA 的 development 包升级为已公证、可对外分发的正式包。",
+      "state": "open"
+    },
+    {
+      "id": "D-ANDROID-SECURITY-TIER",
+      "question": "正式 macOS Android 产品必须等待硬件支持的 KeyMint/安全存储，还是定义明确标注的软件安全等级并限制敏感工作负载？",
+      "impact": "决定 metadata encryption 的密钥根、rollback 防护、兼容设备范围和对外安全声明。",
+      "state": "open"
+    }
+  ],
+  "next_iteration": "Windows x86_64 Empty 与 uploaded Full-debug Microdroid 已完成三轮 ADB SDK 35、Guest power down、重复启动身份与零残留门；有限 v3 Payload 返回 0/17 的真实 Guest 也已分别证明 Stopped/Failed、原始退出码、严格 launcher 双标记和零泄漏。Windows extra APK 进一步完成双 run 的两个受管 descriptor/idsig、Guest marker 顺序、sysfs mapper、跨重启 SHA、停止清理与零残留门。材料生成器已修复为双布局路径：x86_64 native-first/Stored 模板保持原布局，arm64 压缩模板重建为 native-first、Stored、4 KiB 页对齐后再签名。Mac 源码、arm64 finite 材料和最终包门禁均已同步；新的 arm64 extra APK 材料 `macos-microdroid-extra-materials-20260806-r2` 已从移动后的原始产品模板生成并通过 v3、zipalign、SHA、config 顺序与零私钥复核。下一步在不影响受保护实例的可用 HVF 槽位执行 finite 与 extra APK Mac 真 Guest 门；随后继续 UWB、Modem、传感器和字段级定位双端证据。正式发布阻塞仍为 metadata-encrypted Android release bundle、正式 Payload signer、Ed25519 信任根、Developer ID/notary 和硬件 KeyMint。"
+}

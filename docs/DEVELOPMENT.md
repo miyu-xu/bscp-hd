@@ -41,7 +41,7 @@ build.bat
 build_all.bat
 ```
 
-根构建依次处理 binder-rpc、可选 gfxstream/ANGLE、virtmgr/vm/crosvm、HD React/Vite UI 和 Rust workspace，发布到 `out\dist\windows\bin`。HD 发布十四个 Windows 运行时；`hd.exe` 合并 Manager/Player，使用 winit、Wry/WebView2 与 `NativeDisplayHost`，并把 `web/dist` 发布为 `bin/ui`。Casimir 和 RootCanal adapter 分别依赖清单固定的 AOSP 源码，frame producer 依赖同次构建的本仓库 gfxstream backend。
+根构建依次处理 binder-rpc、可选 gfxstream/ANGLE、virtmgr/vm/crosvm、HD React/Vite UI 和 Rust workspace，发布到 `out\dist\windows\bin`。HD 发布十四个 Windows 运行时；`hd.exe` 合并 Manager/Player，使用 winit 桌面壳、三个互相隔离的 Wry/WebView2 表面（顶栏、侧栏、页面）与 `NativeDisplayHost`，并把 `web/dist` 发布为 `bin/ui`。Windows 顶栏由 React/WebView 实现，Win32 只保留根窗口生命周期和固定宽高比控制；macOS 对应标题栏由 AppKit 实现，两端共用同一动作与状态契约。Casimir 和 RootCanal adapter 分别依赖清单固定的 AOSP 源码，frame producer 依赖同次构建的本仓库 gfxstream backend。
 
 ```bat
 set ENABLE_GFXSTREAM_ANGLE=1

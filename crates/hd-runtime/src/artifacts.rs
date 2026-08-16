@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(not(target_os = "macos"))]
 use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 
@@ -7,8 +8,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hd_core::{
     ARTIFACT_INDEX_VERSION, ArtifactBundleKindV2, ArtifactBundleV2, ArtifactFileV2,
-    ArtifactReadyMarkerV2, ArtifactSelectionV2, DiagnosticCheckV2, DiagnosticStatusV2,
-    ResolvedGuestArtifactsV2,
+    ArtifactReadyMarkerV2, ArtifactSelectionV2, DiagnosticCheckV2, DiagnosticStatusV2, GuestKindV2,
+    PACKAGED_ANDROID_ARTIFACT_INDEX_FILE, PACKAGED_ANDROID_ARTIFACT_STORE_VERSION,
+    PackagedAndroidArtifactStoreV2, PackagedArtifactChannelV2, ResolvedGuestArtifactsV2,
 };
 use hd_platform::DataPaths;
 use serde::Deserialize;
@@ -105,6 +107,250 @@ pub struct ResolvedBundleSetV2 {
     pub artifacts: ResolvedGuestArtifactsV2,
 }
 
+#[derive(Debug, Clone)]
+pub struct VerifiedPackagedAndroidStoreV2 {
+    pub index: PackagedAndroidArtifactStoreV2,
+    pub selection: ArtifactSelectionV2,
+    pub bundles: ResolvedBundleSetV2,
+}
+
+pub fn verify_packaged_android_artifact_store(
+    store_root: &Path,
+    trust_path: &Path,
+    expected_channel: PackagedArtifactChannelV2,
+) -> Result<VerifiedPackagedAndroidStoreV2, ArtifactError> {
+    let (index, selection) = load_packaged_android_artifact_selection(store_root)?;
+    validate_packaged_android_index(&index, expected_channel)?;
+    let trust = ArtifactTrustStore::load(trust_path)?;
+    let bundles = ArtifactResolver::new(trust).resolve(&selection)?;
+    let required_data_capability = match index.channel {
+        PackagedArtifactChannelV2::Development => "android-data-unencrypted-development-v1",
+        PackagedArtifactChannelV2::Release => "android-data-metadata-encrypted-v1",
+    };
+    require_capabilities(&bundles.guest_manifest, &[required_data_capability])?;
+    validate_packaged_android_fstab(&bundles.artifacts.android_fstab, index.channel)?;
+    validate_packaged_store_closure(store_root, &index, &bundles)?;
+    Ok(VerifiedPackagedAndroidStoreV2 {
+        index,
+        selection,
+        bundles,
+    })
+}
+
+pub fn load_packaged_android_artifact_selection(
+    store_root: &Path,
+) -> Result<(PackagedAndroidArtifactStoreV2, ArtifactSelectionV2), ArtifactError> {
+    let root_metadata =
+        std::fs::symlink_metadata(store_root).map_err(|source| ArtifactError::Io {
+            operation: "inspect packaged Android artifact store",
+            path: store_root.to_owned(),
+            source,
+        })?;
+    if !store_root.is_absolute()
+        || !root_metadata.file_type().is_dir()
+        || root_metadata.file_type().is_symlink()
+    {
+        return Err(ArtifactError::Manifest(format!(
+            "packaged Android artifact store must be an absolute regular directory: {}",
+            store_root.display()
+        )));
+    }
+    let index_path = store_root.join(PACKAGED_ANDROID_ARTIFACT_INDEX_FILE);
+    let index_bytes = read_limited(&index_path, MAX_MANIFEST_BYTES)?;
+    let index: PackagedAndroidArtifactStoreV2 =
+        serde_json::from_slice(&index_bytes).map_err(ArtifactError::Decode)?;
+    validate_packaged_android_index(&index, index.channel)?;
+    validate_packaged_store_containers(store_root, &index)?;
+    let selection = ArtifactSelectionV2 {
+        store_root: store_root.to_owned(),
+        guest_bundle_digest: index.guest_bundle_digest.clone(),
+        host_bundle_digest: index.host_bundle_digest.clone(),
+    };
+    Ok((index, selection))
+}
+
+pub fn verify_declared_packaged_android_artifact_store(
+    store_root: &Path,
+    trust_path: &Path,
+) -> Result<VerifiedPackagedAndroidStoreV2, ArtifactError> {
+    let index_path = store_root.join(PACKAGED_ANDROID_ARTIFACT_INDEX_FILE);
+    let index_bytes = read_limited(&index_path, MAX_MANIFEST_BYTES)?;
+    let index: PackagedAndroidArtifactStoreV2 =
+        serde_json::from_slice(&index_bytes).map_err(ArtifactError::Decode)?;
+    verify_packaged_android_artifact_store(store_root, trust_path, index.channel)
+}
+
+fn validate_packaged_store_containers(
+    store_root: &Path,
+    index: &PackagedAndroidArtifactStoreV2,
+) -> Result<(), ArtifactError> {
+    for path in [
+        store_root.join("bundles"),
+        store_root.join("bundles").join(&index.guest_bundle_digest),
+        store_root.join("bundles").join(&index.host_bundle_digest),
+    ] {
+        let metadata = std::fs::symlink_metadata(&path).map_err(|source| ArtifactError::Io {
+            operation: "inspect packaged Android store container",
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(ArtifactError::Manifest(format!(
+                "packaged Android store container is not a regular directory: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_packaged_android_index(
+    index: &PackagedAndroidArtifactStoreV2,
+    expected_channel: PackagedArtifactChannelV2,
+) -> Result<(), ArtifactError> {
+    if index.schema_version != PACKAGED_ANDROID_ARTIFACT_STORE_VERSION {
+        return Err(ArtifactError::UnsupportedVersion(index.schema_version));
+    }
+    if index.channel != expected_channel {
+        return Err(ArtifactError::Manifest(format!(
+            "packaged Android channel mismatch: expected {expected_channel:?}, got {:?}",
+            index.channel
+        )));
+    }
+    if index.guest_kind != GuestKindV2::Android {
+        return Err(ArtifactError::Manifest(
+            "packaged Android store index has a non-Android guest kind".to_owned(),
+        ));
+    }
+    if index.android_version != "15.0.0_r14" {
+        return Err(ArtifactError::Manifest(format!(
+            "packaged Android version is unsupported: {}",
+            index.android_version
+        )));
+    }
+    let expected_profile = match index.channel {
+        PackagedArtifactChannelV2::Development => "development-unencrypted",
+        PackagedArtifactChannelV2::Release => "metadata-encrypted",
+    };
+    if index.data_profile != expected_profile {
+        return Err(ArtifactError::Manifest(format!(
+            "packaged Android data profile mismatch: expected {expected_profile}, got {}",
+            index.data_profile
+        )));
+    }
+    validate_digest(&index.guest_bundle_digest)?;
+    validate_digest(&index.host_bundle_digest)
+}
+
+fn validate_packaged_android_fstab(
+    path: &Path,
+    channel: PackagedArtifactChannelV2,
+) -> Result<(), ArtifactError> {
+    crate::disk::validate_android_fstab(path)
+        .map_err(|error| ArtifactError::Manifest(error.to_string()))?;
+    let bytes = hd_platform::read_regular_nofollow_limited(path, MAX_MANIFEST_BYTES)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| ArtifactError::Manifest("Android fstab is not UTF-8".to_owned()))?;
+    let data_lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|mount_point| mount_point == "/data")
+        })
+        .collect::<Vec<_>>();
+    if data_lines.len() != 1 {
+        return Err(ArtifactError::Manifest(format!(
+            "packaged Android fstab must contain exactly one /data entry, found {}",
+            data_lines.len()
+        )));
+    }
+    let columns = data_lines[0].split_whitespace().collect::<Vec<_>>();
+    if columns.len() < 5 {
+        return Err(ArtifactError::Manifest(
+            "packaged Android /data fstab entry has fewer than five columns".to_owned(),
+        ));
+    }
+    let flags = format!(",{},{} ,", columns[3], columns[4]).replace(' ', "");
+    if !flags.contains(",first_stage_mount,") {
+        return Err(ArtifactError::Manifest(
+            "packaged Android /data must use first_stage_mount".to_owned(),
+        ));
+    }
+    let encrypted = flags.contains(",inlinecrypt,")
+        || flags.contains(",fileencryption=")
+        || flags.contains(",metadata_encryption=")
+        || flags.contains(",keydirectory=");
+    match channel {
+        PackagedArtifactChannelV2::Development if encrypted => Err(ArtifactError::Manifest(
+            "development signed Android /data must remain explicitly unencrypted".to_owned(),
+        )),
+        PackagedArtifactChannelV2::Release
+            if !flags.contains(",fileencryption=")
+                || !flags.contains(",metadata_encryption=")
+                || !flags.contains(",keydirectory=") =>
+        {
+            Err(ArtifactError::Manifest(
+                "release Android /data must declare fileencryption, metadata_encryption and keydirectory"
+                    .to_owned(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_packaged_store_closure(
+    store_root: &Path,
+    index: &PackagedAndroidArtifactStoreV2,
+    bundles: &ResolvedBundleSetV2,
+) -> Result<(), ArtifactError> {
+    let mut allowed_files = BTreeSet::from([PathBuf::from(PACKAGED_ANDROID_ARTIFACT_INDEX_FILE)]);
+    if index.channel == PackagedArtifactChannelV2::Development {
+        allowed_files.insert(PathBuf::from("trusted-keys-v2.json"));
+    }
+    let mut allowed_directories = BTreeSet::from([PathBuf::new(), PathBuf::from("bundles")]);
+    for (digest, manifest) in [
+        (&index.guest_bundle_digest, &bundles.guest_manifest),
+        (&index.host_bundle_digest, &bundles.host_manifest),
+    ] {
+        let bundle = PathBuf::from("bundles").join(digest);
+        allowed_directories.insert(bundle.clone());
+        allowed_files.insert(bundle.join(MANIFEST_FILE));
+        allowed_files.insert(bundle.join(READY_FILE));
+        for file in &manifest.files {
+            let relative = bundle.join(&file.relative_path);
+            allowed_files.insert(relative.clone());
+            let mut parent = relative.parent();
+            while let Some(value) = parent {
+                allowed_directories.insert(value.to_owned());
+                parent = value.parent();
+            }
+        }
+    }
+    for entry in walkdir::WalkDir::new(store_root).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            ArtifactError::Manifest(format!("walk packaged Android store: {error}"))
+        })?;
+        let relative = entry.path().strip_prefix(store_root).map_err(|error| {
+            ArtifactError::Manifest(format!("resolve packaged Android store path: {error}"))
+        })?;
+        let file_type = entry.file_type();
+        if file_type.is_symlink()
+            || (file_type.is_file() && !allowed_files.contains(relative))
+            || (file_type.is_dir() && !allowed_directories.contains(relative))
+            || (!file_type.is_file() && !file_type.is_dir())
+        {
+            return Err(ArtifactError::Manifest(format!(
+                "packaged Android store contains an unlisted or unsafe path: {}",
+                relative.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Creates manifest-only bundle records for an explicitly enabled local direct-image workflow.
 /// The normal resolver never calls this path and continues to require signed bundles.
 #[allow(clippy::too_many_lines)]
@@ -122,6 +368,8 @@ pub fn prepare_direct_dev_artifact_store(
     let gfxstream_backend = macos_dev_gfxstream_backend(&host_root);
     let rootfs = std::env::var_os("HD_DEV_GUEST_ROOTFS")
         .map_or_else(|| guest_root.join("aggregate_android.img"), PathBuf::from);
+    let android_data_capability =
+        direct_android_data_profile_capability(&guest_root.join("android_fstab.dt"))?;
     let sensor = std::env::var_os("HD_DEV_SENSOR_INJECTOR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -250,12 +498,6 @@ pub fn prepare_direct_dev_artifact_store(
             false,
         ),
         (
-            "crosvm-runtime-audio",
-            "r8Brain.dll",
-            host_root.join("r8Brain.dll"),
-            false,
-        ),
-        (
             "gnu-runtime-stdcpp",
             "libstdc++-6.dll",
             host_root.join("libstdc++-6.dll"),
@@ -310,8 +552,8 @@ pub fn prepare_direct_dev_artifact_store(
         ),
         (
             "rootcanal-adapter",
-            "hd-rootcanal-adapter-disabled",
-            host_root.join("hd-rootcanal-adapter-disabled"),
+            "hd-rootcanal-adapter",
+            host_root.join("hd-rootcanal-adapter"),
             true,
         ),
         (
@@ -339,9 +581,21 @@ pub fn prepare_direct_dev_artifact_store(
             false,
         ),
         (
-            "crosvm-runtime-audio",
-            "crosvm-runtime-audio-disabled",
-            host_root.join("crosvm-runtime-audio-disabled"),
+            "angle-egl",
+            "libEGL.dylib",
+            host_root.join("libEGL.dylib"),
+            false,
+        ),
+        (
+            "angle-glesv2",
+            "libGLESv2.dylib",
+            host_root.join("libGLESv2.dylib"),
+            false,
+        ),
+        (
+            "angle-vulkan-loader",
+            "libvulkan.dylib",
+            macos_dev_vulkan_loader(&host_root),
             false,
         ),
     ];
@@ -380,6 +634,7 @@ pub fn prepare_direct_dev_artifact_store(
             "android-15.0.0_r14".to_owned(),
             "hd-guest-profile-v2".to_owned(),
             "hd-device-bridge-v2".to_owned(),
+            android_data_capability,
         ],
         signer_key_id: "dev-fast-unsigned".to_owned(),
         signature_ed25519: String::new(),
@@ -440,12 +695,61 @@ fn required_env_path(name: &'static str) -> Result<PathBuf, ArtifactError> {
     })
 }
 
+fn direct_android_data_profile_capability(path: &Path) -> Result<String, ArtifactError> {
+    crate::disk::validate_android_fstab(path)
+        .map_err(|error| ArtifactError::Manifest(error.to_string()))?;
+    let text = std::fs::read_to_string(path).map_err(|source| ArtifactError::Io {
+        operation: "read direct development Android fstab",
+        path: path.to_owned(),
+        source,
+    })?;
+    let data_line = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .find(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|mount_point| mount_point == "/data")
+        })
+        .ok_or_else(|| {
+            ArtifactError::Manifest(format!(
+                "direct development Android fstab has no /data entry: {}",
+                path.display()
+            ))
+        })?;
+    let columns = data_line.split_whitespace().collect::<Vec<_>>();
+    let encrypted = columns[3].split(',').any(|flag| flag == "inlinecrypt")
+        || columns[4]
+            .split(',')
+            .any(|flag| flag.starts_with("keydirectory=") || flag.starts_with("fileencryption="));
+    Ok(if encrypted {
+        "android-data-metadata-encrypted-v1"
+    } else {
+        "android-data-unencrypted-development-v1"
+    }
+    .to_owned())
+}
+
 #[cfg(target_os = "macos")]
 fn default_macos_dev_gfxstream_backend(host_root: &Path) -> PathBuf {
     host_root
         .parent()
         .unwrap_or(host_root)
         .join("lib/libgfxstream_backend.dylib")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dev_vulkan_loader(host_root: &Path) -> PathBuf {
+    let packaged = host_root.join("libvulkan.dylib");
+    if packaged.is_file() {
+        packaged
+    } else {
+        host_root
+            .parent()
+            .unwrap_or(host_root)
+            .join("lib/libvulkan.dylib")
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -515,6 +819,78 @@ pub struct ArtifactResolver {
     trust: ArtifactTrustStore,
 }
 
+fn validate_published_bundle_contract(
+    guest: &ArtifactBundleV2,
+    host: &ArtifactBundleV2,
+    guest_files: &BTreeMap<String, PathBuf>,
+    host_tools: &BTreeMap<String, PathBuf>,
+) -> Result<(), ArtifactError> {
+    for role in ["kernel", "initrd", "rootfs", "android_fstab"] {
+        require_role(guest_files, role)?;
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        require_role(guest_files, "sensor-injector")?;
+        require_executable_roles(guest, &["sensor-injector"])?;
+    }
+    for role in ["crosvm", "adb", "aapt2", "hd-device-sim", "frame-producer"] {
+        require_role(host_tools, role)?;
+    }
+    #[cfg(target_os = "macos")]
+    for role in ["angle-egl", "angle-glesv2", "angle-vulkan-loader"] {
+        require_role(host_tools, role)?;
+    }
+    require_windows_runtime_roles(host_tools)?;
+    for role in [
+        "adb-bridge",
+        "rootcanal-adapter",
+        "casimir-adapter",
+        "modem-adapter",
+        "uwb-adapter",
+    ] {
+        require_role(host_tools, role)?;
+    }
+    require_executable_roles(
+        host,
+        &[
+            "crosvm",
+            "adb",
+            "aapt2",
+            "hd-device-sim",
+            "frame-producer",
+            "adb-bridge",
+            "rootcanal-adapter",
+            "casimir-adapter",
+            "modem-adapter",
+            "uwb-adapter",
+        ],
+    )?;
+    require_capabilities(
+        guest,
+        &[
+            "android-15.0.0_r14",
+            "hd-guest-profile-v2",
+            "hd-device-bridge-v2",
+        ],
+    )?;
+    let frame_transport = match hd_platform::platform_name() {
+        "windows" => "frame-vulkan-win32-v2",
+        "linux" => "frame-vulkan-dmabuf-v2",
+        "macos" => "frame-metal-iosurface-v2",
+        _ => return Err(ArtifactError::UnsupportedHost),
+    };
+    require_capabilities(
+        host,
+        &[
+            "hd-host-tools-v2",
+            "input-external-v2",
+            "device-profile-cf-phone-v2",
+            frame_transport,
+        ],
+    )?;
+    require_capabilities(host, &["adb-loopback-vsock-v2"])
+}
+
 impl ArtifactResolver {
     pub fn new(trust: ArtifactTrustStore) -> Self {
         Self { trust }
@@ -540,66 +916,7 @@ impl ArtifactResolver {
         validate_guest_architecture(&guest)?;
         let guest_files = role_map(&guest_root, &guest)?;
         let host_tools = role_map(&host_root, &host)?;
-        for role in ["kernel", "initrd", "rootfs", "android_fstab"] {
-            require_role(&guest_files, role)?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            require_role(&guest_files, "sensor-injector")?;
-            require_executable_roles(&guest, &["sensor-injector"])?;
-        }
-        for role in ["crosvm", "adb", "aapt2", "hd-device-sim", "frame-producer"] {
-            require_role(&host_tools, role)?;
-        }
-        require_windows_runtime_roles(&host_tools)?;
-        for role in [
-            "adb-bridge",
-            "rootcanal-adapter",
-            "casimir-adapter",
-            "modem-adapter",
-            "uwb-adapter",
-        ] {
-            require_role(&host_tools, role)?;
-        }
-        require_executable_roles(
-            &host,
-            &[
-                "crosvm",
-                "adb",
-                "aapt2",
-                "hd-device-sim",
-                "frame-producer",
-                "adb-bridge",
-                "rootcanal-adapter",
-                "casimir-adapter",
-                "modem-adapter",
-                "uwb-adapter",
-            ],
-        )?;
-        require_capabilities(
-            &guest,
-            &[
-                "android-15.0.0_r14",
-                "hd-guest-profile-v2",
-                "hd-device-bridge-v2",
-            ],
-        )?;
-        let frame_transport = match hd_platform::platform_name() {
-            "windows" => "frame-vulkan-win32-v2",
-            "linux" => "frame-vulkan-dmabuf-v2",
-            "macos" => "frame-metal-iosurface-v2",
-            _ => return Err(ArtifactError::UnsupportedHost),
-        };
-        require_capabilities(
-            &host,
-            &[
-                "hd-host-tools-v2",
-                "input-external-v2",
-                "device-profile-cf-phone-v2",
-                frame_transport,
-            ],
-        )?;
-        require_capabilities(&host, &["adb-loopback-vsock-v2"])?;
+        validate_published_bundle_contract(&guest, &host, &guest_files, &host_tools)?;
         Ok(ResolvedBundleSetV2 {
             artifacts: ResolvedGuestArtifactsV2 {
                 guest_bundle_digest: guest.digest.clone(),
@@ -685,6 +1002,10 @@ impl ArtifactResolver {
         for role in ["crosvm", "adb", "hd-device-sim", "frame-producer"] {
             require_role(&host_tools, role)?;
         }
+        #[cfg(target_os = "macos")]
+        for role in ["angle-egl", "angle-glesv2", "angle-vulkan-loader"] {
+            require_role(&host_tools, role)?;
+        }
         require_windows_runtime_roles(&host_tools)?;
         for role in [
             "adb-bridge",
@@ -764,6 +1085,7 @@ impl ArtifactResolver {
         expected_kind: ArtifactBundleKindV2,
     ) -> Result<ArtifactBundleV2, ArtifactError> {
         validate_digest(expected_digest)?;
+        validate_bundle_root(root)?;
         let manifest_path = root.join(MANIFEST_FILE);
         let ready_path = root.join(READY_FILE);
         let manifest_bytes = read_limited(&manifest_path, MAX_MANIFEST_BYTES)?;
@@ -820,6 +1142,7 @@ fn read_bundle_manifest_fast(
     expected_kind: ArtifactBundleKindV2,
 ) -> Result<ArtifactBundleV2, ArtifactError> {
     validate_digest(expected_digest)?;
+    validate_bundle_root(root)?;
     let manifest_path = root.join(MANIFEST_FILE);
     let ready_path = root.join(READY_FILE);
     let manifest_bytes = read_limited(&manifest_path, MAX_MANIFEST_BYTES)?;
@@ -1100,7 +1423,7 @@ fn validate_guest_architecture(manifest: &ArtifactBundleV2) -> Result<(), Artifa
 }
 
 fn verify_file(root: &Path, file: &hd_core::ArtifactFileV2) -> Result<(), ArtifactError> {
-    let path = root.join(&file.relative_path);
+    let path = artifact_path_without_symlink_parents(root, &file.relative_path)?;
     let metadata = std::fs::symlink_metadata(&path).map_err(|source| ArtifactError::Io {
         operation: "read artifact metadata",
         path: path.clone(),
@@ -1130,25 +1453,75 @@ fn verify_file(root: &Path, file: &hd_core::ArtifactFileV2) -> Result<(), Artifa
     Ok(())
 }
 
-pub fn sha256_file(path: &Path) -> Result<String, ArtifactError> {
-    let file = hd_platform::open_regular_read_nofollow(path)?;
-    let mut reader = BufReader::new(file);
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024].into_boxed_slice();
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|source| ArtifactError::Io {
-                operation: "hash artifact",
-                path: path.to_owned(),
-                source,
-            })?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
+fn validate_bundle_root(root: &Path) -> Result<(), ArtifactError> {
+    let metadata = std::fs::symlink_metadata(root).map_err(|source| ArtifactError::Io {
+        operation: "inspect artifact bundle root",
+        path: root.to_owned(),
+        source,
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(ArtifactError::Manifest(format!(
+            "artifact bundle root is not a regular directory: {}",
+            root.display()
+        )));
     }
-    Ok(hex::encode(digest.finalize()))
+    Ok(())
+}
+
+fn artifact_path_without_symlink_parents(
+    root: &Path,
+    relative: &Path,
+) -> Result<PathBuf, ArtifactError> {
+    validate_relative_path(relative)?;
+    validate_bundle_root(root)?;
+    let mut path = root.to_owned();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        path.push(component.as_os_str());
+        if components.peek().is_some() {
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|source| ArtifactError::Io {
+                    operation: "inspect artifact parent directory",
+                    path: path.clone(),
+                    source,
+                })?;
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(ArtifactError::Manifest(format!(
+                    "artifact parent is not a regular directory: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(path)
+}
+
+pub fn sha256_file(path: &Path) -> Result<String, ArtifactError> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(hex::encode(hd_platform::sha256_regular_nofollow(path)?))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let file = hd_platform::open_regular_read_nofollow(path)?;
+        let mut reader = BufReader::new(file);
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024].into_boxed_slice();
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|source| ArtifactError::Io {
+                    operation: "hash artifact",
+                    path: path.to_owned(),
+                    source,
+                })?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        Ok(hex::encode(digest.finalize()))
+    }
 }
 
 fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, ArtifactError> {
@@ -1157,12 +1530,9 @@ fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, ArtifactError> {
 
 fn validate_relative_path(path: &Path) -> Result<(), ArtifactError> {
     if path.as_os_str().is_empty()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
     {
         return Err(ArtifactError::UnsafePath(path.to_owned()));
     }

@@ -25,7 +25,7 @@ Windows 使用 MinGW/GNU ABI；Linux x86_64 使用 KVM；macOS arm64 使用 Hype
 
 固定源码版本生成 Guest bundle，包含 kernel、initrd、rootfs、fstab，以及配置要求的 system/vendor 镜像。bundle 必须声明 `android-15.0.0_r14`、`hd-guest-profile-v2` 和 `hd-device-bridge-v2`，经受信密钥签名并内容寻址。
 
-唯一 `Ready` 条件是同一次 `run_id` 同时满足：crosvm 进程存活、严格 frame generation 握手通过、ADB loopback bridge 已建立、`adb wait-for-device` 成功、`sys.boot_completed=1`、package manager 可查询。Windows Host bundle 可使用仓库内 `hd-adb-bridge`：它只监听 `127.0.0.1`，经 crosvm `connect_vsock` 将每条连接绑定到同一 CID 的 guest:5555 命名管道，并发布精确 launch/process ready marker。任何超时或进程退出写入稳定错误码和 `result.json`，不能推进到 `Ready`。
+唯一 `Ready` 条件是同一次 `run_id` 同时满足：crosvm 进程存活、严格 frame generation 握手通过、ADB loopback bridge 已建立、`adb wait-for-device` 成功、Android boot/bootanimation 条件稳定、主用户已解锁、Package Manager 和图形/输入/窗口服务可查询，并且镜像支持的 PackageManager 后台 handler 有界排空。全局广播队列空闲不是 Ready 条件。Windows Host bundle 可使用仓库内 `hd-adb-bridge`：它只监听 `127.0.0.1`，经 crosvm `connect_vsock` 将每条连接绑定到同一 CID 的 guest:5555 命名管道，并发布精确 launch/process ready marker。任何超时或进程退出写入稳定错误码和 `result.json`，不能推进到 `Ready`。
 
 ### 严格零拷贝显示
 
@@ -33,7 +33,7 @@ Windows 使用 MinGW/GNU ABI；Linux x86_64 使用 KVM；macOS arm64 使用 Hype
 
 ### 正式设备 profile
 
-Host bundle 必须完整提供并探测 `hd-device-sim`、RootCanal adapter、Casimir adapter、UWB、modem、network、audio 和 camera adapter；实例开关只决定本次运行激活哪些端点，不能改变发布认证身份。每个组件返回 V2 正式 probe，并实现 `--serve-v2 --launch`：发布绑定 launch hash 和进程身份的 ready marker，在独立 owner-only endpoint 接受严格绑定 instance/run/request 且带每组件 256-bit bearer 的 `DeviceControlRequestV2`。Worker 只向组件授予其固定 Guest 串口/virtio 端点，启动后必须先通过认证 Ping，再路由对应动作；Host/Worker 统一拒绝越界参数，不允许绕过组件在 Worker 进程内模拟。Windows UI 直接提供定位、电池、网络、五类传感器、RootCanal Peer 和 Casimir 标签的 Ready-only 控制面。Guest bundle 提供固定串口/virtio 端点契约。对外只声明 conformance 场景真实覆盖的能力；不把无 RF、secure element、IMS、carrier 或硬件认证的模拟能力写成物理设备能力。
+Host bundle 必须完整提供并探测 `hd-device-sim`、RootCanal adapter、Casimir adapter、UWB、modem、network、audio 和 camera adapter；实例开关只决定本次运行激活哪些端点，不能改变发布认证身份。每个组件返回 V2 正式 probe，并实现 `--serve-v2 --launch`：发布绑定 launch hash 和进程身份的 ready marker，在独立 owner-only endpoint 接受严格绑定 instance/run/request 且带每组件 256-bit bearer 的 `DeviceControlRequestV2`。Worker 只向组件授予其固定 Guest 串口/virtio 端点，启动后必须先通过认证 Ping，再路由对应动作；Host/Worker 统一拒绝越界参数，不允许绕过组件在 Worker 进程内模拟。Windows/macOS UI 直接提供定位、电池、网络、当前 Guest profile 实际发布的传感器能力、RootCanal Peer 和 Casimir 标签的 Ready-only 控制面；固定 Android 15 r14 仅显示三轴姿态，不显示独立或定时传感器注入。Guest bundle 提供固定串口/virtio 端点契约。对外只声明 conformance 场景真实覆盖的能力；不把无 RF、secure element、IMS、carrier 或硬件认证的模拟能力写成物理设备能力。
 
 ### 三平台矩阵
 

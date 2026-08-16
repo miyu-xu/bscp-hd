@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,8 @@ pub const DEFAULT_WIDTH: u32 = 1080;
 pub const DEFAULT_HEIGHT: u32 = 1920;
 pub const DEFAULT_DPI: u32 = 420;
 pub const DEFAULT_REFRESH_RATE_HZ: u16 = 60;
+pub const MAX_SECONDARY_DISPLAYS: usize = 3;
+pub const MAX_MICRODROID_EXTRA_APKS: usize = 8;
 
 const ALLOWED_REFRESH_RATES: [u16; 4] = [30, 60, 90, 120];
 
@@ -56,6 +58,21 @@ pub struct DisplayConfigV2 {
     pub orientation: OrientationV2,
     pub vsync: VsyncModeV2,
     pub show_host_fps: bool,
+    /// Additional Android displays in stable product order. The vector position is never exposed
+    /// as product identity: crosvm scanout ids are rebound for every run from each entry's UUID.
+    #[serde(default)]
+    pub secondary_displays: Vec<SecondaryDisplayConfigV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecondaryDisplayConfigV2 {
+    pub id: Uuid,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub dpi: u32,
+    pub refresh_rate_hz: u16,
 }
 
 impl Default for DisplayConfigV2 {
@@ -68,6 +85,7 @@ impl Default for DisplayConfigV2 {
             orientation: OrientationV2::Portrait,
             vsync: VsyncModeV2::On,
             show_host_fps: false,
+            secondary_displays: Vec::new(),
         }
     }
 }
@@ -96,6 +114,49 @@ impl DisplayConfigV2 {
                 "display refresh_rate_hz must be one of 30, 60, 90, 120",
             ));
         }
+        if self.secondary_displays.len() > MAX_SECONDARY_DISPLAYS {
+            return Err(ConfigError::invalid(format!(
+                "at most {MAX_SECONDARY_DISPLAYS} secondary displays are supported"
+            )));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for secondary in &self.secondary_displays {
+            secondary.validate()?;
+            if !ids.insert(secondary.id) {
+                return Err(ConfigError::invalid(
+                    "secondary display ids must be unique within an instance",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SecondaryDisplayConfigV2 {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.id.is_nil() {
+            return Err(ConfigError::invalid("secondary display id must not be nil"));
+        }
+        if self.name.trim().is_empty() || self.name.chars().count() > 40 {
+            return Err(ConfigError::invalid(
+                "secondary display name must contain 1..=40 characters",
+            ));
+        }
+        if !(320..=8192).contains(&self.width) || !(320..=8192).contains(&self.height) {
+            return Err(ConfigError::invalid(
+                "secondary display dimensions must each be in 320..=8192",
+            ));
+        }
+        if !(72..=960).contains(&self.dpi) {
+            return Err(ConfigError::invalid(
+                "secondary display dpi must be in 72..=960",
+            ));
+        }
+        if !ALLOWED_REFRESH_RATES.contains(&self.refresh_rate_hz) {
+            return Err(ConfigError::invalid(
+                "secondary display refresh_rate_hz must be one of 30, 60, 90, 120",
+            ));
+        }
         Ok(())
     }
 }
@@ -105,6 +166,159 @@ impl DisplayConfigV2 {
 pub enum AdbModeV2 {
     Disabled,
     Loopback,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestKindV2 {
+    #[default]
+    Android,
+    Microdroid,
+}
+
+impl GuestKindV2 {
+    pub const fn is_android(&self) -> bool {
+        matches!(self, Self::Android)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicrodroidDebugLevelV2 {
+    None,
+    #[default]
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicrodroidCpuTopologyV2 {
+    #[default]
+    OneCpu,
+    MatchHost,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MicrodroidPayloadV2 {
+    #[default]
+    Empty,
+    Uploaded {
+        upload_id: Uuid,
+        sha256: String,
+        config_path: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MicrodroidExtraApkV2 {
+    pub upload_id: Uuid,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MicrodroidConfigV2 {
+    pub debug_level: MicrodroidDebugLevelV2,
+    pub cpu_topology: MicrodroidCpuTopologyV2,
+    pub payload: MicrodroidPayloadV2,
+    /// Number of extra APKs declared by the uploaded Payload config. `None` is retained only for
+    /// instances created before Host-side config inspection was introduced.
+    pub payload_extra_apk_count: Option<u8>,
+    pub extra_apks: Vec<MicrodroidExtraApkV2>,
+    pub encrypted_storage_mib: Option<u32>,
+}
+
+impl Default for MicrodroidConfigV2 {
+    fn default() -> Self {
+        Self {
+            debug_level: MicrodroidDebugLevelV2::Full,
+            cpu_topology: MicrodroidCpuTopologyV2::OneCpu,
+            payload: MicrodroidPayloadV2::Empty,
+            payload_extra_apk_count: None,
+            extra_apks: Vec::new(),
+            encrypted_storage_mib: Some(64),
+        }
+    }
+}
+
+impl MicrodroidConfigV2 {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(size) = self.encrypted_storage_mib
+            && !(10..=4096).contains(&size)
+        {
+            return Err(ConfigError::invalid(
+                "microdroid encrypted_storage_mib must be in 10..=4096",
+            ));
+        }
+        if let MicrodroidPayloadV2::Uploaded {
+            upload_id,
+            sha256,
+            config_path,
+        } = &self.payload
+        {
+            if upload_id.is_nil() {
+                return Err(ConfigError::invalid(
+                    "microdroid payload upload_id cannot be nil",
+                ));
+            }
+            validate_sha256("microdroid payload sha256", sha256)?;
+            if config_path != "assets/vm_config.json" {
+                return Err(ConfigError::invalid(
+                    "microdroid payload config_path must be assets/vm_config.json",
+                ));
+            }
+        }
+        if matches!(self.payload, MicrodroidPayloadV2::Empty) {
+            if self.payload_extra_apk_count.is_some() {
+                return Err(ConfigError::invalid(
+                    "microdroid EmptyPayload cannot retain a payload_extra_apk_count",
+                ));
+            }
+            if !self.extra_apks.is_empty() {
+                return Err(ConfigError::invalid(
+                    "microdroid extra_apks require an uploaded main Payload APK",
+                ));
+            }
+        }
+        if self
+            .payload_extra_apk_count
+            .is_some_and(|count| usize::from(count) > MAX_MICRODROID_EXTRA_APKS)
+        {
+            return Err(ConfigError::invalid(format!(
+                "microdroid Payload cannot declare more than {MAX_MICRODROID_EXTRA_APKS} extra APKs"
+            )));
+        }
+        if self.extra_apks.len() > MAX_MICRODROID_EXTRA_APKS {
+            return Err(ConfigError::invalid(format!(
+                "microdroid extra_apks cannot exceed {MAX_MICRODROID_EXTRA_APKS}"
+            )));
+        }
+        let mut uploads = BTreeSet::new();
+        for extra in &self.extra_apks {
+            if extra.upload_id.is_nil() {
+                return Err(ConfigError::invalid(
+                    "microdroid extra APK upload_id cannot be nil",
+                ));
+            }
+            if !uploads.insert(extra.upload_id) {
+                return Err(ConfigError::invalid(
+                    "microdroid extra APK upload_id cannot be repeated",
+                ));
+            }
+            validate_sha256("microdroid extra APK sha256", &extra.sha256)?;
+        }
+        if self
+            .payload_extra_apk_count
+            .is_some_and(|count| self.extra_apks.len() > usize::from(count))
+        {
+            return Err(ConfigError::invalid(
+                "microdroid selected extra APKs exceed the count declared by the Payload",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +428,8 @@ pub struct DeviceConfigV2 {
     pub audio: bool,
     pub camera: bool,
     pub power: bool,
+    /// Independent indirect pointing surface, separate from the Android display touchscreen.
+    pub touchpad: bool,
 }
 
 impl Default for DeviceConfigV2 {
@@ -229,8 +445,54 @@ impl Default for DeviceConfigV2 {
             audio: true,
             camera: true,
             power: true,
+            touchpad: false,
         }
     }
+}
+
+impl DeviceConfigV2 {
+    pub const fn all_disabled(&self) -> bool {
+        !self.bluetooth
+            && !self.nfc
+            && !self.uwb
+            && !self.modem
+            && !self.gnss
+            && !self.sensors
+            && !self.network
+            && !self.audio
+            && !self.camera
+            && !self.power
+            && !self.touchpad
+    }
+
+    pub const fn disabled() -> Self {
+        Self {
+            bluetooth: false,
+            nfc: false,
+            uwb: false,
+            modem: false,
+            gnss: false,
+            sensors: false,
+            network: false,
+            audio: false,
+            camera: false,
+            power: false,
+            touchpad: false,
+        }
+    }
+}
+
+/// Explicit Host audio-input routing for one Android instance.
+///
+/// The virtual capture endpoint can exist without reading a physical microphone.  Host capture
+/// therefore stays opt-in and is represented separately from `devices.audio` so enabling the
+/// Guest sound card never grants microphone access implicitly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostAudioInputV2 {
+    #[default]
+    Disabled,
+    DefaultMicrophone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +508,10 @@ pub struct InstanceSpecV2 {
     pub schema_version: u32,
     pub id: Uuid,
     pub name: String,
+    #[serde(default)]
+    pub guest_kind: GuestKindV2,
+    #[serde(default)]
+    pub microdroid: Option<MicrodroidConfigV2>,
     pub cpu_count: u16,
     pub memory_mib: u32,
     pub display: DisplayConfigV2,
@@ -253,6 +519,8 @@ pub struct InstanceSpecV2 {
     pub artifacts: Option<ArtifactSelectionV2>,
     pub boot: BootConfigV2,
     pub devices: DeviceConfigV2,
+    #[serde(default)]
+    pub host_audio_input: HostAudioInputV2,
     pub restart_policy: RestartPolicyV2,
     pub labels: BTreeMap<String, String>,
 }
@@ -263,6 +531,8 @@ impl Default for InstanceSpecV2 {
             schema_version: INSTANCE_CONFIG_VERSION,
             id: Uuid::new_v4(),
             name: "Android".to_owned(),
+            guest_kind: GuestKindV2::Android,
+            microdroid: None,
             cpu_count: DEFAULT_CPU_COUNT,
             memory_mib: DEFAULT_MEMORY_MIB,
             display: DisplayConfigV2::default(),
@@ -270,6 +540,7 @@ impl Default for InstanceSpecV2 {
             artifacts: None,
             boot: BootConfigV2::default(),
             devices: DeviceConfigV2::default(),
+            host_audio_input: HostAudioInputV2::Disabled,
             restart_policy: RestartPolicyV2::OnFailure,
             labels: BTreeMap::new(),
         }
@@ -277,6 +548,24 @@ impl Default for InstanceSpecV2 {
 }
 
 impl InstanceSpecV2 {
+    pub fn microdroid(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            guest_kind: GuestKindV2::Microdroid,
+            microdroid: Some(MicrodroidConfigV2::default()),
+            cpu_count: 1,
+            memory_mib: 512,
+            display: DisplayConfigV2::default(),
+            adb: AdbConfigV2 {
+                mode: AdbModeV2::Disabled,
+                host_port: None,
+                executable: None,
+            },
+            devices: DeviceConfigV2::disabled(),
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != INSTANCE_CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion(self.schema_version));
@@ -289,11 +578,66 @@ impl InstanceSpecV2 {
         if !(1..=256).contains(&self.cpu_count) {
             return Err(ConfigError::invalid("cpu_count must be in 1..=256"));
         }
-        if !(2048..=1_048_576).contains(&self.memory_mib) {
-            return Err(ConfigError::invalid("memory_mib must be in 2048..=1048576"));
+        let minimum_memory = match self.guest_kind {
+            GuestKindV2::Android => 2048,
+            GuestKindV2::Microdroid => 256,
+        };
+        if !(minimum_memory..=1_048_576).contains(&self.memory_mib) {
+            return Err(ConfigError::invalid(format!(
+                "memory_mib must be in {minimum_memory}..=1048576 for this guest kind"
+            )));
         }
-        self.display.validate()?;
-        self.boot.validate()?;
+        match self.guest_kind {
+            GuestKindV2::Android => {
+                if self.microdroid.is_some() {
+                    return Err(ConfigError::invalid(
+                        "microdroid config must be absent for Android instances",
+                    ));
+                }
+                self.display.validate()?;
+                self.boot.validate()?;
+                if !self.devices.audio
+                    && !matches!(self.host_audio_input, HostAudioInputV2::Disabled)
+                {
+                    return Err(ConfigError::invalid(
+                        "host_audio_input requires the Android audio device",
+                    ));
+                }
+            }
+            GuestKindV2::Microdroid => {
+                let microdroid = self.microdroid.as_ref().ok_or_else(|| {
+                    ConfigError::invalid("microdroid config is required for Microdroid instances")
+                })?;
+                microdroid.validate()?;
+                if self.cpu_count != 1 {
+                    return Err(ConfigError::invalid(
+                        "Microdroid cpu_count must remain 1; microdroid.cpu_topology selects one_cpu or match_host",
+                    ));
+                }
+                if !self.devices.all_disabled() {
+                    return Err(ConfigError::invalid(
+                        "Android device simulation must be disabled for Microdroid instances",
+                    ));
+                }
+                if !matches!(self.host_audio_input, HostAudioInputV2::Disabled) {
+                    return Err(ConfigError::invalid(
+                        "host audio input is not valid for Microdroid instances",
+                    ));
+                }
+                if self.artifacts.is_some() {
+                    return Err(ConfigError::invalid(
+                        "Android artifact bundle selection is not valid for Microdroid instances",
+                    ));
+                }
+                if matches!(microdroid.debug_level, MicrodroidDebugLevelV2::None)
+                    && !matches!(self.adb.mode, AdbModeV2::Disabled)
+                {
+                    return Err(ConfigError::invalid(
+                        "ADB must be disabled when Microdroid debug_level is none",
+                    ));
+                }
+            }
+        }
         if matches!(self.adb.mode, AdbModeV2::Disabled) && self.adb.host_port.is_some() {
             return Err(ConfigError::invalid(
                 "adb.host_port must be absent when adb is disabled",
@@ -329,11 +673,14 @@ impl InstanceSpecV2 {
             return ChangeImpactV2::None;
         }
         if self.id != next.id
+            || self.guest_kind != next.guest_kind
+            || self.microdroid != next.microdroid
             || self.cpu_count != next.cpu_count
             || self.memory_mib != next.memory_mib
             || self.artifacts != next.artifacts
             || self.boot != next.boot
             || self.devices != next.devices
+            || self.host_audio_input != next.host_audio_input
         {
             ChangeImpactV2::RestartRequired
         } else {
@@ -415,6 +762,8 @@ fn migrate_v1(value: serde_json::Value) -> Result<MigrationOutcomeV2, ConfigErro
         schema_version: INSTANCE_CONFIG_VERSION,
         id: legacy.id,
         name: legacy.name,
+        guest_kind: GuestKindV2::Android,
+        microdroid: None,
         cpu_count: legacy.cpu_count,
         memory_mib: legacy.memory_mib.max(2048),
         display: DisplayConfigV2 {
@@ -428,6 +777,7 @@ fn migrate_v1(value: serde_json::Value) -> Result<MigrationOutcomeV2, ConfigErro
             orientation,
             vsync,
             show_host_fps: legacy.display.show_host_fps,
+            secondary_displays: Vec::new(),
         },
         adb: AdbConfigV2 {
             mode: adb_mode,
@@ -441,6 +791,7 @@ fn migrate_v1(value: serde_json::Value) -> Result<MigrationOutcomeV2, ConfigErro
         artifacts: None,
         boot: BootConfigV2::default(),
         devices: DeviceConfigV2::default(),
+        host_audio_input: HostAudioInputV2::Disabled,
         restart_policy: RestartPolicyV2::OnFailure,
         labels: BTreeMap::new(),
     };
@@ -611,5 +962,33 @@ mod tests {
             host_bundle_digest: "b".repeat(64),
         };
         assert!(selection.validate().is_err());
+    }
+
+    #[test]
+    fn microdroid_rejects_unrepresentable_cpu_and_android_artifacts() {
+        let mut spec = InstanceSpecV2::microdroid("microdroid");
+        spec.cpu_count = 2;
+        assert!(spec.validate().is_err());
+
+        spec.cpu_count = 1;
+        spec.artifacts = Some(ArtifactSelectionV2 {
+            store_root: PathBuf::from("/absolute/artifacts"),
+            guest_bundle_digest: "a".repeat(64),
+            host_bundle_digest: "b".repeat(64),
+        });
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn microdroid_none_debug_requires_adb_disabled() {
+        let mut spec = InstanceSpecV2::microdroid("microdroid");
+        spec.microdroid
+            .as_mut()
+            .expect("microdroid config")
+            .debug_level = MicrodroidDebugLevelV2::None;
+        spec.adb.mode = AdbModeV2::Loopback;
+        assert!(spec.validate().is_err());
+        spec.adb.mode = AdbModeV2::Disabled;
+        assert!(spec.validate().is_ok());
     }
 }

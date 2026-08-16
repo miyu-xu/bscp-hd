@@ -1,22 +1,32 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-#[cfg(unix)]
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use hd_core::{
-    DeviceSerialEndpointV2, DisplayConfigV2, InstanceSpecV2, KeyActionV2, LaunchPlanV2, VsyncModeV2,
+    DeviceSerialEndpointV2, DisplayConfigV2, InstanceSpecV2, KeyActionV2, LaunchPlanV2,
+    MAX_SECONDARY_DISPLAYS, SecondaryDisplayConfigV2, TRACKPAD_AXIS_MAX, TrackpadEventV2,
+    TrackpadPhaseV2, VsyncModeV2,
 };
 use hd_platform::{PlatformError, VmBackend, VmLaunchContextV2};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
-#[cfg(unix)]
 use tokio::sync::Mutex;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_OUTPUT_LIMIT: u64 = 64 * 1024;
+
+#[cfg(windows)]
+fn windows_realtime_vcpu_arguments(cpu_count: u16) -> [String; 2] {
+    // crosvm maps --rt-cpus to Windows MMCSS (the built-in Pro Audio task) for each selected
+    // vCPU thread. Android's RenderThread and SurfaceFlinger otherwise suffer long scheduling
+    // gaps under WHPX even when the broker process itself is AboveNormal. MMCSS retains the
+    // system-responsiveness reserve, unlike promoting the whole VM to REALTIME_PRIORITY_CLASS.
+    let last_vcpu = cpu_count.saturating_sub(1);
+    ["--rt-cpus".to_owned(), format!("0-{last_vcpu}")]
+}
 
 fn guest_kernel_arguments(spec: &InstanceSpecV2) -> Vec<String> {
     let mut arguments = vec![
@@ -55,6 +65,12 @@ fn guest_kernel_arguments(spec: &InstanceSpecV2) -> Vec<String> {
     if spec.devices.uwb {
         arguments.push("androidboot.uwbcountrycode=US".to_owned());
     }
+    if spec.devices.modem {
+        // Cuttlefish's vendor RIL treats an absent port as the explicit no-RIL profile. The
+        // fixed HD modem component listens on host-vsock 9697 and the Guest connects directly
+        // through crosvm, so enable the RIL only for instances that requested the modem.
+        arguments.push("androidboot.modem_simulator_ports=9697".to_owned());
+    }
     arguments.extend(spec.boot.kernel_arguments());
     arguments
 }
@@ -69,6 +85,16 @@ enum KeyboardEndpoint {
 #[cfg(unix)]
 type KeyboardStreams = BTreeMap<String, KeyboardEndpoint>;
 
+#[cfg(windows)]
+#[derive(Debug)]
+struct TrackpadEndpoint {
+    server: tokio::net::windows::named_pipe::NamedPipeServer,
+    connected: bool,
+}
+
+#[cfg(windows)]
+type TrackpadStreams = BTreeMap<String, TrackpadEndpoint>;
+
 /// Direct crosvm adapter. All launch arguments are derived from typed V2 configuration and
 /// verified immutable bundles; there is deliberately no free-form argument escape hatch.
 #[derive(Debug, Clone)]
@@ -76,6 +102,8 @@ pub struct CrosvmBackend {
     executable: PathBuf,
     #[cfg(unix)]
     keyboard_streams: Arc<Mutex<KeyboardStreams>>,
+    #[cfg(windows)]
+    trackpad_streams: Arc<Mutex<TrackpadStreams>>,
 }
 
 impl CrosvmBackend {
@@ -84,6 +112,8 @@ impl CrosvmBackend {
             executable,
             #[cfg(unix)]
             keyboard_streams: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(windows)]
+            trackpad_streams: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -145,6 +175,55 @@ impl CrosvmBackend {
         }
     }
 
+    /// Prepare the caller-owned endpoint before crosvm connects its independent trackpad.
+    pub async fn prepare_trackpad_endpoint(&self, endpoint: &str) -> Result<(), PlatformError> {
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::ServerOptions;
+
+            if !endpoint.starts_with(r"\\.\pipe\") {
+                return Err(PlatformError::Vm(
+                    "Windows trackpad endpoint is not a local named pipe".to_owned(),
+                ));
+            }
+            let mut options = ServerOptions::new();
+            options
+                .first_pipe_instance(true)
+                .reject_remote_clients(true);
+            let server = hd_platform::create_owner_only_named_pipe(&options, endpoint)?;
+            self.trackpad_streams.lock().await.insert(
+                endpoint.to_owned(),
+                TrackpadEndpoint {
+                    server,
+                    connected: false,
+                },
+            );
+            Ok(())
+        }
+        #[cfg(unix)]
+        {
+            let path = PathBuf::from(endpoint);
+            if path.exists() {
+                std::fs::remove_file(&path).map_err(|source| PlatformError::Io {
+                    operation: "remove stale trackpad socket",
+                    path: path.clone(),
+                    source,
+                })?;
+            }
+            let listener =
+                tokio::net::UnixListener::bind(&path).map_err(|source| PlatformError::Io {
+                    operation: "bind trackpad socket",
+                    path: path.clone(),
+                    source,
+                })?;
+            self.keyboard_streams
+                .lock()
+                .await
+                .insert(endpoint.to_owned(), KeyboardEndpoint::Listening(listener));
+            Ok(())
+        }
+    }
+
     fn gpu_argument(display: &DisplayConfigV2) -> String {
         let (width, height) = Self::backend_display_size(display);
         let renderer_uses_gles = cfg!(target_os = "macos");
@@ -153,10 +232,33 @@ impl CrosvmBackend {
         } else {
             ",wsi=vk"
         };
-        let base = format!(
-            "backend=gfxstream,max-num-displays=1,audio-device-mode=one-global,displays=[[mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh},hidden=true]],context-types=gfxstream-vulkan:gfxstream-composer,angle=true,gles={renderer_uses_gles},vulkan=true{native_wsi}",
+        let mut displays = vec![format!(
+            "[mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh},hidden=true]",
             dpi = display.dpi,
             refresh = display.refresh_rate_hz,
+        )];
+        if !cfg!(windows) {
+            displays.extend(display.secondary_displays.iter().map(|secondary| {
+                format!(
+                    "[mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh},hidden=true]",
+                    width = secondary.width,
+                    height = secondary.height,
+                    dpi = secondary.dpi,
+                    refresh = secondary.refresh_rate_hz,
+                )
+            }));
+        }
+        // The pinned Windows crosvm advertises the portable multi-display control commands and
+        // max-num-displays capacity, but its Win32 display backend rejects more than one display
+        // in the initial `--gpu displays=` list. The Worker materializes configured Windows
+        // secondaries through `gpu add-displays` immediately after the control socket is live and
+        // before Guest readiness. Other platforms keep true launch-time materialization.
+        // Reserve the full bounded product capacity so AOSP-compatible hotplug can add a display
+        // without restarting the VM. Only configured displays are materialized at cold start.
+        let max_num_displays = 1 + MAX_SECONDARY_DISPLAYS;
+        let base = format!(
+            "backend=gfxstream,max-num-displays={max_num_displays},audio-device-mode=one-global,displays=[{}],context-types=gfxstream-vulkan:gfxstream-composer,angle=true,gles={renderer_uses_gles},vulkan=true{native_wsi}",
+            displays.join(",")
         );
         if crate::dev::native_display_direct_enabled() {
             // The native HWND path presents through gfxstream's own Vulkan swapchain. External
@@ -176,6 +278,16 @@ impl CrosvmBackend {
         let (width, height) = Self::backend_display_size(display);
         format!(
             "mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh}",
+            dpi = display.dpi,
+            refresh = display.refresh_rate_hz,
+        )
+    }
+
+    fn secondary_display_argument(display: &SecondaryDisplayConfigV2) -> String {
+        format!(
+            "mode=windowed[{width},{height}],dpi=[{dpi},{dpi}],refresh-rate={refresh},hidden=true",
+            width = display.width,
+            height = display.height,
             dpi = display.dpi,
             refresh = display.refresh_rate_hz,
         )
@@ -208,7 +320,7 @@ impl CrosvmBackend {
         Ok(format!("{prefix},type=sink"))
     }
 
-    async fn control(&self, arguments: &[String]) -> Result<(), PlatformError> {
+    async fn control_output(&self, arguments: &[String]) -> Result<Vec<u8>, PlatformError> {
         let mut command = Command::new(&self.executable);
         command
             .args(arguments)
@@ -244,7 +356,7 @@ impl CrosvmBackend {
             .await
             .map_err(|_| PlatformError::Vm("crosvm control command timed out".to_owned()))??;
         if status.success() {
-            Ok(())
+            Ok(stdout)
         } else {
             let detail = if stderr.is_empty() { stdout } else { stderr };
             Err(PlatformError::Vm(format!(
@@ -253,6 +365,10 @@ impl CrosvmBackend {
                 String::from_utf8_lossy(&detail).trim()
             )))
         }
+    }
+
+    async fn control(&self, arguments: &[String]) -> Result<(), PlatformError> {
+        self.control_output(arguments).await.map(|_| ())
     }
 }
 
@@ -276,7 +392,10 @@ impl VmBackend for CrosvmBackend {
             spec.cpu_count.to_string(),
         ];
         #[cfg(windows)]
-        arguments.extend(["--no-balloon".to_owned(), "--no-usb".to_owned()]);
+        {
+            arguments.extend(["--no-balloon".to_owned(), "--no-usb".to_owned()]);
+            arguments.extend(windows_realtime_vcpu_arguments(spec.cpu_count));
+        }
         #[cfg(target_os = "macos")]
         arguments.extend([
             "--disable-sandbox".to_owned(),
@@ -292,9 +411,31 @@ impl VmBackend for CrosvmBackend {
                 "keyboard[path={}]",
                 safe_key_value_path(&context.keyboard_endpoint)?
             ),
-            "--gpu".to_owned(),
-            Self::gpu_argument(&spec.display),
         ]);
+        #[cfg(windows)]
+        arguments.extend(windows_native_touch_arguments(&spec.display));
+        match (spec.devices.touchpad, context.trackpad_endpoint.as_deref()) {
+            (true, Some(endpoint)) => arguments.extend([
+                "--input".to_owned(),
+                format!(
+                    "trackpad[path={},width={axis},height={axis}]",
+                    safe_key_value_path(endpoint)?,
+                    axis = TRACKPAD_AXIS_MAX,
+                ),
+            ]),
+            (true, None) => {
+                return Err(PlatformError::Vm(
+                    "enabled trackpad has no runtime endpoint".to_owned(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(PlatformError::Vm(
+                    "disabled trackpad received a runtime endpoint".to_owned(),
+                ));
+            }
+            (false, None) => {}
+        }
+        arguments.extend(["--gpu".to_owned(), Self::gpu_argument(&spec.display)]);
 
         if spec.devices.network {
             arguments.extend([
@@ -320,15 +461,42 @@ impl VmBackend for CrosvmBackend {
                     ),
                     "00:01.2",
                 ),
+                "--net".to_owned(),
+                network_argument(
+                    "ethernet",
+                    &format!(
+                        "02:4a:{:02x}:{:02x}:{:02x}:00",
+                        spec.id.as_bytes()[6],
+                        spec.id.as_bytes()[7],
+                        spec.id.as_bytes()[8]
+                    ),
+                    "00:01.3",
+                ),
             ]);
         }
 
-        if spec.devices.audio && !cfg!(target_os = "macos") {
-            arguments.extend([
-                "--virtio-snd".to_owned(),
-                "capture=true,backend=null,num_output_devices=1,num_input_devices=1,num_output_streams=1,num_input_streams=1"
-                    .to_owned(),
-            ]);
+        if spec.devices.audio {
+            #[cfg(windows)]
+            let audio_parameters = if matches!(
+                spec.host_audio_input,
+                hd_core::HostAudioInputV2::DefaultMicrophone
+            ) {
+                "capture=true,backend=winaudio,num_output_devices=1,num_input_devices=1,num_output_streams=1,num_input_streams=1"
+            } else {
+                "capture=false,backend=winaudio,num_output_devices=1,num_input_devices=0,num_output_streams=1,num_input_streams=0"
+            };
+            #[cfg(target_os = "macos")]
+            let audio_parameters = if matches!(
+                spec.host_audio_input,
+                hd_core::HostAudioInputV2::DefaultMicrophone
+            ) {
+                "capture=true,backend=coreaudio,num_output_devices=1,num_input_devices=1,num_output_streams=1,num_input_streams=1"
+            } else {
+                "capture=false,backend=coreaudio,num_output_devices=1,num_input_devices=0,num_output_streams=1,num_input_streams=0"
+            };
+            #[cfg(not(any(windows, target_os = "macos")))]
+            let audio_parameters = "capture=false,backend=null,num_output_devices=1,num_input_devices=0,num_output_streams=1,num_input_streams=0";
+            arguments.extend(["--virtio-snd".to_owned(), audio_parameters.to_owned()]);
         }
 
         arguments.extend([
@@ -435,10 +603,15 @@ impl VmBackend for CrosvmBackend {
         let dev_display_copy_fallback = crate::dev::allow_display_copy_fallback_enabled();
         let native_display_direct = crate::dev::native_display_direct_enabled();
         let strict_frame_broker = !dev_display_copy_fallback && !native_display_direct;
+        let native_zero_copy_required = native_display_direct && !dev_display_copy_fallback;
         let mut environment = BTreeMap::from([
             (
                 "HD_FRAME_REQUIRED".to_owned(),
                 if strict_frame_broker { "1" } else { "0" }.to_owned(),
+            ),
+            (
+                "HD_NATIVE_ZERO_COPY_REQUIRED".to_owned(),
+                if native_zero_copy_required { "1" } else { "0" }.to_owned(),
             ),
             ("HD_FRAME_PROTOCOL".to_owned(), "2".to_owned()),
             ("HD_FRAME_INSTANCE".to_owned(), spec.id.to_string()),
@@ -460,17 +633,25 @@ impl VmBackend for CrosvmBackend {
         #[cfg(target_os = "macos")]
         {
             environment.insert("CROSVM_COCOA_DISPLAY".to_owned(), "1".to_owned());
+            environment.insert("HD_DISPLAY_SELECTION".to_owned(), "1".to_owned());
             // Present the gfxstream CAMetalLayer through CAContext/CALayerHost. This is the
             // macOS zero-copy path; no virtio-gpu framebuffer readback is enabled.
             environment.insert("ANGLE_DEFAULT_PLATFORM".to_owned(), "metal".to_owned());
-            if let Some(gfxstream) = context.artifacts.host_tools.get("gfxstream-backend")
-                && let Some(search_path) = macos_gfxstream_library_search_path(gfxstream)
-            {
-                environment.insert("DYLD_LIBRARY_PATH".to_owned(), search_path);
-            }
+            let search_path = macos_gfxstream_library_search_path(&context.artifacts.host_tools)
+                .ok_or_else(|| {
+                    PlatformError::Vm(
+                        "verified macOS host bundle is missing a gfxstream/ANGLE runtime path"
+                            .to_owned(),
+                    )
+                })?;
+            environment.insert("DYLD_LIBRARY_PATH".to_owned(), search_path);
         }
         #[cfg(windows)]
         {
+            // Gfxstream owns one zero-copy presentation surface. Keep secondary Android displays
+            // registered, but present only the scanout selected by HD instead of composing every
+            // display into the primary Player viewport.
+            environment.insert("HD_DISPLAY_SELECTION".to_owned(), "1".to_owned());
             let gfxstream = context
                 .artifacts
                 .host_tools
@@ -555,6 +736,7 @@ impl VmBackend for CrosvmBackend {
             control_endpoint: context.control_endpoint.clone(),
             frame_endpoint: context.frame_endpoint.clone(),
             keyboard_endpoint: context.keyboard_endpoint.clone(),
+            trackpad_endpoint: context.trackpad_endpoint.clone(),
             device_endpoints: context.device_endpoints.clone(),
             device_control_endpoints: context.device_control_endpoints.clone(),
             adb_serial,
@@ -645,6 +827,106 @@ impl VmBackend for CrosvmBackend {
         }
     }
 
+    async fn send_power_key(
+        &self,
+        keyboard_endpoint: &str,
+        control_endpoint: &str,
+    ) -> Result<(), PlatformError> {
+        #[cfg(windows)]
+        {
+            let _ = keyboard_endpoint;
+            self.power_button(control_endpoint).await
+        }
+        #[cfg(unix)]
+        {
+            let _ = control_endpoint;
+            self.send_key(keyboard_endpoint, KeyActionV2::Power).await
+        }
+    }
+
+    async fn send_trackpad(
+        &self,
+        trackpad_endpoint: &str,
+        event: TrackpadEventV2,
+    ) -> Result<(), PlatformError> {
+        let events = trackpad_report(event)?;
+        #[cfg(windows)]
+        {
+            let mut endpoints = self.trackpad_streams.lock().await;
+            let endpoint = endpoints.get_mut(trackpad_endpoint).ok_or_else(|| {
+                PlatformError::Vm("trackpad endpoint was not prepared".to_owned())
+            })?;
+            if !endpoint.connected {
+                tokio::time::timeout(Duration::from_secs(2), endpoint.server.connect())
+                    .await
+                    .map_err(|_| {
+                        PlatformError::Vm(
+                            "crosvm did not connect to the trackpad endpoint".to_owned(),
+                        )
+                    })?
+                    .map_err(|source| PlatformError::Io {
+                        operation: "accept virtio trackpad connection",
+                        path: PathBuf::from(trackpad_endpoint),
+                        source,
+                    })?;
+                endpoint.connected = true;
+            }
+            endpoint
+                .server
+                .write_all(&events)
+                .await
+                .map_err(|source| PlatformError::Io {
+                    operation: "write virtio trackpad report",
+                    path: PathBuf::from(trackpad_endpoint),
+                    source,
+                })?;
+            endpoint
+                .server
+                .flush()
+                .await
+                .map_err(|source| PlatformError::Io {
+                    operation: "flush virtio trackpad report",
+                    path: PathBuf::from(trackpad_endpoint),
+                    source,
+                })
+        }
+        #[cfg(unix)]
+        {
+            let mut endpoints = self.keyboard_streams.lock().await;
+            let endpoint = endpoints.get_mut(trackpad_endpoint).ok_or_else(|| {
+                PlatformError::Vm("trackpad endpoint was not prepared".to_owned())
+            })?;
+            if let KeyboardEndpoint::Listening(listener) = endpoint {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                    .await
+                    .map_err(|_| {
+                        PlatformError::Vm(
+                            "crosvm did not connect to the trackpad endpoint".to_owned(),
+                        )
+                    })?
+                    .map_err(|source| PlatformError::Io {
+                        operation: "accept virtio trackpad connection",
+                        path: PathBuf::from(trackpad_endpoint),
+                        source,
+                    })?;
+                *endpoint = KeyboardEndpoint::Connected(stream);
+            }
+            let KeyboardEndpoint::Connected(stream) = endpoint else {
+                return Err(PlatformError::Vm(
+                    "trackpad endpoint state is invalid".to_owned(),
+                ));
+            };
+            stream
+                .write_all(&events)
+                .await
+                .map_err(|source| PlatformError::Io {
+                    operation: "write virtio trackpad report",
+                    path: PathBuf::from(trackpad_endpoint),
+                    source,
+                })
+        }
+    }
+
     async fn pause(&self, control_endpoint: &str) -> Result<(), PlatformError> {
         self.control(&["suspend".to_owned(), control_endpoint.to_owned()])
             .await
@@ -663,15 +945,76 @@ impl VmBackend for CrosvmBackend {
     async fn replace_display(
         &self,
         control_endpoint: &str,
+        display_id: u32,
         display: &DisplayConfigV2,
     ) -> Result<(), PlatformError> {
         self.control(&[
             "gpu".to_owned(),
             "replace-display".to_owned(),
             "--display-id".to_owned(),
-            "0".to_owned(),
+            display_id.to_string(),
             "--gpu-display".to_owned(),
             Self::display_argument(display),
+            control_endpoint.to_owned(),
+        ])
+        .await
+    }
+
+    async fn add_secondary_display(
+        &self,
+        control_endpoint: &str,
+        expected_scanout_id: u32,
+        display: &SecondaryDisplayConfigV2,
+    ) -> Result<(), PlatformError> {
+        let maximum_scanout_id = u32::try_from(MAX_SECONDARY_DISPLAYS)
+            .expect("secondary display product limit fits in u32");
+        if !(1..=maximum_scanout_id).contains(&expected_scanout_id) {
+            return Err(PlatformError::Vm(format!(
+                "secondary display scanout {expected_scanout_id} is outside product capacity"
+            )));
+        }
+        // Crosvm assigns AddDisplays to the lowest free scanout. Do not bracket this command with
+        // ListDisplays: the pinned macOS crosvm can consume the config-change edge in that order,
+        // leaving the scanout visible to control queries but absent from Android HWC. The Worker
+        // also keeps guest display queries behind the Android HWC settling window.
+        self.control(&[
+            "gpu".to_owned(),
+            "add-displays".to_owned(),
+            "--gpu-display".to_owned(),
+            Self::secondary_display_argument(display),
+            control_endpoint.to_owned(),
+        ])
+        .await
+    }
+
+    async fn remove_display(
+        &self,
+        control_endpoint: &str,
+        display_id: u32,
+    ) -> Result<(), PlatformError> {
+        self.control(&[
+            "gpu".to_owned(),
+            "remove-displays".to_owned(),
+            "--display-id".to_owned(),
+            display_id.to_string(),
+            control_endpoint.to_owned(),
+        ])
+        .await
+    }
+
+    async fn replace_secondary_display(
+        &self,
+        control_endpoint: &str,
+        display_id: u32,
+        display: &SecondaryDisplayConfigV2,
+    ) -> Result<(), PlatformError> {
+        self.control(&[
+            "gpu".to_owned(),
+            "replace-display".to_owned(),
+            "--display-id".to_owned(),
+            display_id.to_string(),
+            "--gpu-display".to_owned(),
+            Self::secondary_display_argument(display),
             control_endpoint.to_owned(),
         ])
         .await
@@ -679,11 +1022,20 @@ impl VmBackend for CrosvmBackend {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_gfxstream_library_search_path(gfxstream: &Path) -> Option<String> {
-    let library_directory = gfxstream.parent()?;
-    let distribution_root = library_directory.parent()?;
-    let angle_directory = distribution_root.join("gfx").join("angle");
-    std::env::join_paths([library_directory.to_path_buf(), angle_directory])
+fn macos_gfxstream_library_search_path(host_tools: &BTreeMap<String, PathBuf>) -> Option<String> {
+    let mut directories = Vec::new();
+    for role in [
+        "gfxstream-backend",
+        "angle-egl",
+        "angle-glesv2",
+        "angle-vulkan-loader",
+    ] {
+        let directory = host_tools.get(role)?.parent()?.to_owned();
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    std::env::join_paths(directories)
         .ok()
         .map(|path| path.to_string_lossy().into_owned())
 }
@@ -699,6 +1051,34 @@ fn safe_key_value_path(value: &str) -> Result<String, PlatformError> {
         )));
     }
     Ok(value.to_owned())
+}
+
+#[cfg(windows)]
+fn windows_native_touch_arguments(display: &DisplayConfigV2) -> Vec<String> {
+    // Crosvm's Win32 display procedure routes pointer gestures to touchscreen event devices by
+    // scanout id. Unlike macOS, the generic Windows product does not create those devices
+    // implicitly, so preserve display order here: primary scanout 0 first, followed by each
+    // configured secondary scanout. The path is an identity token on Windows; crosvm creates the
+    // native broker pipe internally for multi-touch devices.
+    let (width, height) = CrosvmBackend::backend_display_size(display);
+    let mut arguments = vec![
+        "--input".to_owned(),
+        format!(
+            "multi-touch[path=hd-native-window-0,width={width},height={height},name=HD Android Display 0]"
+        ),
+    ];
+    for (index, secondary) in display.secondary_displays.iter().enumerate() {
+        let scanout_id = index + 1;
+        arguments.extend([
+            "--input".to_owned(),
+            format!(
+                "multi-touch[path=hd-native-window-{scanout_id},width={width},height={height},name=HD Android Display {scanout_id}]",
+                width = secondary.width,
+                height = secondary.height,
+            ),
+        ]);
+    }
+    arguments
 }
 
 fn network_argument(interface_name: &str, mac: &str, pci_address: &str) -> String {
@@ -736,11 +1116,12 @@ fn network_argument_for_macos(
     pci_address: &str,
     socket_vmnet: Option<&Path>,
 ) -> String {
-    // Android's first virtio-net device backs the Cuttlefish Wi-Fi wrapper.
-    // Keep it off socket_vmnet: the daemon fans every inbound packet out to
-    // every client, so an inactive first NIC can eventually block the active
-    // Ethernet client's receive path.
-    let tap_name = if interface_name == "secondary" {
+    // Keep the AOSP Cuttlefish Wi-Fi and mobile transports in their original
+    // slots. A dedicated third virtio-net device is discovered as eth2 and is
+    // the unrestricted Ethernet uplink. Reusing and renaming eth1 after boot
+    // repeatedly recreated NetworkAgent/NetworkMonitor until NetworkStack hit
+    // Android's per-process receiver limit and restarted system_server.
+    let tap_name = if interface_name == "ethernet" {
         socket_vmnet.map_or_else(
             || format!("hd-offline-{interface_name}"),
             |path| format!("hd-socket-vmnet:{}", path.to_string_lossy()),
@@ -758,6 +1139,44 @@ fn key_report(code: u16) -> [u8; 32] {
     encode_input_event(&mut bytes[16..24], 1, code, 0);
     encode_input_event(&mut bytes[24..32], 0, 0, 0);
     bytes
+}
+
+fn trackpad_report(event: TrackpadEventV2) -> Result<Vec<u8>, PlatformError> {
+    const EV_SYN: u16 = 0;
+    const EV_KEY: u16 = 1;
+    const EV_ABS: u16 = 3;
+    const SYN_REPORT: u16 = 0;
+    const ABS_X: u16 = 0;
+    const ABS_Y: u16 = 1;
+    const BTN_TOOL_FINGER: u16 = 0x145;
+    const BTN_TOUCH: u16 = 0x14a;
+
+    if event.x > TRACKPAD_AXIS_MAX || event.y > TRACKPAD_AXIS_MAX {
+        return Err(PlatformError::Vm(
+            "trackpad coordinates exceed the normalized input range".to_owned(),
+        ));
+    }
+    let mut events = Vec::with_capacity(5 * 8);
+    let mut push = |event_type, code, value| {
+        let offset = events.len();
+        events.resize(offset + 8, 0);
+        encode_input_event(&mut events[offset..offset + 8], event_type, code, value);
+    };
+    push(EV_ABS, ABS_X, i32::from(event.x));
+    push(EV_ABS, ABS_Y, i32::from(event.y));
+    match event.phase {
+        TrackpadPhaseV2::Down => {
+            push(EV_KEY, BTN_TOOL_FINGER, 1);
+            push(EV_KEY, BTN_TOUCH, 1);
+        }
+        TrackpadPhaseV2::Move => {}
+        TrackpadPhaseV2::Up => {
+            push(EV_KEY, BTN_TOUCH, 0);
+            push(EV_KEY, BTN_TOOL_FINGER, 0);
+        }
+    }
+    push(EV_SYN, SYN_REPORT, 0);
+    Ok(events)
 }
 
 fn encode_input_event(output: &mut [u8], event_type: u16, code: u16, value: i32) {
@@ -809,7 +1228,7 @@ mod tests {
     fn macos_network_argument_selects_socket_vmnet_backend() {
         assert_eq!(
             network_argument_for_macos(
-                "secondary",
+                "ethernet",
                 "02:48:00:00:00:00",
                 "00:01.1",
                 Some(Path::new("/var/run/socket_vmnet")),
@@ -857,6 +1276,65 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_reserves_multi_display_capacity_but_boots_one_scanout() {
+        let mut display = DisplayConfigV2::default();
+        display.secondary_displays.push(SecondaryDisplayConfigV2 {
+            id: uuid::Uuid::new_v4(),
+            name: "副屏 1".to_owned(),
+            width: 1280,
+            height: 720,
+            dpi: 240,
+            refresh_rate_hz: 60,
+        });
+
+        let argument = CrosvmBackend::gpu_argument(&display);
+
+        assert!(argument.contains("max-num-displays=4"));
+        assert_eq!(argument.matches("mode=windowed").count(), 1);
+        assert!(argument.contains("mode=windowed[1080,1920]"));
+        assert!(!argument.contains("mode=windowed[1280,720]"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_touch_devices_follow_scanout_order_and_size() {
+        let mut display = DisplayConfigV2::default();
+        display.secondary_displays.push(SecondaryDisplayConfigV2 {
+            id: uuid::Uuid::new_v4(),
+            name: "副屏 1".to_owned(),
+            width: 1280,
+            height: 720,
+            dpi: 240,
+            refresh_rate_hz: 60,
+        });
+
+        let arguments = windows_native_touch_arguments(&display);
+
+        assert_eq!(
+            arguments.iter().filter(|value| *value == "--input").count(),
+            2
+        );
+        assert_eq!(
+            arguments[1],
+            "multi-touch[path=hd-native-window-0,width=1080,height=1920,name=HD Android Display 0]"
+        );
+        assert_eq!(
+            arguments[3],
+            "multi-touch[path=hd-native-window-1,width=1280,height=720,name=HD Android Display 1]"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_android_vcpus_use_bounded_mmcss_realtime_threads() {
+        assert_eq!(
+            windows_realtime_vcpu_arguments(4),
+            ["--rt-cpus", "0-3"].map(str::to_owned)
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_guest_graphics_contract_disables_cpu_rendering() {
@@ -882,10 +1360,26 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_gfxstream_search_path_includes_angle_runtime() {
-        let search_path = macos_gfxstream_library_search_path(Path::new(
-            "/bundle/lib/libgfxstream_backend.dylib",
-        ))
-        .expect("bundle layout should produce a search path");
+        let host_tools = BTreeMap::from([
+            (
+                "gfxstream-backend".to_owned(),
+                PathBuf::from("/bundle/lib/libgfxstream_backend.dylib"),
+            ),
+            (
+                "angle-egl".to_owned(),
+                PathBuf::from("/bundle/gfx/angle/libEGL.dylib"),
+            ),
+            (
+                "angle-glesv2".to_owned(),
+                PathBuf::from("/bundle/gfx/angle/libGLESv2.dylib"),
+            ),
+            (
+                "angle-vulkan-loader".to_owned(),
+                PathBuf::from("/bundle/lib/libvulkan.dylib"),
+            ),
+        ]);
+        let search_path = macos_gfxstream_library_search_path(&host_tools)
+            .expect("bundle layout should produce a search path");
         let entries = std::env::split_paths(&search_path).collect::<Vec<_>>();
 
         assert_eq!(

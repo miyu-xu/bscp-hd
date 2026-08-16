@@ -5,14 +5,19 @@
 //! network and sensor control plane and never reports capabilities it does not implement.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use hd_core::{
     BatteryStateV2, COMPONENT_PROTOCOL_VERSION, FormalComponentProbeV2, LocationV2,
-    NetworkConditionV2, SensorInjectionV2,
+    MAX_SENSOR_INJECTION_MS, MIN_TIMED_SENSOR_INJECTION_MS, NetworkConditionV2, SensorInjectionV2,
+    SensorMotionFrameV2, SensorPoseV2, sensor_motion_frame,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
+use tokio::sync::{Mutex, Notify};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 pub const DEVICE_SIM_PROTOCOL_VERSION: u32 = COMPONENT_PROTOCOL_VERSION;
@@ -27,6 +32,7 @@ pub enum DeviceCommandV2 {
     SetBattery { battery: BatteryStateV2 },
     SetNetworkCondition { condition: NetworkConditionV2 },
     InjectSensor { injection: SensorInjectionV2 },
+    SetSensorPose { pose: SensorPoseV2 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +49,8 @@ pub struct DeviceStateV2 {
     pub battery: BatteryStateV2,
     pub network: NetworkConditionV2,
     pub sensors: BTreeMap<String, SensorInjectionV2>,
+    #[serde(default)]
+    pub sensor_pose: Option<SensorPoseV2>,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
@@ -68,6 +76,7 @@ impl Default for DeviceStateV2 {
                 bandwidth_kbps: None,
             },
             sensors: BTreeMap::new(),
+            sensor_pose: None,
             updated_at: OffsetDateTime::now_utc(),
         }
     }
@@ -121,6 +130,54 @@ impl DeviceSimulatorV2 {
         }
     }
 
+    pub fn apply_sensor_override(
+        &mut self,
+        injection: SensorInjectionV2,
+    ) -> Result<(), DeviceSimError> {
+        validate_sensor(&injection)?;
+        self.state
+            .sensors
+            .insert(injection.sensor.clone(), injection);
+        self.changed();
+        Ok(())
+    }
+
+    pub fn clear_sensor_override(&mut self, sensor: &str) -> Result<bool, DeviceSimError> {
+        validate_sensor_name(sensor)?;
+        let removed = self.state.sensors.remove(sensor).is_some();
+        if removed {
+            self.changed();
+        }
+        Ok(removed)
+    }
+
+    pub fn apply_sensor_pose(
+        &mut self,
+        pose: SensorPoseV2,
+    ) -> Result<SensorMotionFrameV2, DeviceSimError> {
+        if !pose.is_valid() {
+            return Err(DeviceSimError::InvalidSensorPose);
+        }
+        let frame = sensor_motion_frame(self.state.sensor_pose.unwrap_or_default(), pose);
+        for (sensor, values, duration_ms) in [
+            ("accelerometer", frame.accelerometer_microunits, 0),
+            ("magnetometer", frame.magnetometer_microunits, 0),
+            ("gyroscope", frame.gyroscope_microunits, pose.transition_ms),
+        ] {
+            self.state.sensors.insert(
+                sensor.to_owned(),
+                SensorInjectionV2 {
+                    sensor: sensor.to_owned(),
+                    values_microunits: values.to_vec(),
+                    duration_ms,
+                },
+            );
+        }
+        self.state.sensor_pose = Some(pose);
+        self.changed();
+        Ok(frame)
+    }
+
     fn apply(&mut self, command: DeviceCommandV2) -> Result<DevicePayloadV2, DeviceSimError> {
         match command {
             DeviceCommandV2::Probe => Ok(DevicePayloadV2::Probe(probe())),
@@ -155,11 +212,11 @@ impl DeviceSimulatorV2 {
                 Ok(DevicePayloadV2::State(self.state.clone()))
             }
             DeviceCommandV2::InjectSensor { injection } => {
-                validate_sensor(&injection)?;
-                self.state
-                    .sensors
-                    .insert(injection.sensor.clone(), injection);
-                self.changed();
+                self.apply_sensor_override(injection)?;
+                Ok(DevicePayloadV2::State(self.state.clone()))
+            }
+            DeviceCommandV2::SetSensorPose { pose } => {
+                self.apply_sensor_pose(pose)?;
                 Ok(DevicePayloadV2::State(self.state.clone()))
             }
         }
@@ -181,23 +238,124 @@ pub fn probe() -> FormalComponentProbeV2 {
             "location-v2".to_owned(),
             "network-condition-v2".to_owned(),
             "sensor-injection-v2".to_owned(),
+            "sensor-duration-reset-v1".to_owned(),
+            "sensor-pose-v1".to_owned(),
         ],
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SensorOverrideRuntimeV2 {
+    inner: Arc<SensorOverrideRuntimeInner>,
+}
+
+#[derive(Debug)]
+struct SensorOverrideRuntimeInner {
+    simulator: Arc<Mutex<DeviceSimulatorV2>>,
+    deadlines: Mutex<BTreeMap<String, Option<Instant>>>,
+    changed: Notify,
+}
+
+impl SensorOverrideRuntimeV2 {
+    pub fn new(simulator: Arc<Mutex<DeviceSimulatorV2>>) -> Self {
+        Self {
+            inner: Arc::new(SensorOverrideRuntimeInner {
+                simulator,
+                deadlines: Mutex::new(BTreeMap::new()),
+                changed: Notify::new(),
+            }),
+        }
+    }
+
+    pub async fn apply(&self, injection: SensorInjectionV2) -> Result<(), DeviceSimError> {
+        validate_sensor(&injection)?;
+        let sensor = injection.sensor.clone();
+        let deadline = (injection.duration_ms > 0)
+            .then(|| Instant::now() + Duration::from_millis(u64::from(injection.duration_ms)));
+        let mut deadlines = self.inner.deadlines.lock().await;
+        self.inner
+            .simulator
+            .lock()
+            .await
+            .apply_sensor_override(injection)?;
+        deadlines.insert(sensor, deadline);
+        drop(deadlines);
+        self.inner.changed.notify_one();
+        Ok(())
+    }
+
+    pub async fn apply_pose(
+        &self,
+        pose: SensorPoseV2,
+    ) -> Result<SensorMotionFrameV2, DeviceSimError> {
+        if !pose.is_valid() {
+            return Err(DeviceSimError::InvalidSensorPose);
+        }
+        let mut deadlines = self.inner.deadlines.lock().await;
+        let frame = self.inner.simulator.lock().await.apply_sensor_pose(pose)?;
+        deadlines.insert("accelerometer".to_owned(), None);
+        deadlines.insert("magnetometer".to_owned(), None);
+        deadlines.insert(
+            "gyroscope".to_owned(),
+            Some(Instant::now() + Duration::from_millis(u64::from(pose.transition_ms))),
+        );
+        drop(deadlines);
+        self.inner.changed.notify_one();
+        Ok(frame)
+    }
+
+    pub async fn run(self) {
+        loop {
+            let notified = self.inner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let next_deadline = self
+                .inner
+                .deadlines
+                .lock()
+                .await
+                .values()
+                .filter_map(|deadline| *deadline)
+                .min();
+            if let Some(deadline) = next_deadline {
+                tokio::select! {
+                    () = &mut notified => continue,
+                    () = tokio::time::sleep_until(deadline) => {}
+                }
+            } else {
+                notified.await;
+                continue;
+            }
+            self.expire_due().await;
+        }
+    }
+
+    async fn expire_due(&self) {
+        let now = Instant::now();
+        let mut deadlines = self.inner.deadlines.lock().await;
+        let expired = deadlines
+            .iter()
+            .filter(|(_, deadline)| deadline.is_some_and(|deadline| deadline <= now))
+            .map(|(sensor, _)| sensor.clone())
+            .collect::<Vec<_>>();
+        if expired.is_empty() {
+            return;
+        }
+        let mut simulator = self.inner.simulator.lock().await;
+        for sensor in expired {
+            let _ = simulator.clear_sensor_override(&sensor);
+            deadlines.remove(&sensor);
+        }
+    }
+}
+
 fn validate_sensor(injection: &SensorInjectionV2) -> Result<(), DeviceSimError> {
-    const ALLOWED: [(&str, usize); 5] = [
-        ("accelerometer", 3),
-        ("gyroscope", 3),
-        ("magnetometer", 3),
-        ("light", 1),
-        ("proximity", 1),
-    ];
-    let Some((_, values)) = ALLOWED.iter().find(|(name, _)| *name == injection.sensor) else {
-        return Err(DeviceSimError::UnsupportedSensor(injection.sensor.clone()));
-    };
+    let values = validate_sensor_name(&injection.sensor)?;
+    let duration_is_valid = injection.duration_ms == 0
+        || (MIN_TIMED_SENSOR_INJECTION_MS..=MAX_SENSOR_INJECTION_MS)
+            .contains(&injection.duration_ms);
     if injection.values_microunits.len() != *values
-        || injection.duration_ms > 3_600_000
+        || !duration_is_valid
         || injection
             .values_microunits
             .iter()
@@ -206,6 +364,21 @@ fn validate_sensor(injection: &SensorInjectionV2) -> Result<(), DeviceSimError> 
         return Err(DeviceSimError::InvalidSensor);
     }
     Ok(())
+}
+
+fn validate_sensor_name(sensor: &str) -> Result<&'static usize, DeviceSimError> {
+    const ALLOWED: [(&str, usize); 5] = [
+        ("accelerometer", 3),
+        ("gyroscope", 3),
+        ("magnetometer", 3),
+        ("light", 1),
+        ("proximity", 1),
+    ];
+    ALLOWED
+        .iter()
+        .find(|(name, _)| *name == sensor)
+        .map(|(_, values)| values)
+        .ok_or_else(|| DeviceSimError::UnsupportedSensor(sensor.to_owned()))
 }
 
 fn failure(request_id: Uuid, code: &str, message: String) -> DeviceResponseV2 {
@@ -220,7 +393,7 @@ fn failure(request_id: Uuid, code: &str, message: String) -> DeviceResponseV2 {
 }
 
 #[derive(Debug, Error)]
-enum DeviceSimError {
+pub enum DeviceSimError {
     #[error("location is outside the supported geodetic range")]
     InvalidLocation,
     #[error("battery state is outside the supported range")]
@@ -229,6 +402,8 @@ enum DeviceSimError {
     InvalidNetwork,
     #[error("sensor injection is outside the supported range")]
     InvalidSensor,
+    #[error("sensor pose is outside the supported angle or transition range")]
+    InvalidSensorPose,
     #[error("sensor {0} is unsupported")]
     UnsupportedSensor(String),
 }
@@ -240,6 +415,7 @@ impl DeviceSimError {
             Self::InvalidBattery => "device_battery_invalid",
             Self::InvalidNetwork => "device_network_invalid",
             Self::InvalidSensor => "device_sensor_invalid",
+            Self::InvalidSensorPose => "device_sensor_pose_invalid",
             Self::UnsupportedSensor(_) => "device_sensor_unsupported",
         }
     }

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::io::{Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,14 +7,16 @@ use std::time::{Duration, Instant};
 
 use fs2::FileExt as _;
 use hd_core::{
-    AcquireDisplaySessionRequestV2, ActionRequestV2, ApiErrorV2, CreateInstanceRequestV2,
-    DesiredStateV2, DisplaySessionV2, DisplayViewportV2, FrameReadyMarkerV2, HostCapabilitiesV2,
+    AcquireDisplaySessionRequestV2, ActionRequestV2, AndroidBugreportRecordV2, ApiErrorV2,
+    CapabilityProbeV2, CapabilityStatusV2, CreateInstanceRequestV2, DesiredStateV2, DisplayIdV2,
+    DisplaySessionV2, DisplayViewportV2, FrameReadyMarkerV2, GuestKindV2, HostCapabilitiesV2,
     HostEventKindV2, HostEventV2, InstanceActionV2, InstanceRecordV2, InstanceSummaryV2,
     NativeDisplayTargetV2, ObservedStateV2, OperationKindV2, OperationRecordV2, OperationStateV2,
     PreparedNativeDisplayV2, ReconcileReportV2, ReleaseDisplaySessionRequestV2, RestartPolicyV2,
-    ScreenshotRecordV2, StopModeV2, UpdateDisplaySessionRequestV2, UpdateInstanceRequestV2,
-    WORKER_PROTOCOL_VERSION, WorkerCommandV2, WorkerDescriptorV2, WorkerIdentityV2,
-    WorkerPayloadV2, WorkerRequestV2, WorkerResponseV2, WorkerStatusV2,
+    RunResultV2, ScreenRecordingRecordV2, ScreenRecordingStatusV2, ScreenshotRecordV2,
+    StartScreenRecordingRequestV2, StopModeV2, UiSnapshotV2, UpdateDisplaySessionRequestV2,
+    UpdateInstanceRequestV2, WORKER_PROTOCOL_VERSION, WorkerCommandV2, WorkerDescriptorV2,
+    WorkerIdentityV2, WorkerPayloadV2, WorkerRequestV2, WorkerResponseV2, WorkerStatusV2,
 };
 use hd_platform::{DataPaths, executable_name, process_identity_is_alive};
 use parking_lot::Mutex as ParkingMutex;
@@ -24,17 +27,32 @@ use uuid::Uuid;
 
 use crate::{
     CapabilityDiscovery, DiagnosticCollector, DiagnosticError, DiagnosticInputsV2, IpcError,
-    LeaseError, LeaseManager, PersistentStore, StoreError, send_worker_request, worker_endpoint,
+    LeaseError, LeaseManager, PersistentStore, PowerwashError, StoreError,
+    discard_powerwash_backup, microdroid_platform_supported, powerwash,
+    recover_storage_transactions, restore_powerwash, send_worker_request,
+    validate_storage_confirmation, worker_endpoint,
 };
 
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(15);
 const SECRET_BYTES: usize = 32;
 const MAX_AUTOMATIC_RUNTIME_RESTARTS: u8 = 3;
+const RUNTIME_READY_STABILITY_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
 struct RuntimeRestartState {
     attempts: u8,
     last_failed_revision: u64,
+    ready_since: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct RuntimeRestartRequest {
+    instance_id: Uuid,
+    failed_revision: u64,
+    attempt: u8,
+    delay: Duration,
+    cause: String,
+    idempotency_key: String,
 }
 
 #[derive(Debug)]
@@ -53,8 +71,10 @@ pub struct HostService {
     capabilities: RwLock<HostCapabilitiesV2>,
     worker_executable: PathBuf,
     instance_operations: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    diagnostics_operation: Mutex<()>,
     runtime_restarts: ParkingMutex<HashMap<Uuid, RuntimeRestartState>>,
     display_sessions: Mutex<HashMap<Uuid, ActiveHostDisplaySession>>,
+    display_operations: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
     events: broadcast::Sender<HostEventV2>,
     shutdown: watch::Sender<bool>,
     started_at: OffsetDateTime,
@@ -99,13 +119,39 @@ impl HostService {
             capabilities: RwLock::new(capabilities),
             worker_executable,
             instance_operations: Mutex::new(HashMap::new()),
+            diagnostics_operation: Mutex::new(()),
             runtime_restarts: ParkingMutex::new(HashMap::new()),
             display_sessions: Mutex::new(HashMap::new()),
+            display_operations: Mutex::new(HashMap::new()),
             events,
             shutdown,
             started_at: OffsetDateTime::now_utc(),
             _data_lock: ParkingMutex::new(data_lock),
         });
+        let recovery_paths = service.paths.clone();
+        let recovery_store = service.store.clone();
+        let recovery = tokio::task::spawn_blocking(move || {
+            recover_storage_transactions(&recovery_paths, &recovery_store)
+        })
+        .await;
+        match recovery {
+            Ok(Ok(recovered)) if recovered > 0 => tracing::warn!(
+                event = "powerwash.transactions.recovered",
+                recovered,
+                "reconciled interrupted instance storage transactions"
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::error!(
+                event = "powerwash.transactions.recovery_blocked",
+                %error,
+                "left an ambiguous storage transaction blocked without removing files"
+            ),
+            Err(error) => tracing::error!(
+                event = "powerwash.transactions.recovery_task_failed",
+                %error,
+                "storage transaction recovery task failed; pending transactions remain blocked"
+            ),
+        }
         service.recover_operations()?;
         service.reconcile().await?;
         service.spawn_runtime_refresh_monitor();
@@ -160,21 +206,73 @@ impl HostService {
                 .ok_or(HostError::InstanceNotFound(instance_id))?;
             let result = self.discovery.discover_cached(Some(&record.spec)).await;
             let mut capabilities = result.capabilities;
-            if record.adb_ready
-                && record.worker.is_some()
-                && let Ok(response) = self
+            if record.adb_ready && record.worker.is_some() {
+                let runtime_checks = match self
                     .call_worker(record.spec.id, WorkerCommandV2::Diagnose)
                     .await
-                && let Ok(Some(WorkerPayloadV2::Diagnostics(checks))) =
-                    ensure_worker_success(response)
-            {
-                apply_device_runtime_checks(&mut capabilities.devices, &checks);
+                {
+                    Ok(response) => match ensure_worker_success(response) {
+                        Ok(Some(WorkerPayloadV2::Diagnostics(checks))) => Ok(checks),
+                        Ok(_) => Err("Worker returned no device diagnostics payload".to_owned()),
+                        Err(error) => Err(error.to_string()),
+                    },
+                    Err(error) => Err(error.to_string()),
+                };
+                match runtime_checks {
+                    Ok(checks) => apply_device_runtime_checks(
+                        &mut capabilities.devices,
+                        &record.spec,
+                        &checks,
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            event = "host.capabilities.device_runtime.unavailable",
+                            %instance_id,
+                            %error,
+                            "device runtime diagnostics unavailable for a Ready instance"
+                        );
+                        mark_device_runtime_probe_unavailable(
+                            &mut capabilities.devices,
+                            &record.spec,
+                            &error,
+                        );
+                    }
+                }
             }
             self.emit(HostEventKindV2::Capabilities(capabilities.clone()))?;
             Ok(capabilities)
         } else {
             Ok(self.capabilities.read().await.clone())
         }
+    }
+
+    /// Returns the lightweight, explanatory resource preflight for the instance's currently
+    /// saved specification. This deliberately does not take the lifecycle lock or perform
+    /// artifact/device discovery; `start` remains the only authoritative admission boundary.
+    pub fn resource_admission(&self, instance_id: Uuid) -> Result<CapabilityProbeV2, HostError> {
+        let started = Instant::now();
+        let record = self
+            .store
+            .get_instance(instance_id)?
+            .ok_or(HostError::InstanceNotFound(instance_id))?;
+        let active_leases = self
+            .store
+            .list_leases()?
+            .into_iter()
+            .filter(|lease| lease.owner.instance_id != instance_id)
+            .collect::<Vec<_>>();
+        let probe = self
+            .discovery
+            .resource_admission(&record.spec, &active_leases);
+        tracing::info!(
+            event = "resource.admission.probed",
+            %instance_id,
+            status = ?probe.status,
+            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            scope = "resource_only",
+            "evaluated lightweight Host resource admission without artifact or device discovery"
+        );
+        Ok(probe)
     }
 
     pub fn list_instances(&self) -> Result<Vec<InstanceSummaryV2>, HostError> {
@@ -184,6 +282,23 @@ impl HostService {
             .iter()
             .map(InstanceSummaryV2::from)
             .collect())
+    }
+
+    /// Returns summaries and the selected full record from one store enumeration so the UI never
+    /// combines two lifecycle revisions. A missing selection deterministically falls back to the
+    /// first record, matching the desktop shell's existing selection behavior.
+    pub fn ui_snapshot(&self, selected_id: Option<Uuid>) -> Result<UiSnapshotV2, HostError> {
+        let records = self.store.list_instances()?;
+        let selected_id = selected_id
+            .filter(|id| records.iter().any(|record| record.spec.id == *id))
+            .or_else(|| records.first().map(|record| record.spec.id));
+        let selected =
+            selected_id.and_then(|id| records.iter().find(|record| record.spec.id == id).cloned());
+        let summaries = records.iter().map(InstanceSummaryV2::from).collect();
+        Ok(UiSnapshotV2 {
+            summaries,
+            selected,
+        })
     }
 
     pub fn get_instance(&self, id: Uuid) -> Result<InstanceRecordV2, HostError> {
@@ -196,6 +311,11 @@ impl HostService {
         &self,
         request: CreateInstanceRequestV2,
     ) -> Result<InstanceRecordV2, HostError> {
+        if request.spec.guest_kind == GuestKindV2::Microdroid && !microdroid_platform_supported() {
+            return Err(HostError::Unsupported(
+                "Microdroid requires macOS Apple Silicon or Windows x86_64",
+            ));
+        }
         let record = self.store.create_instance(request.spec)?;
         self.emit(HostEventKindV2::Instance((&record).into()))?;
         Ok(record)
@@ -215,6 +335,18 @@ impl HostService {
             return Err(HostError::InstanceMismatch);
         }
         let current = self.get_instance(id)?;
+        if current.spec.guest_kind != request.spec.guest_kind {
+            return Err(HostError::Unsupported(
+                "instance guest type is immutable; create a separate Android or Microdroid instance",
+            ));
+        }
+        validate_microdroid_storage_update(&self.paths, &current.spec, &request.spec)?;
+        if current.status.revision != request.expected_revision {
+            return Err(HostError::Store(StoreError::RevisionConflict {
+                expected: request.expected_revision,
+                actual: current.status.revision,
+            }));
+        }
         if current.status.observed.is_active()
             && active_spec_change_requires_restart(&current.spec, &request.spec)
         {
@@ -222,11 +354,66 @@ impl HostService {
                 "stop the instance before changing restart-sensitive specification fields",
             ));
         }
-        let record = self
+        let live_reconfigure = current.status.observed.is_active()
+            && active_worker_reconfigure_required(&current.spec, &request.spec);
+        if live_reconfigure {
+            let response = self
+                .call_worker(
+                    id,
+                    WorkerCommandV2::Reconfigure {
+                        display: request.spec.display.clone(),
+                        adb: request.spec.adb.clone(),
+                    },
+                )
+                .await?;
+            ensure_worker_success(response)?;
+        }
+        let record = match self
             .store
-            .update_instance(request.expected_revision, request.spec)?;
+            .update_instance(request.expected_revision, request.spec)
+        {
+            Ok(record) => record,
+            Err(error @ StoreError::RevisionConflict { expected, actual }) => {
+                tracing::warn!(
+                    event = "instance.settings.revision_conflict",
+                    instance_id = %id,
+                    expected_revision = expected,
+                    actual_revision = actual,
+                    "rejected stale per-instance settings update"
+                );
+                return Err(HostError::Store(error));
+            }
+            Err(error) => {
+                if live_reconfigure {
+                    let rollback = self
+                        .call_worker(
+                            id,
+                            WorkerCommandV2::Reconfigure {
+                                display: current.spec.display.clone(),
+                                adb: current.spec.adb.clone(),
+                            },
+                        )
+                        .await;
+                    let rollback_failed = match rollback {
+                        Ok(response) => ensure_worker_success(response).is_err(),
+                        Err(_) => true,
+                    };
+                    if rollback_failed {
+                        return Err(HostError::DisplaySession(format!(
+                            "persist live display settings failed ({error}); worker rollback also failed"
+                        )));
+                    }
+                }
+                return Err(HostError::Store(error));
+            }
+        };
         self.emit(HostEventKindV2::Instance((&record).into()))?;
-        Ok(record)
+        if live_reconfigure {
+            self.refresh_from_worker(id).await?;
+            self.get_instance(id)
+        } else {
+            Ok(record)
+        }
     }
 
     pub fn operation(&self, id: Uuid) -> Result<OperationRecordV2, HostError> {
@@ -273,7 +460,34 @@ impl HostService {
         kind: OperationKindV2,
         idempotency_key: &str,
     ) -> Result<OperationRecordV2, HostError> {
-        self.get_instance(instance_id)?;
+        let record = self.get_instance(instance_id)?;
+        match &kind {
+            OperationKindV2::Powerwash {
+                expected_revision,
+                confirmation_name,
+            } => {
+                validate_storage_confirmation(&record, *expected_revision, confirmation_name)?;
+                if record.powerwash_backup.is_some() {
+                    return Err(PowerwashError::BackupAlreadyAvailable.into());
+                }
+            }
+            OperationKindV2::RestorePowerwash {
+                backup_id,
+                expected_revision,
+                confirmation_name,
+            }
+            | OperationKindV2::DiscardPowerwashBackup {
+                backup_id,
+                expected_revision,
+                confirmation_name,
+            } => {
+                validate_storage_confirmation(&record, *expected_revision, confirmation_name)?;
+                if record.powerwash_backup.as_ref().map(|backup| backup.id) != Some(*backup_id) {
+                    return Err(PowerwashError::BackupNotFound(*backup_id).into());
+                }
+            }
+            _ => {}
+        }
         let (operation, created) =
             self.store
                 .create_operation_idempotent(Some(instance_id), kind, idempotency_key)?;
@@ -308,6 +522,25 @@ impl HostService {
         };
         let _guard = operation_lock.lock().await;
         let record = self.get_instance(instance_id)?;
+        match (&record.spec.guest_kind, &request.action) {
+            (GuestKindV2::Microdroid, InstanceActionV2::MicrodroidConsoleChallenge { .. }) => {
+                #[cfg(windows)]
+                return Err(HostError::Unsupported(
+                    "Microdroid console challenge is unavailable on Windows until the console input path provides a live, verified named-pipe channel",
+                ));
+            }
+            (GuestKindV2::Microdroid, _) => {
+                return Err(HostError::Unsupported(
+                    "Android device actions are not available for Microdroid",
+                ));
+            }
+            (GuestKindV2::Android, InstanceActionV2::MicrodroidConsoleChallenge { .. }) => {
+                return Err(HostError::Unsupported(
+                    "Microdroid console challenge is not available for Android",
+                ));
+            }
+            (GuestKindV2::Android, _) => {}
+        }
         if record.status.observed != ObservedStateV2::Ready {
             return Err(HostError::Busy("typed actions require Ready"));
         }
@@ -348,7 +581,34 @@ impl HostService {
                 "Player process identity is not alive".to_owned(),
             ));
         }
+        let display_operation = {
+            let mut operations = self.display_operations.lock().await;
+            Arc::clone(
+                operations
+                    .entry(instance_id)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        // Serialize replacement only for this instance. Different Android instances keep
+        // independent display pipelines, while two Players racing to replace one target cannot
+        // leave the Host registry pointing at a different session than the Worker.
+        let _display_guard = display_operation.lock().await;
         let record = self.get_instance(instance_id)?;
+        if record.spec.guest_kind == GuestKindV2::Microdroid {
+            return Err(HostError::Unsupported(
+                "Microdroid is headless and has no display session",
+            ));
+        }
+        let expected_scanout =
+            configured_scanout_id(&record.spec, request.display_id).ok_or_else(|| {
+                HostError::DisplaySession("requested display is not configured".to_owned())
+            })?;
+        if request.target.scanout_id() != expected_scanout {
+            return Err(HostError::DisplaySession(
+                "native display target scanout does not match the requested product display"
+                    .to_owned(),
+            ));
+        }
         let generation = record.frame_generation;
         let worker_active = record.status.observed.is_active() && record.worker.is_some();
         let previous = self.display_sessions.lock().await.remove(&instance_id);
@@ -374,6 +634,7 @@ impl HostService {
                     WorkerCommandV2::AttachDisplay {
                         session_id,
                         generation,
+                        display_id: request.display_id,
                         target: request.target.clone(),
                         viewport: request.viewport.clone(),
                     },
@@ -387,6 +648,7 @@ impl HostService {
             worker_endpoint: worker_endpoint(instance_id)?,
             session_token: token,
             generation,
+            display_id: request.display_id,
             expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(15),
         };
         self.display_sessions.lock().await.insert(
@@ -410,39 +672,74 @@ impl HostService {
                 "viewport is outside supported bounds".to_owned(),
             ));
         }
+        let display_operation = {
+            let mut operations = self.display_operations.lock().await;
+            Arc::clone(
+                operations
+                    .entry(instance_id)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _display_guard = display_operation.lock().await;
         let record = self.get_instance(instance_id)?;
         let worker_active = record.status.observed.is_active() && record.worker.is_some();
+        let worker_session = {
+            let mut sessions = self.display_sessions.lock().await;
+            let active = sessions.get_mut(&instance_id).ok_or_else(|| {
+                HostError::DisplaySession("display session was not found".to_owned())
+            })?;
+            if !tokens_equal(&active.session.session_token, &request.session_token) {
+                return Err(HostError::DisplaySession(
+                    "display session authentication failed".to_owned(),
+                ));
+            }
+            if !process_identity_is_alive(active.target.owner()) {
+                return Err(HostError::DisplaySession(
+                    "Player process identity is no longer alive".to_owned(),
+                ));
+            }
+            if request.viewport.revision < active.viewport.revision {
+                active.session.expires_at = OffsetDateTime::now_utc() + time::Duration::seconds(15);
+                return Ok(active.session.clone());
+            }
+            if !worker_active {
+                if request.viewport.revision > active.viewport.revision {
+                    active.viewport = request.viewport;
+                }
+                active.session.expires_at = OffsetDateTime::now_utc() + time::Duration::seconds(15);
+                return Ok(active.session.clone());
+            }
+            active.session.clone()
+        };
+
+        // Equal-revision heartbeats let the Worker cheaply verify the native child hierarchy and
+        // dimensions. Do not hold the global display-session registry while awaiting one Worker:
+        // a stalled instance must not serialize acquire/update/release for every other Player.
+        let response = self
+            .call_worker(
+                instance_id,
+                WorkerCommandV2::ResizeDisplay {
+                    session_id: worker_session.id,
+                    generation: worker_session.generation,
+                    viewport: request.viewport.clone(),
+                },
+            )
+            .await?;
+        ensure_worker_success(response)?;
+
         let mut sessions = self.display_sessions.lock().await;
         let active = sessions
             .get_mut(&instance_id)
             .ok_or_else(|| HostError::DisplaySession("display session was not found".to_owned()))?;
-        if !tokens_equal(&active.session.session_token, &request.session_token) {
+        if !tokens_equal(&active.session.session_token, &request.session_token)
+            || active.session.id != worker_session.id
+            || active.session.generation != worker_session.generation
+        {
             return Err(HostError::DisplaySession(
-                "display session authentication failed".to_owned(),
-            ));
-        }
-        if !process_identity_is_alive(active.target.owner()) {
-            return Err(HostError::DisplaySession(
-                "Player process identity is no longer alive".to_owned(),
+                "display session changed while updating its viewport".to_owned(),
             ));
         }
         if request.viewport.revision > active.viewport.revision {
-            if !worker_active {
-                active.viewport = request.viewport;
-                active.session.expires_at = OffsetDateTime::now_utc() + time::Duration::seconds(15);
-                return Ok(active.session.clone());
-            }
-            let response = self
-                .call_worker(
-                    instance_id,
-                    WorkerCommandV2::ResizeDisplay {
-                        session_id: active.session.id,
-                        generation: active.session.generation,
-                        viewport: request.viewport.clone(),
-                    },
-                )
-                .await?;
-            ensure_worker_success(response)?;
             active.viewport = request.viewport;
         }
         active.session.expires_at = OffsetDateTime::now_utc() + time::Duration::seconds(15);
@@ -454,6 +751,15 @@ impl HostService {
         instance_id: Uuid,
         request: ReleaseDisplaySessionRequestV2,
     ) -> Result<(), HostError> {
+        let display_operation = {
+            let mut operations = self.display_operations.lock().await;
+            Arc::clone(
+                operations
+                    .entry(instance_id)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _display_guard = display_operation.lock().await;
         let mut sessions = self.display_sessions.lock().await;
         let active = sessions
             .get(&instance_id)
@@ -489,6 +795,11 @@ impl HostService {
         instance_id: Uuid,
     ) -> Result<ScreenshotRecordV2, HostError> {
         let record = self.get_instance(instance_id)?;
+        if record.spec.guest_kind == GuestKindV2::Microdroid {
+            return Err(HostError::Unsupported(
+                "Microdroid is headless and does not support screenshots",
+            ));
+        }
         if record.status.observed != ObservedStateV2::Ready {
             return Err(HostError::Busy("screenshots require Ready"));
         }
@@ -512,6 +823,168 @@ impl HostService {
                 "worker screenshot response had an unexpected payload".to_owned(),
             )),
         }
+    }
+
+    pub async fn collect_android_bugreport(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<AndroidBugreportRecordV2, HostError> {
+        let operation_lock = {
+            let mut locks = self.instance_operations.lock().await;
+            Arc::clone(
+                locks
+                    .entry(instance_id)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _guard = operation_lock.lock().await;
+        let record = self.get_instance(instance_id)?;
+        if record.spec.guest_kind != GuestKindV2::Android {
+            return Err(HostError::Unsupported(
+                "bugreport is only available for Android instances",
+            ));
+        }
+        if record.status.observed != ObservedStateV2::Ready || !record.adb_ready {
+            return Err(HostError::Busy(
+                "bugreport requires a Ready Android instance with ADB",
+            ));
+        }
+        hd_platform::ensure_owner_only_directory(&self.paths.diagnostics)?;
+        let bugreport_id = Uuid::new_v4();
+        let output_path = self.paths.diagnostics.join(format!(
+            "android-bugreport-{}-{}.zip",
+            instance_id,
+            bugreport_id.simple()
+        ));
+        let response = self
+            .call_worker(
+                instance_id,
+                WorkerCommandV2::CollectAndroidBugreport {
+                    bugreport_id,
+                    output_path,
+                },
+            )
+            .await?;
+        let Some(WorkerPayloadV2::AndroidBugreport(bugreport)) = ensure_worker_success(response)?
+        else {
+            return Err(HostError::WorkerProtocol(
+                "worker bugreport response had an unexpected payload".to_owned(),
+            ));
+        };
+        retain_android_bugreports(&self.paths.diagnostics, instance_id, &bugreport.path)?;
+        Ok(bugreport)
+    }
+
+    pub async fn start_screen_recording(
+        &self,
+        instance_id: Uuid,
+        request: StartScreenRecordingRequestV2,
+    ) -> Result<ScreenRecordingStatusV2, HostError> {
+        if !request.is_valid() {
+            return Err(HostError::InvalidScreenRecordingDuration(
+                request.max_duration_seconds,
+            ));
+        }
+        let operation_lock = {
+            let mut locks = self.instance_operations.lock().await;
+            Arc::clone(
+                locks
+                    .entry(instance_id)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _guard = operation_lock.lock().await;
+        let record = self.get_instance(instance_id)?;
+        if record.spec.guest_kind != GuestKindV2::Android {
+            return Err(HostError::Unsupported(
+                "screen recording is only available for Android instances",
+            ));
+        }
+        if record.status.observed != ObservedStateV2::Ready
+            || (!cfg!(target_os = "macos") && !record.adb_ready)
+        {
+            return Err(HostError::Busy(
+                "screen recording requires a Ready Android instance and its platform recorder",
+            ));
+        }
+        if record.screen_recording.is_some() {
+            return Err(HostError::Busy(
+                "one screen recording is already active for this instance",
+            ));
+        }
+        let scanout_id = configured_scanout_id(&record.spec, request.display_id).ok_or(
+            HostError::Unsupported("requested screen-recording display is not configured"),
+        )?;
+        if !record.runtime_displays.iter().any(|display| {
+            display.display_id == request.display_id && display.scanout_id == scanout_id
+        }) {
+            return Err(HostError::Busy(
+                "requested screen-recording display is not active in the current Android run",
+            ));
+        }
+        let recording_id = Uuid::new_v4();
+        let directory = self.paths.screen_recording_directory();
+        hd_platform::ensure_owner_only_directory(&directory)?;
+        let output_path = directory.join(format!("{}-{}.mp4", instance_id, recording_id.simple()));
+        let response = self
+            .call_worker(
+                instance_id,
+                WorkerCommandV2::StartScreenRecording {
+                    recording_id,
+                    display_id: request.display_id,
+                    output_path,
+                    max_duration_seconds: request.max_duration_seconds,
+                },
+            )
+            .await?;
+        let Some(WorkerPayloadV2::ScreenRecordingStatus(status)) = ensure_worker_success(response)?
+        else {
+            return Err(HostError::WorkerProtocol(
+                "worker screen-recording start response had an unexpected payload".to_owned(),
+            ));
+        };
+        self.refresh_from_worker(instance_id).await?;
+        Ok(status)
+    }
+
+    pub async fn stop_screen_recording(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<ScreenRecordingRecordV2, HostError> {
+        let operation_lock = {
+            let mut locks = self.instance_operations.lock().await;
+            Arc::clone(
+                locks
+                    .entry(instance_id)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _guard = operation_lock.lock().await;
+        let record = self.get_instance(instance_id)?;
+        if record.spec.guest_kind != GuestKindV2::Android {
+            return Err(HostError::Unsupported(
+                "screen recording is only available for Android instances",
+            ));
+        }
+        let recording_id = record
+            .screen_recording
+            .as_ref()
+            .map(|recording| recording.id)
+            .ok_or(HostError::Busy("no screen recording is active"))?;
+        let response = self
+            .call_worker(
+                instance_id,
+                WorkerCommandV2::StopScreenRecording { recording_id },
+            )
+            .await?;
+        let Some(WorkerPayloadV2::ScreenRecording(recording)) = ensure_worker_success(response)?
+        else {
+            return Err(HostError::WorkerProtocol(
+                "worker screen-recording stop response had an unexpected payload".to_owned(),
+            ));
+        };
+        self.refresh_from_worker(instance_id).await?;
+        Ok(recording)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -659,17 +1132,51 @@ impl HostService {
         }
         if stop_all {
             for record in active {
+                let mode = if microdroid_graceful_stop_requires_force(
+                    record.spec.guest_kind,
+                    StopModeV2::Graceful,
+                    record.status.observed,
+                    record.adb_ready,
+                    record.adb_serial.is_some(),
+                ) {
+                    StopModeV2::Force
+                } else {
+                    StopModeV2::Graceful
+                };
                 let key = format!("host-shutdown-{}", Uuid::new_v4());
                 let operation = self.create_operation(
                     record.spec.id,
                     OperationKindV2::Stop {
-                        mode: StopModeV2::Graceful,
+                        mode,
                         graceful_timeout_ms: 20_000,
                     },
                     &key,
                 )?;
-                self.wait_operation(operation.id, Duration::from_secs(45))
-                    .await?;
+                if let Err(error) = self
+                    .wait_operation(operation.id, Duration::from_secs(45))
+                    .await
+                {
+                    if mode == StopModeV2::Force {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        event = "host.shutdown.force_fallback",
+                        instance_id = %record.spec.id,
+                        %error,
+                        "graceful stop failed during stop-all; retrying with force"
+                    );
+                    let force_key = format!("host-shutdown-force-{}", Uuid::new_v4());
+                    let force_operation = self.create_operation(
+                        record.spec.id,
+                        OperationKindV2::Stop {
+                            mode: StopModeV2::Force,
+                            graceful_timeout_ms: 20_000,
+                        },
+                        &force_key,
+                    )?;
+                    self.wait_operation(force_operation.id, Duration::from_secs(45))
+                        .await?;
+                }
             }
             // `stop_all` is also the controlled deployment/maintenance boundary. A stopped VM's
             // detached Worker normally survives Host exit, but retaining it here would keep the
@@ -693,6 +1200,7 @@ impl HostService {
         instance_id: Option<Uuid>,
         include_guest_logs: bool,
     ) -> Result<hd_core::DiagnosticBundleResponseV2, HostError> {
+        let _diagnostics_guard = self.diagnostics_operation.lock().await;
         let instance = instance_id.map(|id| self.get_instance(id)).transpose()?;
         let capabilities = self.capabilities(instance_id).await?;
         let mut worker_checks = Vec::new();
@@ -873,6 +1381,63 @@ impl HostService {
                         .result
                         .insert("archive_sha256".to_owned(), bundle.archive_sha256);
                 }),
+            OperationKindV2::Powerwash {
+                expected_revision,
+                confirmation_name,
+            } => self
+                .powerwash_instance(
+                    instance_id,
+                    expected_revision,
+                    &confirmation_name,
+                    operation_id,
+                )
+                .await
+                .map(|backup| {
+                    operation
+                        .result
+                        .insert("powerwash_backup_id".to_owned(), backup.id.to_string());
+                    operation
+                        .result
+                        .insert("powerwash_backup_sha256".to_owned(), backup.sha256);
+                }),
+            OperationKindV2::RestorePowerwash {
+                backup_id,
+                expected_revision,
+                confirmation_name,
+            } => self
+                .restore_powerwash_instance(
+                    instance_id,
+                    backup_id,
+                    expected_revision,
+                    &confirmation_name,
+                    operation_id,
+                )
+                .await
+                .map(|rollback| {
+                    operation.result.insert(
+                        "powerwash_restore_rollback_id".to_owned(),
+                        rollback.map_or_else(|| "none".to_owned(), |backup| backup.id.to_string()),
+                    );
+                }),
+            OperationKindV2::DiscardPowerwashBackup {
+                backup_id,
+                expected_revision,
+                confirmation_name,
+            } => self
+                .discard_powerwash_instance_backup(
+                    instance_id,
+                    backup_id,
+                    expected_revision,
+                    &confirmation_name,
+                    operation_id,
+                )
+                .await
+                .map(|backup| {
+                    operation.result.insert(
+                        "discarded_powerwash_backup_id".to_owned(),
+                        backup.id.to_string(),
+                    );
+                }),
             OperationKindV2::Delete => self.delete_instance(instance_id).await,
         };
         operation.finished_at = Some(OffsetDateTime::now_utc());
@@ -965,7 +1530,12 @@ impl HostService {
     #[allow(clippy::too_many_lines)]
     async fn start_instance(&self, id: Uuid) -> Result<(), HostError> {
         let mut record = self.get_instance(id)?;
-        self.guard_existing_worker(&mut record).await?;
+        if record.storage_transaction.is_some() {
+            return Err(PowerwashError::TransactionPending.into());
+        }
+        if self.guard_existing_worker(&mut record).await? {
+            return Ok(());
+        }
         if record.status.observed.is_active()
             && record.status.observed != ObservedStateV2::Recovering
         {
@@ -980,13 +1550,14 @@ impl HostService {
                 discovery.capabilities.clone(),
             ))?;
             if !discovery.capabilities.can_start() {
+                let blocked_detail = blocked_capability_detail(&discovery.capabilities);
                 record.status.force_reconciled(
                     ObservedStateV2::Blocked,
                     Some("capability_blocked".to_owned()),
-                    Some("required host capability is unavailable".to_owned()),
+                    Some(blocked_detail.clone()),
                 );
                 self.persist_instance(&record)?;
-                return Err(HostError::CapabilityBlocked);
+                return Err(HostError::CapabilityBlocked(blocked_detail));
             }
             self.leases.release_instance(id)?;
             record.frame_generation = record
@@ -1018,6 +1589,7 @@ impl HostService {
                         OffsetDateTime::now_utc() + time::Duration::seconds(15);
                     Some(PreparedNativeDisplayV2 {
                         session_id: active.session.id,
+                        display_id: active.session.display_id,
                         target: active.target.clone(),
                         viewport: active.viewport.clone(),
                     })
@@ -1082,11 +1654,44 @@ impl HostService {
                 let _ = self.refresh_from_worker(id).await;
                 return Err(error);
             }
-            let status = self.refresh_from_worker(id).await?;
-            if status.observed != ObservedStateV2::Ready {
+            let mut status = self.refresh_from_worker(id).await?;
+            if record.spec.guest_kind == GuestKindV2::Microdroid
+                && matches!(
+                    status.observed,
+                    ObservedStateV2::Stopping | ObservedStateV2::Stopped
+                )
+                && status.last_error.is_none()
+            {
+                let completion_deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < completion_deadline
+                    && !(status.observed == ObservedStateV2::Stopped
+                        && read_completed_microdroid_payload_result(&self.paths, id, run_id)
+                            .is_some())
+                    && matches!(
+                        status.observed,
+                        ObservedStateV2::Stopping | ObservedStateV2::Stopped
+                    )
+                    && status.last_error.is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    status = self.refresh_from_worker(id).await?;
+                }
+            }
+            let finite_microdroid_completed = record.spec.guest_kind == GuestKindV2::Microdroid
+                && status.observed == ObservedStateV2::Stopped
+                && status.last_error.is_none()
+                && read_completed_microdroid_payload_result(&self.paths, id, run_id).is_some();
+            if status.observed != ObservedStateV2::Ready && !finite_microdroid_completed {
                 return Err(HostError::WorkerProtocol(
                     "worker acknowledged start without reaching Ready".to_owned(),
                 ));
+            }
+            if finite_microdroid_completed {
+                tracing::info!(
+                    event = "instance.microdroid.payload.completed_during_start",
+                    instance_id = %id,
+                    "finite Microdroid payload completed before the Host Ready refresh"
+                );
             }
             Ok(())
         }
@@ -1103,7 +1708,10 @@ impl HostService {
         }
     }
 
-    async fn guard_existing_worker(&self, record: &mut InstanceRecordV2) -> Result<(), HostError> {
+    async fn guard_existing_worker(
+        &self,
+        record: &mut InstanceRecordV2,
+    ) -> Result<bool, HostError> {
         let id = record.spec.id;
         let persisted_identity = record.worker.clone();
         let persisted_alive = persisted_identity
@@ -1124,10 +1732,18 @@ impl HostService {
                         ));
                     }
                     sync_runtime_fields(record, &status);
-                    if status.observed.is_active()
-                        || status.cleanup_pending
-                        || status.child_pid.is_some()
-                    {
+                    if status.observed == ObservedStateV2::Ready && !status.cleanup_pending {
+                        self.persist_instance(record)?;
+                        tracing::info!(
+                            event = "instance.start.idempotent",
+                            instance_id = %id,
+                            worker_pid = status.identity.pid,
+                            observed = ?status.observed,
+                            "authenticated active Worker already satisfies Start"
+                        );
+                        return Ok(true);
+                    }
+                    if status.cleanup_pending || status.child_pid.is_some() {
                         record.status.force_reconciled(
                             ObservedStateV2::Recovering,
                             Some("live_worker_owns_runtime".to_owned()),
@@ -1158,7 +1774,7 @@ impl HostService {
                 Err(_) => {}
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     async fn reconcile_start_failure(
@@ -1166,6 +1782,7 @@ impl HostService {
         id: Uuid,
         error: &HostError,
     ) -> Result<bool, HostError> {
+        let api_error = error.api_error();
         let worker_status = self.ping_worker(id).await.ok();
         if let Some(status) = &worker_status
             && status.observed == ObservedStateV2::Ready
@@ -1174,7 +1791,7 @@ impl HostService {
             tracing::warn!(
                 event = "instance.start.response.recovered",
                 instance_id = %id,
-                error_code = error.code(),
+                error_code = %api_error.code,
                 "worker reached Ready despite a lost or rejected start response"
             );
             return Ok(true);
@@ -1185,8 +1802,8 @@ impl HostService {
             if status.observed.is_active() || status.cleanup_pending || status.child_pid.is_some() {
                 record.status.force_reconciled(
                     ObservedStateV2::Recovering,
-                    Some(error.code().to_owned()),
-                    Some(format!("start result is uncertain: {error}")),
+                    Some(api_error.code.clone()),
+                    Some(format!("start result is uncertain: {}", api_error.message)),
                 );
                 self.persist_instance(&record)?;
                 return Ok(false);
@@ -1198,9 +1815,10 @@ impl HostService {
         {
             record.status.force_reconciled(
                 ObservedStateV2::Recovering,
-                Some(error.code().to_owned()),
+                Some(api_error.code.clone()),
                 Some(format!(
-                    "worker is alive but start status is unavailable: {error}"
+                    "worker is alive but start status is unavailable: {}",
+                    api_error.message
                 )),
             );
             self.persist_instance(&record)?;
@@ -1208,7 +1826,7 @@ impl HostService {
         } else {
             record.worker = None;
         }
-        let blocked = matches!(error, HostError::CapabilityBlocked)
+        let blocked = matches!(error, HostError::CapabilityBlocked(_))
             || matches!(
                 error,
                 HostError::Lease(
@@ -1230,7 +1848,12 @@ impl HostService {
                             | "capability_changed"
                             | "readiness_unavailable"
                             | "frame_handshake"
+                            | "component_contract"
                             | "artifacts"
+                            | "microdroid_payload_verification_failed"
+                            | "microdroid_payload_changed"
+                            | "microdroid_invalid_payload_config"
+                            | "microdroid_service_connection_failed"
                     )
             );
         record.status.force_reconciled(
@@ -1239,8 +1862,8 @@ impl HostService {
             } else {
                 ObservedStateV2::Failed
             },
-            Some(error.code().to_owned()),
-            Some(error.to_string()),
+            Some(api_error.code),
+            Some(api_error.message),
         );
         self.leases.release_instance(id)?;
         self.persist_instance(&record)?;
@@ -1254,6 +1877,17 @@ impl HostService {
         timeout: Duration,
     ) -> Result<(), HostError> {
         let mut record = self.get_instance(id)?;
+        if microdroid_graceful_stop_requires_force(
+            record.spec.guest_kind,
+            mode,
+            record.status.observed,
+            record.adb_ready,
+            record.adb_serial.is_some(),
+        ) {
+            return Err(HostError::Unsupported(
+                "Microdroid graceful shutdown requires a ready ADB service; use explicit force stop",
+            ));
+        }
         record.status.set_desired(DesiredStateV2::Stopped);
         self.runtime_restarts.lock().remove(&id);
         // Persist the user's desired state before consulting the worker.  If the worker is already
@@ -1319,6 +1953,13 @@ impl HostService {
         id: Uuid,
         command: WorkerCommandV2,
     ) -> Result<(), HostError> {
+        if self.get_instance(id)?.spec.guest_kind == GuestKindV2::Microdroid
+            && is_unsupported_microdroid_worker_command(&command)
+        {
+            return Err(HostError::Unsupported(
+                "pause and resume are not available for Microdroid instances",
+            ));
+        }
         let response = self.call_worker(id, command).await?;
         let operation_result = ensure_worker_success(response).map(|_| ());
         let refresh_result = self.refresh_from_worker(id).await.map(|_| ());
@@ -1331,6 +1972,11 @@ impl HostService {
         display: hd_core::DisplayConfigV2,
         adb: hd_core::AdbConfigV2,
     ) -> Result<(), HostError> {
+        if self.get_instance(id)?.spec.guest_kind == GuestKindV2::Microdroid {
+            return Err(HostError::Unsupported(
+                "live Android display/ADB reconfiguration is not available for Microdroid",
+            ));
+        }
         let response = self
             .call_worker(
                 id,
@@ -1350,6 +1996,11 @@ impl HostService {
     }
 
     async fn install_apk(&self, id: Uuid, upload_id: Uuid, sha256: &str) -> Result<(), HostError> {
+        if self.get_instance(id)?.spec.guest_kind == GuestKindV2::Microdroid {
+            return Err(HostError::Unsupported(
+                "use the instance Payload import workflow for Microdroid APKs",
+            ));
+        }
         let upload = self
             .store
             .get_upload(upload_id)?
@@ -1367,6 +2018,133 @@ impl HostService {
             )
             .await?;
         ensure_worker_success(response).map(|_| ())
+    }
+
+    async fn powerwash_instance(
+        &self,
+        id: Uuid,
+        expected_revision: u64,
+        confirmation_name: &str,
+        operation_id: Uuid,
+    ) -> Result<hd_core::PowerwashBackupV2, HostError> {
+        let mut record = self.get_instance(id)?;
+        validate_storage_confirmation(&record, expected_revision, confirmation_name)?;
+        if record.powerwash_backup.is_some() {
+            return Err(PowerwashError::BackupAlreadyAvailable.into());
+        }
+        self.detach_worker_for_storage_mutation(&mut record).await?;
+        let paths = self.paths.clone();
+        let store = self.store.clone();
+        let (record, backup) = tokio::task::spawn_blocking(move || {
+            let backup = powerwash(&paths, &store, &mut record, operation_id)?;
+            Ok::<_, PowerwashError>((record, backup))
+        })
+        .await
+        .map_err(|error| HostError::OperationFailed(format!("powerwash task failed: {error}")))??;
+        tracing::info!(
+            event = "instance.powerwash.completed",
+            instance_id = %id,
+            backup_id = %backup.id,
+            size_bytes = backup.size_bytes,
+            sha256 = %backup.sha256,
+            "atomically reset Android userdata while preserving one recoverable backup"
+        );
+        self.emit(HostEventKindV2::Instance(InstanceSummaryV2::from(&record)))?;
+        Ok(backup)
+    }
+
+    async fn restore_powerwash_instance(
+        &self,
+        id: Uuid,
+        backup_id: Uuid,
+        expected_revision: u64,
+        confirmation_name: &str,
+        operation_id: Uuid,
+    ) -> Result<Option<hd_core::PowerwashBackupV2>, HostError> {
+        let mut record = self.get_instance(id)?;
+        validate_storage_confirmation(&record, expected_revision, confirmation_name)?;
+        self.detach_worker_for_storage_mutation(&mut record).await?;
+        let paths = self.paths.clone();
+        let store = self.store.clone();
+        let (record, rollback) = tokio::task::spawn_blocking(move || {
+            let rollback = restore_powerwash(&paths, &store, &mut record, backup_id, operation_id)?;
+            Ok::<_, PowerwashError>((record, rollback))
+        })
+        .await
+        .map_err(|error| {
+            HostError::OperationFailed(format!("powerwash restore task failed: {error}"))
+        })??;
+        tracing::info!(
+            event = "instance.powerwash.restore.completed",
+            instance_id = %id,
+            %backup_id,
+            rollback_id = ?rollback.as_ref().map(|backup| backup.id),
+            "restored Android userdata and retained the displaced overlay as the rollback backup"
+        );
+        self.emit(HostEventKindV2::Instance(InstanceSummaryV2::from(&record)))?;
+        Ok(rollback)
+    }
+
+    async fn discard_powerwash_instance_backup(
+        &self,
+        id: Uuid,
+        backup_id: Uuid,
+        expected_revision: u64,
+        confirmation_name: &str,
+        operation_id: Uuid,
+    ) -> Result<hd_core::PowerwashBackupV2, HostError> {
+        let mut record = self.get_instance(id)?;
+        validate_storage_confirmation(&record, expected_revision, confirmation_name)?;
+        self.detach_worker_for_storage_mutation(&mut record).await?;
+        let paths = self.paths.clone();
+        let store = self.store.clone();
+        let (record, discarded) = tokio::task::spawn_blocking(move || {
+            let discarded =
+                discard_powerwash_backup(&paths, &store, &mut record, backup_id, operation_id)?;
+            Ok::<_, PowerwashError>((record, discarded))
+        })
+        .await
+        .map_err(|error| {
+            HostError::OperationFailed(format!("powerwash discard task failed: {error}"))
+        })??;
+        tracing::info!(
+            event = "instance.powerwash.backup.discarded",
+            instance_id = %id,
+            %backup_id,
+            size_bytes = discarded.size_bytes,
+            "explicitly discarded the recoverable Android userdata backup"
+        );
+        self.emit(HostEventKindV2::Instance(InstanceSummaryV2::from(&record)))?;
+        Ok(discarded)
+    }
+
+    async fn detach_worker_for_storage_mutation(
+        &self,
+        record: &mut InstanceRecordV2,
+    ) -> Result<(), HostError> {
+        if let Some(identity) = record.worker.clone()
+            && process_identity_is_alive(&identity)
+        {
+            let response = self
+                .call_worker(record.spec.id, WorkerCommandV2::Shutdown)
+                .await?;
+            ensure_worker_success(response)?;
+            wait_for_process_exit(&identity, Duration::from_secs(5)).await;
+            if process_identity_is_alive(&identity) {
+                hd_platform::terminate_process_identity(&identity)?;
+                wait_for_process_exit(&identity, Duration::from_secs(5)).await;
+            }
+            if process_identity_is_alive(&identity) {
+                return Err(HostError::WorkerShutdownTimeout(record.spec.id));
+            }
+        }
+        self.leases.release_instance(record.spec.id)?;
+        record.worker = None;
+        record.active_run_id = None;
+        record.adb_serial = None;
+        record.adb_ready = false;
+        record.screen_recording = None;
+        Ok(())
     }
 
     async fn delete_instance(&self, id: Uuid) -> Result<(), HostError> {
@@ -1399,6 +2177,11 @@ impl HostService {
         }
         self.leases.release_instance(id)?;
         remove_regular_file_if_present(&self.paths.disk_overlay(id))?;
+        remove_scoped_directory_if_safe(
+            &self.paths.disks.join("powerwash"),
+            id,
+            "delete instance powerwash backups",
+        )?;
         remove_scoped_directory_if_safe(&self.paths.instances, id, "delete instance directory")?;
         remove_scoped_directory_if_safe(&self.paths.runs, id, "delete instance run history")?;
         remove_scoped_directory_if_safe(&self.paths.workers, id, "delete instance worker data")?;
@@ -1644,6 +2427,15 @@ impl HostService {
             .last_error
             .as_ref()
             .map(|error| error.message.clone());
+        let completed_microdroid_payload = (record.spec.guest_kind == GuestKindV2::Microdroid
+            && status.observed == ObservedStateV2::Stopped
+            && status.last_error.is_none())
+        .then_some(record.active_run_id)
+        .flatten()
+        .and_then(|run_id| {
+            read_completed_microdroid_payload_result(&self.paths, id, run_id)
+                .map(|result| (run_id, result))
+        });
         if record.status.observed != status.observed
             || record.status.error_code != error_code
             || record.status.reason != reason
@@ -1653,6 +2445,22 @@ impl HostService {
                 .force_reconciled(status.observed, error_code, reason);
         }
         sync_runtime_fields(&mut record, &status);
+        if let Some((run_id, result)) = completed_microdroid_payload {
+            record.status.set_desired(DesiredStateV2::Stopped);
+            record.active_run_id = None;
+            record.adb_serial = None;
+            record.adb_ready = false;
+            record.host_fps_milli = None;
+            self.runtime_restarts.lock().remove(&id);
+            self.leases.release_instance(id)?;
+            tracing::info!(
+                event = "instance.microdroid.payload.completed",
+                instance_id = %id,
+                %run_id,
+                payload_exit_code = ?result.exit_code,
+                "finite Microdroid payload completed; desired state and Host leases converged to Stopped"
+            );
+        }
         if record != previous {
             self.persist_instance(&record)?;
         }
@@ -1686,26 +2494,43 @@ impl HostService {
 
     async fn expire_display_sessions(&self) {
         let now = OffsetDateTime::now_utc();
-        let expired = {
-            let mut sessions = self.display_sessions.lock().await;
-            let expired_ids = sessions
+        let expired_ids = {
+            let sessions = self.display_sessions.lock().await;
+            sessions
                 .iter()
                 .filter_map(|(instance_id, active)| {
                     (active.session.expires_at <= now
                         || !process_identity_is_alive(active.target.owner()))
                     .then_some(*instance_id)
                 })
-                .collect::<Vec<_>>();
-            expired_ids
-                .into_iter()
-                .filter_map(|instance_id| {
-                    sessions
-                        .remove(&instance_id)
-                        .map(|session| (instance_id, session))
-                })
                 .collect::<Vec<_>>()
         };
-        for (instance_id, active) in expired {
+        for instance_id in expired_ids {
+            let display_operation = {
+                let mut operations = self.display_operations.lock().await;
+                Arc::clone(
+                    operations
+                        .entry(instance_id)
+                        .or_insert_with(|| Arc::new(Mutex::new(()))),
+                )
+            };
+            // Expiry races with Player replacement just like an explicit release. Serialize the
+            // complete remove/detach operation for this instance, then re-check after waiting so a
+            // heartbeat or a newly acquired session is never removed by a stale expiry candidate.
+            let _display_guard = display_operation.lock().await;
+            let active = {
+                let mut sessions = self.display_sessions.lock().await;
+                let still_expired = sessions.get(&instance_id).is_some_and(|active| {
+                    active.session.expires_at <= now
+                        || !process_identity_is_alive(active.target.owner())
+                });
+                still_expired
+                    .then(|| sessions.remove(&instance_id))
+                    .flatten()
+            };
+            let Some(active) = active else {
+                continue;
+            };
             if let Err(error) = self
                 .call_worker(
                     instance_id,
@@ -1735,7 +2560,7 @@ impl HostService {
     async fn refresh_runtime_instance(self: &Arc<Self>, instance_id: Uuid) {
         match self.refresh_from_worker(instance_id).await {
             Ok(status) if status.observed == ObservedStateV2::Ready => {
-                self.runtime_restarts.lock().remove(&instance_id);
+                self.observe_runtime_ready(instance_id);
             }
             Ok(status) if status.observed == ObservedStateV2::Failed => {
                 let Ok(record) = self.get_instance(instance_id) else {
@@ -1745,6 +2570,26 @@ impl HostService {
             }
             Ok(_) => {}
             Err(error) => self.handle_runtime_refresh_error(instance_id, &error),
+        }
+    }
+
+    fn observe_runtime_ready(&self, instance_id: Uuid) {
+        let mut restarts = self.runtime_restarts.lock();
+        let state = restarts.entry(instance_id).or_default();
+        let ready_since = state.ready_since.get_or_insert_with(Instant::now);
+        if ready_since.elapsed() < RUNTIME_READY_STABILITY_WINDOW {
+            return;
+        }
+        let recovered_attempts = state.attempts;
+        restarts.remove(&instance_id);
+        if recovered_attempts != 0 {
+            tracing::info!(
+                event = "instance.runtime_recovery.stable",
+                %instance_id,
+                attempts = recovered_attempts,
+                stable_seconds = RUNTIME_READY_STABILITY_WINDOW.as_secs(),
+                "runtime remained Ready long enough to reset its automatic restart budget"
+            );
         }
     }
 
@@ -1811,10 +2656,7 @@ impl HostService {
         self.schedule_runtime_restart(&record, "worker_lost");
     }
 
-    fn schedule_runtime_restart(self: &Arc<Self>, record: &InstanceRecordV2, cause: &str) {
-        if !should_restart_after_failure(record) {
-            return;
-        }
+    fn runtime_restart_waits_for_player(&self, record: &InstanceRecordV2) -> bool {
         #[cfg(target_os = "macos")]
         {
             let has_live_display_session = self
@@ -1828,58 +2670,131 @@ impl HostService {
                     })
                 })
                 .unwrap_or(false);
-            if should_wait_for_native_display_session(
+            should_wait_for_native_display_session(
+                record.spec.guest_kind,
                 crate::dev::native_display_direct_enabled(),
                 has_live_display_session,
-            ) {
-                tracing::debug!(
-                    event = "instance.runtime_failure.restart_waiting_for_player_session",
-                    instance_id = %record.spec.id,
-                    %cause,
-                    "macOS zero-copy recovery is waiting for a live Player display session"
-                );
-                return;
-            }
+            )
         }
-        let attempt = {
-            let mut restarts = self.runtime_restarts.lock();
-            let state = restarts.entry(record.spec.id).or_default();
-            if state.last_failed_revision == record.status.revision {
-                return;
-            }
-            if state.attempts >= MAX_AUTOMATIC_RUNTIME_RESTARTS {
-                tracing::error!(
-                    event = "instance.runtime_failure.restart_exhausted",
-                    instance_id = %record.spec.id,
-                    attempts = state.attempts,
-                    %cause,
-                    "automatic runtime recovery reached its bounded retry limit"
-                );
-                state.last_failed_revision = record.status.revision;
-                return;
-            }
-            state.attempts = state.attempts.saturating_add(1);
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (self, record);
+            false
+        }
+    }
+
+    fn reserve_runtime_restart_attempt(
+        &self,
+        record: &InstanceRecordV2,
+        cause: &str,
+    ) -> Option<u8> {
+        let mut restarts = self.runtime_restarts.lock();
+        let state = restarts.entry(record.spec.id).or_default();
+        if state.last_failed_revision == record.status.revision {
+            return None;
+        }
+        state.ready_since = None;
+        if state.attempts >= MAX_AUTOMATIC_RUNTIME_RESTARTS {
+            tracing::error!(
+                event = "instance.runtime_failure.restart_exhausted",
+                instance_id = %record.spec.id,
+                attempts = state.attempts,
+                %cause,
+                "automatic runtime recovery reached its bounded retry limit"
+            );
             state.last_failed_revision = record.status.revision;
-            state.attempts
+            return None;
+        }
+        state.attempts = state.attempts.saturating_add(1);
+        state.last_failed_revision = record.status.revision;
+        Some(state.attempts)
+    }
+
+    fn spawn_runtime_restart(self: &Arc<Self>, request: RuntimeRestartRequest) {
+        let host = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(request.delay).await;
+            let restart_still_current = host
+                .runtime_restarts
+                .lock()
+                .get(&request.instance_id)
+                .is_some_and(|state| {
+                    state.attempts == request.attempt
+                        && state.last_failed_revision == request.failed_revision
+                        && state.ready_since.is_none()
+                });
+            let Ok(latest) = host.get_instance(request.instance_id) else {
+                return;
+            };
+            if !restart_still_current
+                || latest.status.revision != request.failed_revision
+                || latest.status.desired != DesiredStateV2::Running
+                || !matches!(
+                    latest.status.observed,
+                    ObservedStateV2::Failed | ObservedStateV2::Recovering
+                )
+            {
+                tracing::debug!(
+                    event = "instance.runtime_failure.restart_cancelled",
+                    instance_id = %request.instance_id,
+                    attempt = request.attempt,
+                    cause = %request.cause,
+                    "runtime recovery no longer matches the failed instance revision"
+                );
+                return;
+            }
+            if let Err(error) = host.create_operation(
+                request.instance_id,
+                OperationKindV2::Start,
+                &request.idempotency_key,
+            ) {
+                tracing::error!(
+                    event = "instance.runtime_failure.restart_schedule_failed",
+                    instance_id = %request.instance_id,
+                    attempt = request.attempt,
+                    cause = %request.cause,
+                    %error,
+                    "failed to schedule runtime recovery"
+                );
+            }
+        });
+    }
+
+    fn schedule_runtime_restart(self: &Arc<Self>, record: &InstanceRecordV2, cause: &str) {
+        if !should_restart_after_failure(record) {
+            return;
+        }
+        if self.runtime_restart_waits_for_player(record) {
+            tracing::debug!(
+                event = "instance.runtime_failure.restart_waiting_for_player_session",
+                instance_id = %record.spec.id,
+                %cause,
+                "macOS zero-copy recovery is waiting for a live Player display session"
+            );
+            return;
+        }
+        let Some(attempt) = self.reserve_runtime_restart_attempt(record, cause) else {
+            return;
         };
-        let key = format!("{cause}-restart-{}-{attempt}", record.status.revision);
+        let delay = automatic_runtime_restart_backoff(attempt);
         tracing::warn!(
             event = "instance.runtime_failure.restart_scheduled",
             instance_id = %record.spec.id,
             error_code = record.status.error_code.as_deref().unwrap_or(cause),
             %attempt,
             %cause,
-            "runtime failure scheduled a new start under restart_policy=on_failure"
+            delay_ms = delay.as_millis(),
+            "runtime failure scheduled a bounded delayed start under restart_policy=on_failure"
         );
-        if let Err(error) = self.create_operation(record.spec.id, OperationKindV2::Start, &key) {
-            tracing::error!(
-                event = "instance.runtime_failure.restart_schedule_failed",
-                instance_id = %record.spec.id,
-                %cause,
-                %error,
-                "failed to schedule runtime recovery"
-            );
-        }
+        self.spawn_runtime_restart(RuntimeRestartRequest {
+            instance_id: record.spec.id,
+            failed_revision: record.status.revision,
+            attempt,
+            delay,
+            cause: cause.to_owned(),
+            idempotency_key: format!("{cause}-restart-{}-{attempt}", record.status.revision),
+        });
     }
 
     async fn call_worker(
@@ -1969,13 +2884,54 @@ fn sync_runtime_fields(record: &mut InstanceRecordV2, status: &WorkerStatusV2) {
     record.adb_serial.clone_from(&status.adb_serial);
     record.adb_ready = status.adb_ready;
     record.frame_generation = record.frame_generation.max(status.frame_generation);
+    record.runtime_displays.clone_from(&status.runtime_displays);
     record.host_fps_milli =
         (status.frame_metrics.fps_milli > 0).then_some(status.frame_metrics.fps_milli);
+    record.screen_recording.clone_from(&status.screen_recording);
+    record.location_route.clone_from(&status.location_route);
+    record.uwb_ranging.clone_from(&status.uwb_ranging);
+    record.modem_state.clone_from(&status.modem_state);
+    record.sensor_pose.clone_from(&status.sensor_pose);
+    record.bluetooth_peers.clone_from(&status.bluetooth_peers);
+    record
+        .last_bluetooth_hci_capture
+        .clone_from(&status.last_bluetooth_hci_capture);
+    if status.last_location_route.is_some() {
+        record
+            .last_location_route
+            .clone_from(&status.last_location_route);
+    }
+    if status.last_screen_recording.is_some() {
+        record
+            .last_screen_recording
+            .clone_from(&status.last_screen_recording);
+    }
+}
+
+fn read_completed_microdroid_payload_result(
+    paths: &DataPaths,
+    instance_id: Uuid,
+    run_id: Uuid,
+) -> Option<RunResultV2> {
+    let path = paths.run_dir(instance_id, run_id).join("result.json");
+    let bytes = hd_platform::read_regular_nofollow_limited(&path, 64 * 1024).ok()?;
+    let result = serde_json::from_slice::<RunResultV2>(&bytes).ok()?;
+    (result.instance_id == instance_id
+        && result.run_id == run_id
+        && result.final_state == ObservedStateV2::Stopped
+        && result.exit_code == Some(0)
+        && result.error_code.is_none()
+        && result.reason.is_none())
+    .then_some(result)
 }
 
 fn should_restart_after_failure(record: &InstanceRecordV2) -> bool {
     record.status.desired == DesiredStateV2::Running
         && matches!(record.spec.restart_policy, RestartPolicyV2::OnFailure)
+}
+
+fn automatic_runtime_restart_backoff(attempt: u8) -> Duration {
+    Duration::from_secs(1_u64 << u32::from(attempt.saturating_sub(1).min(2)))
 }
 
 fn active_spec_change_requires_restart(
@@ -1990,24 +2946,132 @@ fn active_spec_change_requires_restart(
     allowed != *next
 }
 
+fn active_worker_reconfigure_required(
+    current: &hd_core::InstanceSpecV2,
+    next: &hd_core::InstanceSpecV2,
+) -> bool {
+    current.display.orientation != next.display.orientation
+        || current.display.secondary_displays != next.display.secondary_displays
+}
+
+fn configured_scanout_id(spec: &hd_core::InstanceSpecV2, display_id: DisplayIdV2) -> Option<u32> {
+    if spec.guest_kind != GuestKindV2::Android {
+        return None;
+    }
+    match display_id {
+        DisplayIdV2::Primary => Some(0),
+        DisplayIdV2::Secondary { id } => spec
+            .display
+            .secondary_displays
+            .iter()
+            .position(|display| display.id == id)
+            .and_then(|index| u32::try_from(index + 1).ok()),
+    }
+}
+
+fn is_unsupported_microdroid_worker_command(command: &WorkerCommandV2) -> bool {
+    matches!(command, WorkerCommandV2::Pause | WorkerCommandV2::Resume)
+}
+
+fn validate_microdroid_storage_update(
+    paths: &DataPaths,
+    current: &hd_core::InstanceSpecV2,
+    next: &hd_core::InstanceSpecV2,
+) -> Result<(), HostError> {
+    if current.guest_kind != GuestKindV2::Microdroid {
+        return Ok(());
+    }
+    let current_size = current
+        .microdroid
+        .as_ref()
+        .and_then(|config| config.encrypted_storage_mib);
+    let next_size = next
+        .microdroid
+        .as_ref()
+        .and_then(|config| config.encrypted_storage_mib);
+    if current_size == next_size || next_size.is_none() {
+        return Ok(());
+    }
+    let path = paths
+        .instance_dir(current.id)
+        .join("microdroid")
+        .join("storage.img");
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(HostError::Io {
+                operation: "inspect Microdroid encrypted storage",
+                path,
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(HostError::UnsafeFile(path));
+    }
+    let expected = u64::from(next_size.expect("checked above")).saturating_mul(1024 * 1024);
+    if metadata.len() != expected {
+        return Err(HostError::Unsupported(
+            "existing Microdroid encrypted storage cannot be resized; detach it or create a new instance",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
 const fn should_wait_for_native_display_session(
+    guest_kind: GuestKindV2,
     native_display_direct: bool,
     has_live_display_session: bool,
 ) -> bool {
-    native_display_direct && !has_live_display_session
+    matches!(guest_kind, GuestKindV2::Android) && native_display_direct && !has_live_display_session
 }
 
 #[cfg(test)]
 mod native_display_restart_tests {
-    use hd_core::InstanceSpecV2;
+    use hd_core::{GuestKindV2, HostAudioInputV2, InstanceSpecV2};
 
-    use super::{active_spec_change_requires_restart, should_wait_for_native_display_session};
+    use super::{
+        active_spec_change_requires_restart, is_unsupported_microdroid_worker_command,
+        should_wait_for_native_display_session,
+    };
 
     #[test]
     fn macos_zero_copy_restart_waits_for_player_session() {
-        assert!(should_wait_for_native_display_session(true, false));
-        assert!(!should_wait_for_native_display_session(true, true));
-        assert!(!should_wait_for_native_display_session(false, false));
+        assert!(should_wait_for_native_display_session(
+            GuestKindV2::Android,
+            true,
+            false
+        ));
+        assert!(!should_wait_for_native_display_session(
+            GuestKindV2::Android,
+            true,
+            true
+        ));
+        assert!(!should_wait_for_native_display_session(
+            GuestKindV2::Android,
+            false,
+            false
+        ));
+        assert!(!should_wait_for_native_display_session(
+            GuestKindV2::Microdroid,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn microdroid_pause_and_resume_are_rejected_before_worker_state_changes() {
+        assert!(is_unsupported_microdroid_worker_command(
+            &hd_core::WorkerCommandV2::Pause
+        ));
+        assert!(is_unsupported_microdroid_worker_command(
+            &hd_core::WorkerCommandV2::Resume
+        ));
+        assert!(!is_unsupported_microdroid_worker_command(
+            &hd_core::WorkerCommandV2::Diagnose
+        ));
     }
 
     #[test]
@@ -2020,6 +3084,10 @@ mod native_display_restart_tests {
             .labels
             .insert("group".to_owned(), "demo".to_owned());
         assert!(!active_spec_change_requires_restart(&current, &host_only));
+
+        let mut audio_change = current.clone();
+        audio_change.host_audio_input = HostAudioInputV2::DefaultMicrophone;
+        assert!(active_spec_change_requires_restart(&current, &audio_change));
 
         let mut guest_change = host_only;
         guest_change.memory_mib += 1024;
@@ -2053,10 +3121,60 @@ fn diagnostic_failure(id: &str, detail: &str) -> hd_core::DiagnosticCheckV2 {
     }
 }
 
+fn retain_android_bugreports(
+    directory: &Path,
+    instance_id: Uuid,
+    current: &Path,
+) -> Result<(), HostError> {
+    const RETAIN_PER_INSTANCE: usize = 3;
+    let prefix = format!("android-bugreport-{instance_id}-");
+    let mut artifacts = std::fs::read_dir(directory)
+        .map_err(|source| HostError::Io {
+            operation: "read Android bugreport directory",
+            path: directory.to_owned(),
+            source,
+        })?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            let id = name.strip_prefix(&prefix)?.strip_suffix(".zip")?;
+            if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return None;
+            }
+            Some((metadata.modified().ok(), path))
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by(|left, right| {
+        (right.1 == current)
+            .cmp(&(left.1 == current))
+            .then_with(|| right.0.cmp(&left.0))
+            .then_with(|| right.1.cmp(&left.1))
+    });
+    for (_, path) in artifacts.into_iter().skip(RETAIN_PER_INSTANCE) {
+        std::fs::remove_file(&path).map_err(|source| HostError::Io {
+            operation: "remove expired Android bugreport",
+            path,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 fn apply_device_runtime_checks(
     devices: &mut hd_core::DeviceCapabilitiesV2,
+    spec: &hd_core::InstanceSpecV2,
     checks: &[hd_core::DiagnosticCheckV2],
 ) {
+    mark_device_runtime_probe_unavailable(
+        devices,
+        spec,
+        "Worker diagnostics did not include a result for this device",
+    );
     for check in checks {
         let Some(id) = check.id.strip_prefix("device.") else {
             continue;
@@ -2065,6 +3183,7 @@ fn apply_device_runtime_checks(
             continue;
         };
         let field = |name: &str| check.fields.get(name).is_some_and(|value| value == "true");
+        device.runtime.probed = true;
         device.runtime.installed = field("installed");
         device.runtime.configured = field("configured");
         device.runtime.running = field("running");
@@ -2072,6 +3191,37 @@ fn apply_device_runtime_checks(
         device.runtime.verified =
             field("verified") && check.status == hd_core::DiagnosticStatusV2::Pass;
         device.runtime.detail.clone_from(&check.detail);
+    }
+}
+
+fn mark_device_runtime_probe_unavailable(
+    devices: &mut hd_core::DeviceCapabilitiesV2,
+    spec: &hd_core::InstanceSpecV2,
+    error: &str,
+) {
+    for device in &mut devices.devices {
+        let configured = match device.id.as_str() {
+            "bluetooth" => spec.devices.bluetooth,
+            "nfc" => spec.devices.nfc,
+            "uwb" => spec.devices.uwb,
+            "modem" => spec.devices.modem,
+            "gnss" => spec.devices.gnss,
+            "sensors" => spec.devices.sensors,
+            "network" => spec.devices.network,
+            "audio" => spec.devices.audio,
+            "camera" => spec.devices.camera,
+            "power" => spec.devices.power,
+            _ => false,
+        };
+        device.runtime.probed = false;
+        device.runtime.installed = device.available;
+        device.runtime.configured = configured;
+        device.runtime.running = false;
+        device.runtime.controllable = false;
+        device.runtime.verified = false;
+        device.runtime.detail = format!(
+            "实例已 Ready，但设备运行态探测失败；主机能力声明保持不变，控制操作暂时禁用：{error}"
+        );
     }
 }
 
@@ -2232,6 +3382,19 @@ async fn wait_for_process_exit(identity: &WorkerIdentityV2, timeout: Duration) {
     }
 }
 
+fn microdroid_graceful_stop_requires_force(
+    guest_kind: GuestKindV2,
+    mode: StopModeV2,
+    observed: ObservedStateV2,
+    adb_ready: bool,
+    adb_serial_present: bool,
+) -> bool {
+    guest_kind == GuestKindV2::Microdroid
+        && mode == StopModeV2::Graceful
+        && matches!(observed, ObservedStateV2::Ready | ObservedStateV2::Paused)
+        && (!adb_ready || !adb_serial_present)
+}
+
 fn remove_regular_file_if_present(path: &Path) -> Result<(), HostError> {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return Ok(());
@@ -2278,6 +3441,92 @@ fn remove_scoped_directory_if_safe(
     })
 }
 
+fn blocked_probe_reason(probe: &CapabilityProbeV2) -> String {
+    const MAX_DETAIL_CHARS: usize = 512;
+    const RESOURCE_KEYS: [&str; 8] = [
+        "requested_cpus",
+        "guest_cpu_capacity",
+        "available_memory_bytes",
+        "requested_memory_bytes",
+        "host_memory_reserve_bytes",
+        "available_disk_bytes",
+        "required_disk_bytes",
+        "disk_requirement_mode",
+    ];
+    let detail = probe
+        .detail
+        .chars()
+        .take(MAX_DETAIL_CHARS)
+        .collect::<String>();
+    let properties = (probe.id == "host.resources")
+        .then(|| {
+            RESOURCE_KEYS
+                .iter()
+                .filter_map(|key| {
+                    probe
+                        .properties
+                        .get(*key)
+                        .map(|value| format!("{key}={value}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" ({value})"))
+        .unwrap_or_default();
+    format!("{}: {detail}{properties}", probe.id)
+}
+
+fn blocked_capability_detail(capabilities: &HostCapabilitiesV2) -> String {
+    const MAX_REASONS: usize = 8;
+    if let Some(resources) = capabilities.probes.iter().find(|probe| {
+        probe.id == "host.resources"
+            && probe.required
+            && !matches!(probe.status, CapabilityStatusV2::Supported)
+    }) {
+        return format!(
+            "required host capability is blocked: {}; remaining artifact, device and release checks are deferred until host resources recover",
+            blocked_probe_reason(resources)
+        );
+    }
+
+    let mut reasons = Vec::new();
+    let certification_reported = capabilities.probes.iter().any(|probe| {
+        probe.id == "release.certification"
+            && probe.required
+            && !matches!(probe.status, CapabilityStatusV2::Supported)
+    });
+    if !capabilities.certified && !capabilities.development_bypass && !certification_reported {
+        reasons.push("release.authorization: no valid Host certification is installed".to_owned());
+    }
+    for probe in capabilities
+        .probes
+        .iter()
+        .filter(|probe| probe.required && !matches!(probe.status, CapabilityStatusV2::Supported))
+    {
+        reasons.push(blocked_probe_reason(probe));
+    }
+    // `device.profile` is the instance-aware aggregate: it includes only device switches enabled
+    // by this specification.  Adding every unavailable device capability again here would turn a
+    // deliberately disabled device into a launch blocker (for example, a Windows image without
+    // the optional Guest sensor injector).  Individual device entries remain visible to the UI,
+    // while launch authorization is decided by the required aggregate probe above.
+    if reasons.is_empty() {
+        return "required host capability is blocked; refresh capabilities for current details"
+            .to_owned();
+    }
+    let omitted = reasons.len().saturating_sub(MAX_REASONS);
+    reasons.truncate(MAX_REASONS);
+    let mut detail = format!(
+        "required host capability is blocked: {}",
+        reasons.join("; ")
+    );
+    if omitted > 0 {
+        let _ = write!(detail, "; {omitted} additional blockers omitted");
+    }
+    detail
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     #[error("instance {0} was not found")]
@@ -2290,8 +3539,10 @@ pub enum HostError {
     InstanceMismatch,
     #[error("host is busy: {0}")]
     Busy(&'static str),
-    #[error("required host capability is blocked")]
-    CapabilityBlocked,
+    #[error("operation is unsupported for this guest type: {0}")]
+    Unsupported(&'static str),
+    #[error("{0}")]
+    CapabilityBlocked(String),
     #[error("worker executable is missing: {0}")]
     WorkerExecutable(PathBuf),
     #[error("worker {0} did not authenticate before the startup deadline")]
@@ -2312,6 +3563,8 @@ pub enum HostError {
     OperationFailed(String),
     #[error("operation {0} timed out")]
     OperationTimeout(Uuid),
+    #[error("screen recording duration must be between 1 and 180 seconds, got {0}")]
+    InvalidScreenRecordingDuration(u16),
     #[error("secure file is unsafe or exceeds its size limit: {0}")]
     UnsafeFile(PathBuf),
     #[error("secure secret is not UTF-8: {0}")]
@@ -2332,6 +3585,8 @@ pub enum HostError {
     State(#[from] hd_core::StateTransitionError),
     #[error(transparent)]
     Diagnostic(#[from] DiagnosticError),
+    #[error(transparent)]
+    Powerwash(#[from] PowerwashError),
     #[error("failed to decode JSON: {0}")]
     Json(serde_json::Error),
     #[error("{operation} failed for {path}: {source}")]
@@ -2351,7 +3606,8 @@ impl HostError {
             Self::UploadNotFound(_) => "upload_not_found",
             Self::InstanceMismatch => "instance_mismatch",
             Self::Busy(_) => "busy",
-            Self::CapabilityBlocked => "capability_blocked",
+            Self::Unsupported(_) => "unsupported",
+            Self::CapabilityBlocked(_) => "capability_blocked",
             Self::WorkerExecutable(_) => "worker_executable",
             Self::WorkerStartTimeout(_) => "worker_start_timeout",
             Self::WorkerShutdownTimeout(_) => "worker_shutdown_timeout",
@@ -2362,16 +3618,19 @@ impl HostError {
             Self::UploadDigestMismatch => "upload_digest_mismatch",
             Self::OperationFailed(_) => "operation_failed",
             Self::OperationTimeout(_) => "operation_timeout",
+            Self::InvalidScreenRecordingDuration(_) => "screen_recording_duration_invalid",
             Self::UnsafeFile(_) => "unsafe_file",
             Self::SecretUtf8(_) => "secret_utf8",
             Self::Random(_) => "random",
             Self::Action(_) => "action_invalid",
+            Self::Store(StoreError::RevisionConflict { .. }) => "revision_conflict",
             Self::Store(_) => "store",
             Self::Lease(error) => error.code(),
             Self::Ipc(_) => "ipc",
             Self::Platform(_) => "platform",
             Self::State(_) => "state",
             Self::Diagnostic(_) => "diagnostic",
+            Self::Powerwash(error) => error.code(),
             Self::Json(_) => "json",
             Self::Io { .. } => "io",
         }
@@ -2403,5 +3662,30 @@ mod host_error_tests {
         );
         let actual = HostError::WorkerRejected(expected.clone()).api_error();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn microdroid_graceful_stop_without_ready_adb_requires_force() {
+        assert!(microdroid_graceful_stop_requires_force(
+            GuestKindV2::Microdroid,
+            StopModeV2::Graceful,
+            ObservedStateV2::Ready,
+            false,
+            true,
+        ));
+        assert!(!microdroid_graceful_stop_requires_force(
+            GuestKindV2::Microdroid,
+            StopModeV2::Force,
+            ObservedStateV2::Ready,
+            false,
+            false,
+        ));
+        assert!(!microdroid_graceful_stop_requires_force(
+            GuestKindV2::Android,
+            StopModeV2::Graceful,
+            ObservedStateV2::Ready,
+            false,
+            false,
+        ));
     }
 }

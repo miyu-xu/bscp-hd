@@ -25,6 +25,7 @@ license = "Apache-2.0"
 rust-version = "1.92"
 
 [workspace.dependencies]
+aes = "0.8.4"
 anyhow = "1.0.102"
 ash = "0.38.0"
 async-trait = "0.1.89"
@@ -40,6 +41,7 @@ getrandom = "0.4.2"
 hex = "0.4.3"
 libc = "0.2.186"
 parking_lot = "0.12.5"
+quick-xml = "0.39.4"
 raw-window-handle = "0.6.2"
 winit = { version = "0.30.12", features = ["rwh_06"] }
 wry = { version = "0.55.1", default-features = false, features = ["protocol"] }
@@ -64,6 +66,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "jso
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 url = "2.5.8"
 walkdir = "2.5.0"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 zstd = "0.13.3"
 
 [profile.release]

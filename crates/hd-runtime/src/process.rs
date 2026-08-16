@@ -1,11 +1,16 @@
 use std::fs::OpenOptions;
 
 use async_trait::async_trait;
+#[cfg(unix)]
+use hd_core::WorkerIdentityV2;
 use hd_platform::{
     PlatformError, ProcessContainment, ProcessExit, ProcessSpec, ProcessSupervisor,
-    configure_managed_command, contain_process, resume_managed_process,
+    configure_latency_sensitive_managed_command, configure_managed_command, contain_process,
+    resume_managed_process,
 };
 use tokio::process::{Child, Command};
+#[cfg(unix)]
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokioProcessSupervisor;
@@ -55,7 +60,11 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             .stdout(stdout)
             .stderr(stderr)
             .kill_on_drop(spec.kill_on_drop);
-        configure_managed_command(command.as_std_mut())?;
+        if spec.latency_sensitive {
+            configure_latency_sensitive_managed_command(command.as_std_mut())?;
+        } else {
+            configure_managed_command(command.as_std_mut())?;
+        }
         tracing::info!(
             event = "process.spawn.started",
             executable = %spec.executable.display(),
@@ -106,12 +115,61 @@ impl ProcessSupervisor for TokioProcessSupervisor {
 
     async fn terminate(&self, handle: &mut Self::Handle) -> Result<(), PlatformError> {
         tracing::info!(event = "process.terminate.started", pid = handle.pid);
-        handle.child.start_kill().map_err(|error| {
-            PlatformError::Process(format!("kill process {}: {error}", handle.pid))
-        })?;
-        let status = handle.child.wait().await.map_err(|error| {
-            PlatformError::Process(format!("wait process {}: {error}", handle.pid))
-        })?;
+        #[cfg(unix)]
+        let graceful_status = if let Some(status) = handle.child.try_wait().map_err(|error| {
+            PlatformError::Process(format!("poll process {}: {error}", handle.pid))
+        })? {
+            Some(status)
+        } else {
+            let identity = WorkerIdentityV2 {
+                pid: handle.pid,
+                process_start_marker: hd_platform::process_start_marker(handle.pid)?,
+                nonce: Uuid::nil(),
+            };
+            match hd_platform::terminate_process_identity(&identity) {
+                Ok(()) => {
+                    if let Ok(status) =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), handle.child.wait())
+                            .await
+                    {
+                        Some(status.map_err(|error| {
+                            PlatformError::Process(format!(
+                                "wait gracefully terminated process {}: {error}",
+                                handle.pid
+                            ))
+                        })?)
+                    } else {
+                        tracing::warn!(
+                            event = "process.terminate.graceful_timeout",
+                            pid = handle.pid,
+                            "managed process ignored SIGTERM; forcing termination"
+                        );
+                        None
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "process.terminate.graceful_failed",
+                        pid = handle.pid,
+                        %error,
+                        "managed process could not be signaled gracefully; forcing termination"
+                    );
+                    None
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let graceful_status = None;
+        let status = if let Some(status) = graceful_status {
+            status
+        } else {
+            handle.child.start_kill().map_err(|error| {
+                PlatformError::Process(format!("kill process {}: {error}", handle.pid))
+            })?;
+            handle.child.wait().await.map_err(|error| {
+                PlatformError::Process(format!("wait process {}: {error}", handle.pid))
+            })?
+        };
         tracing::info!(
             event = "process.terminate.succeeded",
             pid = handle.pid,

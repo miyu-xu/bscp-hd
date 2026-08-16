@@ -406,7 +406,30 @@ impl PersistentStore {
                 path: paths.instances.clone(),
                 source,
             })?;
-            let config_path = entry.path().join("instance.json");
+            let instance_path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&instance_path).map_err(|source| StoreError::Io {
+                    operation: "inspect legacy instance directory",
+                    path: instance_path.clone(),
+                    source,
+                })?;
+            if metadata.file_type().is_symlink() {
+                return Err(StoreError::Corrupt(format!(
+                    "legacy instance directory must not be a symbolic link: {}",
+                    instance_path.display()
+                )));
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            let Some(directory_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok())
+            else {
+                continue;
+            };
+            let config_path = instance_path.join("instance.json");
             let bytes = match read_regular_limited(&config_path, MAX_LEGACY_CONFIG_BYTES) {
                 Ok(bytes) => bytes,
                 Err(StoreError::Io { source, .. })
@@ -417,6 +440,12 @@ impl PersistentStore {
                 Err(error) => return Err(error),
             };
             let outcome = decode_or_migrate_instance(&bytes)?;
+            if outcome.spec.id != directory_id {
+                return Err(StoreError::Corrupt(format!(
+                    "legacy instance {} contains configuration for {}",
+                    directory_id, outcome.spec.id
+                )));
+            }
             if self.get_instance(outcome.spec.id)?.is_some() {
                 continue;
             }

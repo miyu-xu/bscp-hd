@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -10,13 +11,15 @@ use hd_core::{
     FormalComponentConfigurationV2, FormalComponentLaunchV2, FormalComponentReadyV2,
     InstanceActionV2,
 };
-use hd_device_sim::{DeviceCommandV2, DeviceRequestV2, DeviceSimulatorV2, probe};
+use hd_device_sim::{
+    DeviceCommandV2, DeviceRequestV2, DeviceSimulatorV2, SensorOverrideRuntimeV2, probe,
+};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 #[cfg(windows)]
 use tokio::io::AsyncReadExt as _;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 const MAX_DEVICE_MESSAGE_BYTES: usize = 64 * 1024;
@@ -24,6 +27,8 @@ const MAX_DEVICE_MESSAGE_BYTES: usize = 64 * 1024;
 const FIXED_LOCATION_COMMAND: &[u8] = b"CMD_GET_LOCATION";
 
 #[cfg(unix)]
+mod location_bridge;
+#[cfg(any(unix, windows))]
 mod sensor_bridge;
 
 #[derive(Debug, Parser)]
@@ -53,7 +58,33 @@ struct FormalContext {
     control_token: DeviceControlTokenV2,
     #[cfg_attr(not(windows), allow(dead_code))]
     guest_endpoints: std::collections::BTreeMap<String, DeviceSerialEndpointV2>,
-    simulator: Mutex<DeviceSimulatorV2>,
+    simulator: Arc<Mutex<DeviceSimulatorV2>>,
+    sensor_overrides: SensorOverrideRuntimeV2,
+    location_updates: watch::Sender<hd_core::LocationV2>,
+    location_delivery_count: AtomicU64,
+    location_delivery_evidence: PathBuf,
+}
+
+impl FormalContext {
+    fn record_location_delivery(&self) -> Result<()> {
+        let delivered_sequence = self.location_delivery_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let updated_at_unix_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let evidence = serde_json::json!({
+            "schema_version": 1,
+            "instance_id": self.launch.instance_id,
+            "run_id": self.launch.run_id,
+            "delivered_sequence": delivered_sequence,
+            "updated_at_unix_millis": updated_at_unix_millis,
+        });
+        hd_platform::write_owner_only(
+            &self.location_delivery_evidence,
+            &serde_json::to_vec_pretty(&evidence)?,
+        )?;
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -127,20 +158,46 @@ async fn serve_formal(launch_path: &Path) -> Result<()> {
         ),
         _ => bail!("hd-device-sim requires a device_adapter configuration"),
     };
+    let simulator = Arc::new(Mutex::new(DeviceSimulatorV2::default()));
+    let (location_updates, _) = watch::channel(simulator.lock().await.state().location.clone());
+    let sensor_overrides = SensorOverrideRuntimeV2::new(Arc::clone(&simulator));
+    let location_delivery_evidence = launch
+        .component_ready_marker
+        .parent()
+        .context("formal component ready marker has no parent")?
+        .join("location-delivery-v1.json");
     let context = Arc::new(FormalContext {
         launch,
         control_endpoint,
         control_token,
         guest_endpoints,
-        simulator: Mutex::new(DeviceSimulatorV2::default()),
+        simulator,
+        sensor_overrides,
+        location_updates,
+        location_delivery_count: AtomicU64::new(0),
+        location_delivery_evidence,
     });
-    #[cfg(unix)]
+    let sensor_overrides = context.sensor_overrides.clone();
+    tokio::spawn(sensor_overrides.run());
+    #[cfg(any(unix, windows))]
     if context.guest_endpoints.contains_key("sensors") {
         let bridge_context = Arc::clone(&context);
         tokio::spawn(async move {
             loop {
                 if let Err(error) = sensor_bridge::run(Arc::clone(&bridge_context)).await {
                     tracing::warn!(%error, "sensor Guest bridge disconnected");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        });
+    }
+    #[cfg(unix)]
+    if context.guest_endpoints.contains_key("location") {
+        let bridge_context = Arc::clone(&context);
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = location_bridge::run(Arc::clone(&bridge_context)).await {
+                    tracing::warn!(%error, "fixed location Guest bridge disconnected");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -304,7 +361,15 @@ async fn handle_control(
 async fn apply_action(context: &FormalContext, action: InstanceActionV2) -> Result<()> {
     match action {
         InstanceActionV2::SetLocation { location } => {
-            apply_simulation(context, DeviceCommandV2::SetLocation { location }).await
+            apply_simulation(
+                context,
+                DeviceCommandV2::SetLocation {
+                    location: location.clone(),
+                },
+            )
+            .await?;
+            context.location_updates.send_replace(location);
+            Ok(())
         }
         InstanceActionV2::SetBattery { battery } => {
             apply_simulation(context, DeviceCommandV2::SetBattery { battery }).await
@@ -312,9 +377,17 @@ async fn apply_action(context: &FormalContext, action: InstanceActionV2) -> Resu
         InstanceActionV2::SetNetworkCondition { condition } => {
             apply_simulation(context, DeviceCommandV2::SetNetworkCondition { condition }).await
         }
-        InstanceActionV2::InjectSensor { injection } => {
-            apply_simulation(context, DeviceCommandV2::InjectSensor { injection }).await
-        }
+        InstanceActionV2::InjectSensor { injection } => context
+            .sensor_overrides
+            .apply(injection)
+            .await
+            .map_err(anyhow::Error::from),
+        InstanceActionV2::SetSensorPose { pose } => context
+            .sensor_overrides
+            .apply_pose(pose)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from),
         _ => bail!("action is not implemented by hd-device-sim"),
     }
 }
@@ -370,26 +443,51 @@ async fn run_fixed_location_bridge(context: Arc<FormalContext>) -> Result<()> {
     .await?;
     let mut pending = Vec::new();
     let mut chunk = [0_u8; 64];
+    let mut location_updates = context.location_updates.subscribe();
+    let mut guest_subscribed = false;
     loop {
-        let read = guest_output.read(&mut chunk).await?;
-        ensure!(read > 0, "fixed location Guest output closed");
-        pending.extend_from_slice(&chunk[..read]);
-        while let Some(offset) = pending
-            .windows(FIXED_LOCATION_COMMAND.len())
-            .position(|window| window == FIXED_LOCATION_COMMAND)
-        {
-            pending.drain(..offset + FIXED_LOCATION_COMMAND.len());
-            let location = context.simulator.lock().await.state().location.clone();
-            guest_input
-                .write_all(format_fixed_location(&location).as_bytes())
-                .await?;
-            guest_input.flush().await?;
-        }
-        if pending.len() > FIXED_LOCATION_COMMAND.len() * 4 {
-            let keep = FIXED_LOCATION_COMMAND.len().saturating_sub(1);
-            pending.drain(..pending.len().saturating_sub(keep));
+        tokio::select! {
+            changed = location_updates.changed(), if guest_subscribed => {
+                changed.context("fixed location update channel closed")?;
+                let location = location_updates.borrow().clone();
+                write_location(&context, &mut guest_input, &location).await?;
+            }
+            read_result = guest_output.read(&mut chunk) => {
+                let read = read_result?;
+                ensure!(read > 0, "fixed location Guest output closed");
+                pending.extend_from_slice(&chunk[..read]);
+                while let Some(offset) = pending
+                    .windows(FIXED_LOCATION_COMMAND.len())
+                    .position(|window| window == FIXED_LOCATION_COMMAND)
+                {
+                    pending.drain(..offset + FIXED_LOCATION_COMMAND.len());
+                    guest_subscribed = true;
+                    let location = context.simulator.lock().await.state().location.clone();
+                    write_location(&context, &mut guest_input, &location).await?;
+                }
+                if pending.len() > FIXED_LOCATION_COMMAND.len() * 4 {
+                    let keep = FIXED_LOCATION_COMMAND.len().saturating_sub(1);
+                    pending.drain(..pending.len().saturating_sub(keep));
+                }
+            }
         }
     }
+}
+
+async fn write_location<W>(
+    context: &FormalContext,
+    guest_input: &mut W,
+    location: &hd_core::LocationV2,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    guest_input
+        .write_all(format_fixed_location(location).as_bytes())
+        .await?;
+    guest_input.flush().await?;
+    context.record_location_delivery()?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -413,7 +511,6 @@ where
     }
 }
 
-#[cfg(windows)]
 fn format_fixed_location(location: &hd_core::LocationV2) -> String {
     let timestamp_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

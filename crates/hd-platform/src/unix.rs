@@ -573,12 +573,13 @@ impl Drop for UnixContainment {
         let Ok(process_group) = i32::try_from(self.process_id) else {
             return;
         };
-        // SAFETY: managed children are created as process-group leaders. Verify that the PID
-        // still names that group before sending SIGKILL, and ignore an already-exited group.
+        // SAFETY: managed children are created as process-group leaders. The leader can exit
+        // before one of its descendants (for example, a launcher whose runtime child is still
+        // alive), and getpgid(leader_pid) then fails even though the original process group still
+        // exists. killpg targets that containment group directly and harmlessly returns ESRCH
+        // after the full tree has already exited.
         unsafe {
-            if libc::getpgid(process_group) == process_group {
-                let _ = libc::killpg(process_group, libc::SIGKILL);
-            }
+            let _ = libc::killpg(process_group, libc::SIGKILL);
         }
     }
 }
@@ -589,10 +590,17 @@ pub(crate) const fn contain_process(pid: u32) -> UnixContainment {
 
 pub(crate) fn configure_managed(command: &mut Command) {
     command.process_group(0);
+    #[cfg(target_os = "macos")]
+    let open_max = {
+        // Query this before fork. The pre-exec watchdog path must use only async-signal-safe
+        // syscalls and must close every inherited descriptor except its private kqueue.
+        let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        if limit > 0 { limit } else { 1024 }
+    };
     // SAFETY: the closure only invokes process-control syscalls before exec and captures no
     // allocation-backed state.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             #[cfg(target_os = "linux")]
             {
                 let parent = libc::getppid();
@@ -605,17 +613,156 @@ pub(crate) fn configure_managed(command: &mut Command) {
             }
             #[cfg(target_os = "macos")]
             {
-                const PROC_SETPC_TERMINATE: i32 = 2;
-                unsafe extern "C" {
-                    fn proc_setpcontrol(control: i32) -> i32;
-                }
-                if proc_setpcontrol(PROC_SETPC_TERMINATE) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                configure_macos_managed_watchdog(open_max)?;
             }
             Ok(())
         });
     }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_managed_watchdog(open_max: i64) -> std::io::Result<()> {
+    // SAFETY: this runs after fork and before exec, using only async-signal-safe process and fd
+    // syscalls. The watchdog child never returns into Rust runtime code.
+    unsafe {
+        // std applies Command::process_group after user pre_exec callbacks on Darwin. Establish
+        // the group before forking so the runtime and watchdog inherit the same containment.
+        if libc::setpgid(0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let worker_pid = libc::getppid();
+        let worker_ident = libc::uintptr_t::try_from(worker_pid)
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::ESRCH))?;
+        let mut handshake_pipe = [-1_i32; 2];
+        if libc::pipe(handshake_pipe.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let monitor_pid = libc::fork();
+        if monitor_pid < 0 {
+            let error = std::io::Error::last_os_error();
+            libc::close(handshake_pipe[0]);
+            libc::close(handshake_pipe[1]);
+            return Err(error);
+        }
+        if monitor_pid == 0 {
+            macos_parent_watchdog_main(worker_pid, worker_ident, handshake_pipe, open_max);
+        }
+        libc::close(handshake_pipe[1]);
+        let mut handshake = [0_u8];
+        let mut read_result = libc::read(
+            handshake_pipe[0],
+            handshake.as_mut_ptr().cast(),
+            handshake.len(),
+        );
+        while read_result < 0 && *libc::__error() == libc::EINTR {
+            read_result = libc::read(
+                handshake_pipe[0],
+                handshake.as_mut_ptr().cast(),
+                handshake.len(),
+            );
+        }
+        libc::close(handshake_pipe[0]);
+        if read_result != 1 || handshake[0] != 1 {
+            libc::kill(monitor_pid, libc::SIGKILL);
+            return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+        }
+        if libc::getppid() != worker_pid {
+            libc::kill(monitor_pid, libc::SIGKILL);
+            libc::raise(libc::SIGKILL);
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_parent_watchdog_main(
+    worker_pid: libc::pid_t,
+    worker_ident: libc::uintptr_t,
+    handshake_pipe: [i32; 2],
+    open_max: i64,
+) -> ! {
+    // SAFETY: this is the single-threaded post-fork watchdog path. It uses only scalar syscalls,
+    // stack values and _exit, and never returns to allocation-backed runtime state.
+    unsafe {
+        libc::close(handshake_pipe[0]);
+        // Darwin kqueues do not survive fork, so the watchdog creates and registers its own.
+        let queue = libc::kqueue();
+        if queue < 0 {
+            watchdog_handshake_exit(handshake_pipe[1]);
+        }
+        let change = libc::kevent {
+            ident: worker_ident,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        if libc::kevent(
+            queue,
+            &raw const change,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        ) < 0
+        {
+            watchdog_handshake_exit(handshake_pipe[1]);
+        }
+        let ready = [1_u8];
+        if libc::write(handshake_pipe[1], ready.as_ptr().cast(), 1) != 1 {
+            libc::_exit(127);
+        }
+        libc::close(handshake_pipe[1]);
+        if libc::kill(worker_pid, 0) != 0 && *libc::__error() == libc::ESRCH {
+            libc::killpg(libc::getpgrp(), libc::SIGKILL);
+            libc::_exit(0);
+        }
+        // Close standard streams too: a managed capability probe commonly pipes stdout/stderr,
+        // and retaining either writer would prevent its reader from ever observing EOF.
+        let mut fd = 0;
+        while i64::from(fd) < open_max {
+            if fd != queue {
+                libc::close(fd);
+            }
+            fd += 1;
+        }
+        let mut event: libc::kevent = std::mem::zeroed();
+        loop {
+            let result = libc::kevent(
+                queue,
+                std::ptr::null(),
+                0,
+                &raw mut event,
+                1,
+                std::ptr::null(),
+            );
+            if result > 0 {
+                libc::killpg(libc::getpgrp(), libc::SIGKILL);
+                libc::_exit(0);
+            }
+            if result < 0 && *libc::__error() == libc::EINTR {
+                continue;
+            }
+            libc::_exit(127);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn watchdog_handshake_exit(handshake_fd: i32) -> ! {
+    // SAFETY: the descriptor belongs to the watchdog, the byte is stack-backed for the write,
+    // and _exit prevents returning into post-fork runtime state.
+    unsafe {
+        let failed = [0_u8];
+        libc::write(handshake_fd, failed.as_ptr().cast(), 1);
+        libc::_exit(127);
+    }
+}
+
+pub(crate) fn configure_transient(command: &mut Command) {
+    command.process_group(0);
 }
 
 #[cfg(target_os = "macos")]

@@ -109,7 +109,6 @@ pub(crate) async fn serve(
         "frame ready marker is outside the run directory"
     );
     let (signed_width, signed_height) = display.oriented_size();
-    let max_signed_extent = signed_width.max(signed_height);
 
     let mut options = ServerOptions::new();
     options
@@ -149,12 +148,10 @@ pub(crate) async fn serve(
                     "frame registration buffer id is out of range"
                 );
                 ensure!(
-                    registration.width >= 320
-                        && registration.height >= 320
-                        && registration.width <= max_signed_extent
-                        && registration.height <= max_signed_extent
+                    registration.width == signed_width
+                        && registration.height == signed_height
                         && registration.stride_bytes >= registration.width.saturating_mul(4),
-                    "gfxstream frame dimensions are outside the signed launch bounds"
+                    "gfxstream frame dimensions do not match the signed launch display"
                 );
                 if !is_supported_frame_format(&registration) {
                     eprintln!(

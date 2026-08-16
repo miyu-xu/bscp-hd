@@ -2,6 +2,7 @@
 set -eu
 
 LABEL="com.bscp.hd-network"
+CONTRACT_VERSION="2"
 HELPER="/Library/PrivilegedHelperTools/${LABEL}"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 PF_CONF="/etc/pf.conf"
@@ -20,6 +21,27 @@ require_root() {
         echo "macOS network setup requires root" >&2
         exit 77
     fi
+}
+
+is_regular_nosymlink() {
+    [ -f "$1" ] && [ ! -L "$1" ]
+}
+
+sha256_file() {
+    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+validate_system_paths() {
+    if ! is_regular_nosymlink "${PF_CONF}"; then
+        echo "unsafe or missing PF configuration: ${PF_CONF}" >&2
+        exit 66
+    fi
+    for path in "${HELPER}" "${PLIST}" "${PF_BACKUP}" "${STATE_FILE}" "${PF_TOKEN_FILE}"; do
+        if [ -e "${path}" ] && ! is_regular_nosymlink "${path}"; then
+            echo "refusing unsafe network service path: ${path}" >&2
+            exit 66
+        fi
+    done
 }
 
 default_interface() {
@@ -58,6 +80,7 @@ release_pf_token() {
 
 reconcile() {
     require_root
+    validate_system_paths
     if [ ! -S "${SOCKET_VMNET}" ]; then
         clear_anchor
         /bin/rm -f "${STATE_FILE}"
@@ -102,8 +125,7 @@ daemon() {
 
 write_pf_config() {
     temporary="$(/usr/bin/mktemp /tmp/hd-pf.XXXXXX)"
-    trap '/bin/rm -f "${temporary}"' EXIT
-    /usr/bin/awk -v nat_line="${PF_NAT_LINE}" -v filter_line="${PF_FILTER_LINE}" '
+    if ! /usr/bin/awk -v nat_line="${PF_NAT_LINE}" -v filter_line="${PF_FILTER_LINE}" '
         $0 == nat_line || $0 == filter_line { next }
         {
             print
@@ -121,18 +143,22 @@ write_pf_config() {
                 exit 65
             }
         }
-    ' "${PF_CONF}" >"${temporary}"
-    /sbin/pfctl -nf "${temporary}" >/dev/null
-    /usr/sbin/chown root:wheel "${temporary}"
-    /bin/chmod 0644 "${temporary}"
-    /bin/mv "${temporary}" "${PF_CONF}"
-    trap - EXIT
+    ' "${PF_CONF}" >"${temporary}"; then
+        /bin/rm -f "${temporary}"
+        return 65
+    fi
+    if ! /sbin/pfctl -nf "${temporary}" >/dev/null ||
+        ! /usr/sbin/chown root:wheel "${temporary}" ||
+        ! /bin/chmod 0644 "${temporary}" ||
+        ! /bin/mv "${temporary}" "${PF_CONF}"; then
+        /bin/rm -f "${temporary}"
+        return 70
+    fi
 }
 
 write_launch_daemon() {
     temporary="$(/usr/bin/mktemp /tmp/hd-network-plist.XXXXXX)"
-    trap '/bin/rm -f "${temporary}"' EXIT
-    /bin/cat >"${temporary}" <<EOF
+    if ! /bin/cat >"${temporary}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -148,16 +174,75 @@ write_launch_daemon() {
 </dict>
 </plist>
 EOF
-    /usr/bin/plutil -lint "${temporary}" >/dev/null
-    /usr/sbin/chown root:wheel "${temporary}"
-    /bin/chmod 0644 "${temporary}"
-    /bin/mv "${temporary}" "${PLIST}"
-    trap - EXIT
+    then
+        /bin/rm -f "${temporary}"
+        return 70
+    fi
+    if ! /usr/bin/plutil -lint "${temporary}" >/dev/null ||
+        ! /usr/sbin/chown root:wheel "${temporary}" ||
+        ! /bin/chmod 0644 "${temporary}" ||
+        ! /bin/mv "${temporary}" "${PLIST}"; then
+        /bin/rm -f "${temporary}"
+        return 70
+    fi
 }
 
 install_helper() {
     require_root
     source_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+    if ! is_regular_nosymlink "${source_path}"; then
+        echo "network setup source must be a regular non-symlink file" >&2
+        exit 66
+    fi
+    validate_system_paths
+    install_stage="$(/usr/bin/mktemp -d /tmp/hd-network-install.XXXXXX)"
+    /bin/chmod 0700 "${install_stage}"
+    /bin/cp -p "${PF_CONF}" "${install_stage}/pf.conf"
+    helper_existed=false
+    plist_existed=false
+    token_existed=false
+    if is_regular_nosymlink "${HELPER}"; then
+        /bin/cp -p "${HELPER}" "${install_stage}/helper"
+        helper_existed=true
+    fi
+    if is_regular_nosymlink "${PLIST}"; then
+        /bin/cp -p "${PLIST}" "${install_stage}/launchd.plist"
+        plist_existed=true
+    fi
+    if is_regular_nosymlink "${PF_TOKEN_FILE}"; then
+        token_existed=true
+    fi
+    rollback_pending=true
+    rollback_install() {
+        if [ "${rollback_pending}" = true ]; then
+            echo "network service installation failed; restoring previous state" >&2
+            /bin/launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
+            /usr/bin/install -o root -g wheel -m 0644 \
+                "${install_stage}/pf.conf" "${PF_CONF}" >/dev/null 2>&1 || true
+            if [ "${helper_existed}" = true ]; then
+                /usr/bin/install -o root -g wheel -m 0755 \
+                    "${install_stage}/helper" "${HELPER}" >/dev/null 2>&1 || true
+            else
+                /bin/rm -f "${HELPER}"
+            fi
+            if [ "${plist_existed}" = true ]; then
+                /usr/bin/install -o root -g wheel -m 0644 \
+                    "${install_stage}/launchd.plist" "${PLIST}" >/dev/null 2>&1 || true
+            else
+                /bin/rm -f "${PLIST}"
+            fi
+            /sbin/pfctl -f "${PF_CONF}" >/dev/null 2>&1 || true
+            if [ "${token_existed}" = false ]; then
+                release_pf_token
+            fi
+            if [ "${plist_existed}" = true ]; then
+                /bin/launchctl bootstrap system "${PLIST}" >/dev/null 2>&1 || true
+                /bin/launchctl kickstart -k "system/${LABEL}" >/dev/null 2>&1 || true
+            fi
+        fi
+        /bin/rm -rf -- "${install_stage}"
+    }
+    trap rollback_install EXIT HUP INT TERM
     if [ ! -f "${PF_BACKUP}" ]; then
         /bin/cp -p "${PF_CONF}" "${PF_BACKUP}"
         /usr/sbin/chown root:wheel "${PF_BACKUP}"
@@ -171,7 +256,10 @@ install_helper() {
     /bin/launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
     /bin/launchctl bootstrap system "${PLIST}"
     /bin/launchctl kickstart -k "system/${LABEL}"
-    echo "installed ${LABEL}"
+    rollback_pending=false
+    rollback_install
+    trap - EXIT HUP INT TERM
+    echo "installed ${LABEL} contract=${CONTRACT_VERSION}"
 }
 
 remove_pf_config() {
@@ -189,6 +277,7 @@ remove_pf_config() {
 
 uninstall_helper() {
     require_root
+    validate_system_paths
     /bin/launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
     clear_anchor
     remove_pf_config
@@ -199,19 +288,110 @@ uninstall_helper() {
 }
 
 status() {
-    require_root
+    source_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
     interface="$(default_interface || true)"
     loaded="false"
     if /bin/launchctl print "system/${LABEL}" >/dev/null 2>&1; then
         loaded="true"
     fi
-    anchor_rules="$(/sbin/pfctl -a "${PF_ANCHOR}" -sn 2>/dev/null || true)"
-    /usr/bin/printf "label=%s\nloaded=%s\negress=%s\nsocket_vmnet=%s\n" \
-        "${LABEL}" "${loaded}" "${interface:-none}" "$([ -S "${SOCKET_VMNET}" ] && echo true || echo false)"
-    if [ -n "${anchor_rules}" ]; then
-        /usr/bin/printf "nat=active\n%s\n" "${anchor_rules}"
+    socket_vmnet=false
+    [ ! -S "${SOCKET_VMNET}" ] || socket_vmnet=true
+    installed=false
+    plist_installed=false
+    pf_configured=false
+    state_present=false
+    unsafe=false
+    source_sha256=unavailable
+    installed_sha256=unavailable
+    package_match=false
+    is_regular_nosymlink "${source_path}" || unsafe=true
+    if is_regular_nosymlink "${source_path}"; then
+        source_sha256="$(sha256_file "${source_path}")"
+    fi
+    if [ -e "${HELPER}" ] && ! is_regular_nosymlink "${HELPER}"; then
+        unsafe=true
+    elif is_regular_nosymlink "${HELPER}"; then
+        installed=true
+        installed_sha256="$(sha256_file "${HELPER}")"
+    fi
+    if [ -e "${PLIST}" ] && ! is_regular_nosymlink "${PLIST}"; then
+        unsafe=true
+    elif is_regular_nosymlink "${PLIST}"; then
+        plist_installed=true
+    fi
+    for runtime_path in "${PF_BACKUP}" "${STATE_FILE}" "${PF_TOKEN_FILE}"; do
+        if [ -e "${runtime_path}" ] && ! is_regular_nosymlink "${runtime_path}"; then
+            unsafe=true
+        fi
+    done
+    if is_regular_nosymlink "${PF_CONF}" &&
+        [ "$(/usr/bin/grep -Fxc "${PF_NAT_LINE}" "${PF_CONF}" || true)" = 1 ] &&
+        [ "$(/usr/bin/grep -Fxc "${PF_FILTER_LINE}" "${PF_CONF}" || true)" = 1 ]; then
+        pf_configured=true
+    elif [ -e "${PF_CONF}" ] && ! is_regular_nosymlink "${PF_CONF}"; then
+        unsafe=true
+    fi
+    if is_regular_nosymlink "${STATE_FILE}"; then
+        state_present=true
+    fi
+    if [ "${source_sha256}" != unavailable ] &&
+        [ "${source_sha256}" = "${installed_sha256}" ]; then
+        package_match=true
+    fi
+    vpn_nat_required=false
+    case "${interface}" in utun[0-9]*) vpn_nat_required=true ;; esac
+    service_action=none
+    if [ "${unsafe}" = true ]; then
+        service_action=manual_repair
+    elif [ "${installed}" = false ]; then
+        service_action=install
+    elif [ "${package_match}" = false ]; then
+        service_action=upgrade
+    elif [ "${plist_installed}" = false ] || [ "${pf_configured}" = false ] ||
+        [ "${loaded}" = false ]; then
+        service_action=repair
+    fi
+    network_usable="${socket_vmnet}"
+    nat=inactive
+    if [ "${vpn_nat_required}" = true ]; then
+        nat=inactive
+        if [ "${service_action}" = none ] && [ "${state_present}" = true ]; then
+            nat=active
+        else
+            network_usable=false
+        fi
+    fi
+    health=ready
+    if [ "${socket_vmnet}" = false ]; then
+        health=offline
+    elif [ "${network_usable}" = false ]; then
+        health=degraded
+    elif [ "${service_action}" != none ]; then
+        health=maintenance
+    fi
+    /usr/bin/printf \
+        "schema_version=%s\nlabel=%s\nhealth=%s\nservice_action=%s\nnetwork_usable=%s\ninstalled=%s\npackage_match=%s\nplist_installed=%s\nloaded=%s\npf_configured=%s\negress=%s\nvpn_nat_required=%s\nsocket_vmnet=%s\nnat=%s\nsource_sha256=%s\ninstalled_sha256=%s\nunsafe=%s\n" \
+        "${CONTRACT_VERSION}" "${LABEL}" "${health}" "${service_action}" \
+        "${network_usable}" "${installed}" "${package_match}" \
+        "${plist_installed}" "${loaded}" "${pf_configured}" \
+        "${interface:-none}" "${vpn_nat_required}" "${socket_vmnet}" \
+        "${nat}" "${source_sha256}" "${installed_sha256}" "${unsafe}"
+    if [ "${unsafe}" = true ]; then
+        /usr/bin/printf "detail=检测到不安全的系统路径，需要管理员手动修复\n"
+    elif [ "${network_usable}" = false ] && [ "${vpn_nat_required}" = true ]; then
+        /usr/bin/printf "detail=当前 VPN 出口需要安装或修复 HD 网络兼容服务\n"
+    elif [ "${socket_vmnet}" = false ]; then
+        /usr/bin/printf "detail=socket_vmnet 未运行，Android 将使用离线网络配置\n"
+    elif [ "${service_action}" = none ]; then
+        /usr/bin/printf "detail=共享 NAT 上行链路与当前 HD 网络服务已就绪\n"
     else
-        /usr/bin/printf "nat=inactive\n"
+        case "${service_action}" in
+            install) action_label="安装" ;;
+            upgrade) action_label="升级" ;;
+            repair) action_label="修复" ;;
+            *) action_label="管理员处理" ;;
+        esac
+        /usr/bin/printf "detail=当前网络可用，但 HD 网络兼容服务需要%s\n" "${action_label}"
     fi
 }
 

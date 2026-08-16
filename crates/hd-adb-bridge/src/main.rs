@@ -234,7 +234,7 @@ async fn bridge_connection(mut tcp: TcpStream, context: &BridgeContext) -> Resul
     }
     #[cfg(target_os = "macos")]
     {
-        return bridge_macos_uds(&mut tcp, context, &initial[..initial_size]).await;
+        return bridge_macos_uds(tcp, context, &initial[..initial_size]).await;
     }
 
     #[cfg(windows)]
@@ -291,11 +291,7 @@ async fn bridge_connection(mut tcp: TcpStream, context: &BridgeContext) -> Resul
 }
 
 #[cfg(target_os = "macos")]
-async fn bridge_macos_uds(
-    tcp: &mut TcpStream,
-    context: &BridgeContext,
-    initial: &[u8],
-) -> Result<()> {
+async fn bridge_macos_uds(tcp: TcpStream, context: &BridgeContext, initial: &[u8]) -> Result<()> {
     use tokio::net::UnixStream;
 
     const HOST_CONNECT_MAGIC: &[u8; 4] = b"HDVS";
@@ -331,17 +327,31 @@ async fn bridge_macos_uds(
         guest_port = context.guest_port,
         "crosvm host-vsock connection requested"
     );
-    let (tcp_to_guest, guest_to_tcp) = tokio::io::copy_bidirectional(tcp, &mut vsock)
-        .await
-        .context("bridge ADB TCP and macOS guest-vsock")?;
+    let (closed_side, bytes) = {
+        let (mut tcp_reader, mut tcp_writer) = tcp.into_split();
+        let (mut vsock_reader, mut vsock_writer) = vsock.into_split();
+        let finished = tokio::select! {
+            result = tokio::io::copy(&mut tcp_reader, &mut vsock_writer) => {
+                ("tcp", result.context("copy ADB TCP to macOS guest-vsock")?)
+            }
+            result = tokio::io::copy(&mut vsock_reader, &mut tcp_writer) => {
+                ("guest_vsock", result.context("copy macOS guest-vsock to ADB TCP")?)
+            }
+        };
+        // crosvm permits one active connection per Guest vsock port. Closing every owned half as
+        // soon as either peer disconnects releases port 5555 for the ADB server's reconnect.
+        drop(tcp_reader);
+        drop(tcp_writer);
+        drop(vsock_reader);
+        drop(vsock_writer);
+        finished
+    };
     tracing::info!(
         event = "adb.bridge.copy.finished",
-        tcp_to_guest,
-        guest_to_tcp,
+        closed_side,
+        bytes,
         "ADB bridge byte copy finished"
     );
-    let _ = vsock.shutdown().await;
-    tcp.shutdown().await.context("shutdown ADB TCP stream")?;
     Ok(())
 }
 

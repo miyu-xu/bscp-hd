@@ -1,5 +1,6 @@
 use std::io::{Read as _, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use hd_core::{
     DIAGNOSTIC_MANIFEST_VERSION, DiagnosticBundleResponseV2, DiagnosticCheckV2, DiagnosticFileV2,
@@ -13,7 +14,10 @@ use uuid::Uuid;
 
 const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_BLUETOOTH_HCI_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+const MIN_BUNDLE_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
 const RETAIN_BUNDLES: usize = 10;
+const STALE_TEMPORARY_AGE: Duration = Duration::from_hours(1);
 
 #[derive(Debug)]
 pub struct DiagnosticInputsV2 {
@@ -53,6 +57,21 @@ impl DiagnosticCollector {
             path: self.paths.diagnostics.clone(),
             source,
         })?;
+        self.cleanup_stale_temporaries()?;
+        let available_bytes = fs2::available_space(&self.paths.diagnostics).map_err(|source| {
+            DiagnosticError::Io {
+                operation: "query diagnostic disk space",
+                path: self.paths.diagnostics.clone(),
+                source,
+            }
+        })?;
+        let required_bytes = MAX_BUNDLE_BYTES.saturating_add(MIN_BUNDLE_HEADROOM_BYTES);
+        if available_bytes < required_bytes {
+            return Err(DiagnosticError::InsufficientDisk {
+                available: available_bytes,
+                required: required_bytes,
+            });
+        }
         let bundle_id = Uuid::new_v4();
         let created_at = OffsetDateTime::now_utc();
         let instance_id = inputs.instance.as_ref().map(|record| record.spec.id);
@@ -150,7 +169,14 @@ impl DiagnosticCollector {
             .map_err(|error| DiagnosticError::Hash(error.to_string()))?;
         hd_platform::replace_file(&temporary, &output)?;
         temporary_guard.disarm();
-        self.enforce_retention(&output)?;
+        if let Err(error) = self.enforce_retention(&output) {
+            tracing::warn!(
+                event = "diagnostics.retention.failed",
+                path = %output.display(),
+                %error,
+                "diagnostic bundle was created but old-bundle retention failed"
+            );
+        }
         Ok(DiagnosticBundleResponseV2 {
             bundle_id,
             path: output,
@@ -186,6 +212,14 @@ impl DiagnosticCollector {
             "guest-logcat.txt",
             "frame-ready-v2.json",
             "frame-metrics-v2.json",
+            "microdroid.stdout.log",
+            "microdroid.stderr.log",
+            "microdroid-console.txt",
+            "microdroid-guest.log",
+            "microdroid-virtmgr-trace.log",
+            "microdroid-vmclient-trace.log",
+            "microdroid-idsig.stdout.log",
+            "microdroid-idsig.stderr.log",
         ] {
             let source = run_dir.join(name);
             if source.is_file() {
@@ -350,6 +384,50 @@ impl DiagnosticCollector {
         }
         Ok(())
     }
+
+    fn cleanup_stale_temporaries(&self) -> Result<(), DiagnosticError> {
+        let now = SystemTime::now();
+        for entry in
+            std::fs::read_dir(&self.paths.diagnostics).map_err(|source| DiagnosticError::Io {
+                operation: "scan diagnostic temporaries",
+                path: self.paths.diagnostics.clone(),
+                source,
+            })?
+        {
+            let entry = entry.map_err(|source| DiagnosticError::Io {
+                operation: "read diagnostic temporary entry",
+                path: self.paths.diagnostics.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|source| DiagnosticError::Io {
+                    operation: "inspect diagnostic temporary",
+                    path: path.clone(),
+                    source,
+                })?;
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || !name.starts_with("diag-")
+                || !name.contains(".tar.tmp-")
+                || now
+                    .duration_since(metadata.modified().unwrap_or(now))
+                    .unwrap_or_default()
+                    < STALE_TEMPORARY_AGE
+            {
+                continue;
+            }
+            std::fs::remove_file(&path).map_err(|source| DiagnosticError::Io {
+                operation: "remove stale diagnostic temporary",
+                path,
+                source,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 fn add_json<T: Serialize>(
@@ -376,6 +454,13 @@ fn redact(files: &mut [CollectedFile]) -> Result<(), DiagnosticError> {
     .filter(|value| !value.is_empty())
     .collect::<Vec<_>>();
     for file in files {
+        // A btsnoop capture is an explicitly requested binary diagnostic artifact. Treating it as
+        // lossy UTF-8 corrupts packet framing and can make Wireshark reject the result. Preserve
+        // only the tightly named, bounded, standard-header artifact produced by RootCanal; all
+        // other component files continue through the normal JSON/text redaction policy.
+        if is_bounded_bluetooth_hci_capture(file) {
+            continue;
+        }
         if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&file.bytes) {
             redact_json(&mut value, &private_roots);
             file.bytes = serde_json::to_vec_pretty(&value).map_err(DiagnosticError::Json)?;
@@ -384,6 +469,47 @@ fn redact(files: &mut [CollectedFile]) -> Result<(), DiagnosticError> {
         }
     }
     Ok(())
+}
+
+fn is_bounded_bluetooth_hci_capture(file: &CollectedFile) -> bool {
+    if file.truncated
+        || !(16..=MAX_BLUETOOTH_HCI_CAPTURE_BYTES).contains(&file.bytes.len())
+        || file.bytes.get(..16) != Some(b"btsnoop\0\0\0\0\x01\0\0\x03\xea")
+    {
+        return false;
+    }
+    let mut path_components = file.relative_path.components();
+    let (
+        Some(Component::Normal(run)),
+        Some(Component::Normal(run_id)),
+        Some(Component::Normal(components_dir)),
+        Some(Component::Normal(name)),
+    ) = (
+        path_components.next(),
+        path_components.next(),
+        path_components.next(),
+        path_components.next(),
+    )
+    else {
+        return false;
+    };
+    if path_components.next().is_some()
+        || run != "run"
+        || components_dir != "components"
+        || run_id
+            .to_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .is_none()
+    {
+        return false;
+    }
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.strip_prefix("rootcanal-hci-")
+        .and_then(|value| value.strip_suffix(".btsnoop"))
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .is_some()
 }
 
 fn redact_json(value: &mut serde_json::Value, private_roots: &[String]) {
@@ -645,6 +771,10 @@ pub enum DiagnosticError {
     UnsafePath(PathBuf),
     #[error("diagnostic bundle exceeded {MAX_BUNDLE_BYTES} bytes: {0}")]
     BundleTooLarge(u64),
+    #[error(
+        "insufficient disk space for diagnostic bundle: {available} bytes available, {required} required"
+    )]
+    InsufficientDisk { available: u64, required: u64 },
     #[error("diagnostic JSON failed: {0}")]
     Json(serde_json::Error),
     #[error("diagnostic archive failed: {0}")]
@@ -670,7 +800,9 @@ mod tests {
 
     #[test]
     fn bearer_and_profile_are_redacted() {
-        let profile = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:/Users/test".to_owned());
+        let profile = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| "C:/Users/test".to_owned());
         let differently_cased_profile = profile.to_ascii_uppercase();
         let text = format!(
             "Authorization: bearer abc123 password=hunter2 client_secret=client-value \

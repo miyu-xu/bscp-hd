@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,16 @@ const CHUNK_TYPE_RAW: u16 = 0xcac1;
 const CHUNK_TYPE_FILL: u16 = 0xcac2;
 const CHUNK_TYPE_DONT_CARE: u16 = 0xcac3;
 const CHUNK_TYPE_CRC32: u16 = 0xcac4;
+const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
+const GPT_HEADER_LBA: u64 = 1;
+const GPT_PARTITION_ENTRY_MIN_SIZE: usize = 128;
+const LP_METADATA_GEOMETRY_MAGIC: u32 = 0x616c_4467;
+const LP_METADATA_GEOMETRY_OFFSETS: [u64; 2] = [4096, 8192];
+// Direct Cuttlefish aggregates use a compact EROFS logical-partition super image and a small,
+// formattable userdata seed.  These are structural truncation floors, not desktop storage quotas:
+// the AOSP Android 15 all-target product is 1704 MiB / 3 MiB respectively.
+const MIN_ANDROID_SUPER_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_ANDROID_USERDATA_BYTES: u64 = 3 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct AndroidSparseInfo {
@@ -55,6 +66,7 @@ fn provision(source: &Path, destination: &Path) -> Result<DiskProvisionResultV2,
                 expected_size
             )));
         }
+        validate_android_aggregate(destination)?;
         return Ok(DiskProvisionResultV2 {
             path: destination.to_owned(),
             method: DiskProvisionMethodV2::ExistingVerified,
@@ -129,6 +141,7 @@ fn provision(source: &Path, destination: &Path) -> Result<DiskProvisionResultV2,
             copied_metadata.len()
         )));
     }
+    validate_android_aggregate(&temporary)?;
     hd_platform::replace_file(&temporary, destination)?;
     temporary_guard.disarm();
     Ok(DiskProvisionResultV2 {
@@ -136,6 +149,383 @@ fn provision(source: &Path, destination: &Path) -> Result<DiskProvisionResultV2,
         method,
         bytes: copied_metadata.len(),
     })
+}
+
+pub fn validate_android_fstab(path: &Path) -> Result<(), PlatformError> {
+    let text = std::fs::read_to_string(path).map_err(|source| PlatformError::Io {
+        operation: "read Android fstab",
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut mount_filesystems = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut data_profiles = Vec::<(BTreeSet<String>, BTreeSet<String>)>::new();
+    for (index, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        if columns.len() != 5 {
+            return Err(PlatformError::Process(format!(
+                "Android fstab {} line {} has {} columns; expected 5",
+                path.display(),
+                index + 1,
+                columns.len()
+            )));
+        }
+        if !columns[1].starts_with('/') {
+            continue;
+        }
+        mount_filesystems
+            .entry(columns[1].to_owned())
+            .or_default()
+            .insert(columns[2].to_owned());
+        if columns[1] == "/data" {
+            data_profiles.push((
+                columns[3].split(',').map(str::to_owned).collect(),
+                columns[4].split(',').map(str::to_owned).collect(),
+            ));
+        }
+    }
+    let unsupported_alternatives = mount_filesystems
+        .iter()
+        .filter(|(_, filesystems)| filesystems.len() > 1)
+        .filter(|(mount_point, filesystems)| {
+            !is_supported_aosp_filesystem_alternative(mount_point, filesystems)
+        })
+        .map(|(mount_point, filesystems)| {
+            format!(
+                "{mount_point}={}",
+                filesystems.iter().cloned().collect::<Vec<_>>().join("|")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !unsupported_alternatives.is_empty() {
+        return Err(PlatformError::Process(format!(
+            "Android fstab {} has unsupported filesystem alternatives ({}); only AOSP ext4|erofs logical-partition and ext4|f2fs userdata alternatives are accepted",
+            path.display(),
+            unsupported_alternatives.join(", ")
+        )));
+    }
+    let missing = ["/system", "/data", "/metadata"]
+        .into_iter()
+        .filter(|mount_point| !mount_filesystems.contains_key(*mount_point))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(PlatformError::Process(format!(
+            "Android fstab {} is missing required mounts {}; regenerate the Guest artifact",
+            path.display(),
+            missing.join(", ")
+        )));
+    }
+    if data_profiles.is_empty() || data_profiles.len() > 2 {
+        return Err(PlatformError::Process(format!(
+            "Android fstab {} has {} /data entries; expected one profile or the AOSP ext4|f2fs alternative pair",
+            path.display(),
+            data_profiles.len()
+        )));
+    }
+    let data_encryption = data_profiles
+        .iter()
+        .map(|(mount_flags, fs_mgr_flags)| {
+            mount_flags.contains("inlinecrypt")
+                || fs_mgr_flags.iter().any(|flag| {
+                    flag.starts_with("keydirectory=") || flag.starts_with("fileencryption=")
+                })
+        })
+        .collect::<BTreeSet<_>>();
+    if data_encryption.len() != 1 {
+        return Err(PlatformError::Process(format!(
+            "Android fstab {} mixes encrypted and unencrypted /data alternatives",
+            path.display()
+        )));
+    }
+    let data_encrypted = data_encryption.contains(&true);
+    if !data_encrypted
+        && data_profiles.iter().any(|(_, fs_mgr_flags)| {
+            !fs_mgr_flags.contains("first_stage_mount") || fs_mgr_flags.contains("latemount")
+        })
+    {
+        return Err(PlatformError::Process(format!(
+            "Android fstab {} has an unencrypted /data profile that is not first-stage-only; HD passes this fstab through crosvm's Android DT, so a late /data entry would be mounted twice. Regenerate with --data-encryption none --fstab-suffix hd.direct",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn is_supported_aosp_filesystem_alternative(
+    mount_point: &str,
+    filesystems: &BTreeSet<String>,
+) -> bool {
+    let expected = match mount_point {
+        "/data" => ["ext4", "f2fs"],
+        "/odm" | "/odm_dlkm" | "/product" | "/system" | "/system_dlkm" | "/system_ext"
+        | "/vendor" | "/vendor_dlkm" => ["erofs", "ext4"],
+        _ => return false,
+    };
+    filesystems.len() == expected.len()
+        && expected
+            .into_iter()
+            .all(|filesystem| filesystems.contains(filesystem))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GptEntryTable {
+    offset: u64,
+    count: u32,
+    entry_size: usize,
+}
+
+fn android_gpt_entry_table(
+    file: &mut File,
+    path: &Path,
+    file_len: u64,
+) -> Result<Option<GptEntryTable>, PlatformError> {
+    let header_offset = GPT_HEADER_LBA * 512;
+    if file_len < header_offset + 92 {
+        return Ok(None);
+    }
+    let mut header = [0_u8; 92];
+    file.seek(SeekFrom::Start(header_offset))
+        .and_then(|_| file.read_exact(&mut header))
+        .map_err(|source| PlatformError::Io {
+            operation: "read Android aggregate GPT header",
+            path: path.to_owned(),
+            source,
+        })?;
+    if &header[..GPT_SIGNATURE.len()] != GPT_SIGNATURE {
+        // The provisioner is also exercised by format-specific fixtures. Actual HD Android
+        // artifacts use GPT and are validated below.
+        return Ok(None);
+    }
+    let entries_lba = u64::from_le_bytes(
+        header[72..80]
+            .try_into()
+            .expect("GPT entry LBA is eight bytes"),
+    );
+    let count = u32::from_le_bytes(
+        header[80..84]
+            .try_into()
+            .expect("GPT entry count is four bytes"),
+    );
+    let entry_size_raw = u32::from_le_bytes(
+        header[84..88]
+            .try_into()
+            .expect("GPT entry size is four bytes"),
+    );
+    let entry_size = usize::try_from(entry_size_raw).map_err(|_| {
+        PlatformError::Process(format!(
+            "Android aggregate {} has an unsupported GPT entry size",
+            path.display()
+        ))
+    })?;
+    if count == 0 || count > 4096 || !(GPT_PARTITION_ENTRY_MIN_SIZE..=4096).contains(&entry_size) {
+        return Err(PlatformError::Process(format!(
+            "Android aggregate {} has invalid GPT entry geometry",
+            path.display()
+        )));
+    }
+    let offset = entries_lba.checked_mul(512).ok_or_else(|| {
+        PlatformError::Process(format!(
+            "Android aggregate {} GPT entry offset overflows",
+            path.display()
+        ))
+    })?;
+    let table_bytes = u64::from(count)
+        .checked_mul(u64::from(entry_size_raw))
+        .ok_or_else(|| {
+            PlatformError::Process(format!(
+                "Android aggregate {} GPT entry table size overflows",
+                path.display()
+            ))
+        })?;
+    if offset
+        .checked_add(table_bytes)
+        .is_none_or(|end| end > file_len)
+    {
+        return Err(PlatformError::Process(format!(
+            "Android aggregate {} has a truncated GPT entry table",
+            path.display()
+        )));
+    }
+    Ok(Some(GptEntryTable {
+        offset,
+        count,
+        entry_size,
+    }))
+}
+
+fn parse_android_gpt_partition(
+    entry: &[u8],
+    path: &Path,
+    file_len: u64,
+) -> Result<Option<(String, u64, u64)>, PlatformError> {
+    if entry[..16].iter().all(|byte| *byte == 0) {
+        return Ok(None);
+    }
+    let first_lba = u64::from_le_bytes(entry[32..40].try_into().expect("first LBA is eight bytes"));
+    let last_lba = u64::from_le_bytes(entry[40..48].try_into().expect("last LBA is eight bytes"));
+    if last_lba < first_lba {
+        return Err(PlatformError::Process(format!(
+            "Android aggregate {} has an invalid GPT partition extent",
+            path.display()
+        )));
+    }
+    let name_units = entry[56..128]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    let name = String::from_utf16(&name_units).map_err(|_| {
+        PlatformError::Process(format!(
+            "Android aggregate {} has an invalid GPT partition name",
+            path.display()
+        ))
+    })?;
+    let sectors = last_lba
+        .checked_sub(first_lba)
+        .and_then(|sectors| sectors.checked_add(1))
+        .ok_or_else(|| {
+            PlatformError::Process(format!(
+                "Android aggregate {} partition size overflows",
+                path.display()
+            ))
+        })?;
+    let size = sectors.checked_mul(512).ok_or_else(|| {
+        PlatformError::Process(format!(
+            "Android aggregate {} partition size overflows",
+            path.display()
+        ))
+    })?;
+    let end = last_lba
+        .checked_add(1)
+        .and_then(|sectors| sectors.checked_mul(512))
+        .ok_or_else(|| {
+            PlatformError::Process(format!(
+                "Android aggregate {} partition extent overflows",
+                path.display()
+            ))
+        })?;
+    if end > file_len {
+        return Err(PlatformError::Process(format!(
+            "Android aggregate {} partition {name} extends past the disk",
+            path.display()
+        )));
+    }
+    let offset = first_lba.checked_mul(512).ok_or_else(|| {
+        PlatformError::Process(format!(
+            "Android aggregate {} partition offset overflows",
+            path.display()
+        ))
+    })?;
+    Ok(Some((name, offset, size)))
+}
+
+fn android_gpt_partitions(
+    file: &mut File,
+    path: &Path,
+    file_len: u64,
+    table: GptEntryTable,
+) -> Result<BTreeMap<String, (u64, u64)>, PlatformError> {
+    file.seek(SeekFrom::Start(table.offset))
+        .map_err(|source| PlatformError::Io {
+            operation: "seek Android aggregate GPT entries",
+            path: path.to_owned(),
+            source,
+        })?;
+    let mut entry = vec![0_u8; table.entry_size];
+    let mut partitions = BTreeMap::new();
+    for _ in 0..table.count {
+        file.read_exact(&mut entry)
+            .map_err(|source| PlatformError::Io {
+                operation: "read Android aggregate GPT entry",
+                path: path.to_owned(),
+                source,
+            })?;
+        if let Some((name, offset, size)) = parse_android_gpt_partition(&entry, path, file_len)? {
+            partitions.insert(name, (offset, size));
+        }
+    }
+    Ok(partitions)
+}
+
+pub fn validate_android_aggregate(path: &Path) -> Result<(), PlatformError> {
+    let mut file = File::open(path).map_err(|source| PlatformError::Io {
+        operation: "open Android aggregate",
+        path: path.to_owned(),
+        source,
+    })?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| PlatformError::Io {
+            operation: "read Android aggregate metadata",
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    let Some(table) = android_gpt_entry_table(&mut file, path, file_len)? else {
+        return Ok(());
+    };
+    let partitions = android_gpt_partitions(&mut file, path, file_len, table)?;
+    for (name, minimum) in [
+        ("super", MIN_ANDROID_SUPER_BYTES),
+        ("userdata", MIN_ANDROID_USERDATA_BYTES),
+    ] {
+        let (_, size) = partitions.get(name).copied().ok_or_else(|| {
+            PlatformError::Process(format!(
+                "Android aggregate {} is missing the {name} partition",
+                path.display()
+            ))
+        })?;
+        if size < minimum {
+            return Err(PlatformError::Process(format!(
+                "Android aggregate {} has a {name} partition of {size} bytes; at least {minimum} bytes are required. Regenerate the Guest artifact from the Android sparse image's logical size",
+                path.display()
+            )));
+        }
+    }
+    let (super_offset, super_size) = partitions
+        .get("super")
+        .copied()
+        .expect("super presence was checked above");
+    let mut magic = [0_u8; 4];
+    file.seek(SeekFrom::Start(super_offset))
+        .and_then(|_| file.read_exact(&mut magic))
+        .map_err(|source| PlatformError::Io {
+            operation: "read Android aggregate super header",
+            path: path.to_owned(),
+            source,
+        })?;
+    if u32::from_le_bytes(magic) == ANDROID_SPARSE_MAGIC {
+        return Err(PlatformError::Process(format!(
+            "Android aggregate {} embeds an unexpanded Android sparse image inside its super partition; regenerate the aggregate while expanding super.img",
+            path.display()
+        )));
+    }
+    for geometry_offset in LP_METADATA_GEOMETRY_OFFSETS {
+        if geometry_offset + u64::try_from(magic.len()).expect("magic length fits u64") > super_size
+        {
+            return Err(PlatformError::Process(format!(
+                "Android aggregate {} has a truncated super metadata geometry region",
+                path.display()
+            )));
+        }
+        file.seek(SeekFrom::Start(super_offset + geometry_offset))
+            .and_then(|_| file.read_exact(&mut magic))
+            .map_err(|source| PlatformError::Io {
+                operation: "read Android aggregate super metadata geometry",
+                path: path.to_owned(),
+                source,
+            })?;
+        if u32::from_le_bytes(magic) != LP_METADATA_GEOMETRY_MAGIC {
+            return Err(PlatformError::Process(format!(
+                "Android aggregate {} has invalid logical-partition geometry at super offset {geometry_offset}; regenerate it from a valid expanded super.img",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn inspect_android_sparse(path: &Path) -> Result<Option<AndroidSparseInfo>, PlatformError> {

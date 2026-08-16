@@ -20,11 +20,14 @@
 
 enum {
     HD_CA_HELLO_MAGIC = 0x48444341,
+    HD_CA_HELLO_V2_MAGIC = 0x48444342,
+    HD_CA_SELECT_MAGIC = 0x4844534C,
     HD_INPUT_KEY = 1,
     HD_INPUT_TOUCH_DOWN = 2,
     HD_INPUT_TOUCH_MOVE = 3,
     HD_INPUT_TOUCH_UP = 4,
     HD_INPUT_VIEWPORT_RESIZE = 5,
+    HD_INPUT_SELECT_DISPLAY = 6,
 };
 
 typedef struct {
@@ -33,6 +36,26 @@ typedef struct {
     uint32_t guest_width;
     uint32_t guest_height;
 } HDCaHello;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t scanout_id;
+    uint32_t context_id;
+    uint32_t guest_width;
+    uint32_t guest_height;
+} HDCaHelloV2;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t scanout_id;
+    uint32_t guest_width;
+    uint32_t guest_height;
+} HDCaSelect;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t status;
+} HDCaSelectResponse;
 
 typedef struct {
     int32_t kind;
@@ -46,7 +69,14 @@ typedef struct {
 typedef void (*HDTitlebarCallback)(void* context, const char* message);
 static char HDTitlebarButtonMessageKey;
 static char HDTitlebarFpsLabelKey;
+static char HDTitlebarSidebarButtonKey;
+static char HDTitlebarActionButtonsKey;
+static char HDTitlebarSeparatorKey;
+static char HDTitlebarLeftStackKey;
+static char HDTitlebarRightStackKey;
+static char HDTitlebarTargetKey;
 static char HDTitlebarExpansionObserversKey;
+static char HDWorkspaceLifecycleObserversKey;
 
 extern void hd_macos_map_pointer_contract(double normalized_x,
                                            double normalized_y,
@@ -77,6 +107,8 @@ static const HDTitlebarControlContract HDTitlebarControlContracts[] = {
      "{\"command\":\"rotate\"}", "right"},
     {"camera", "▣", "截图",
      "{\"command\":\"screenshot\"}", "right"},
+    {"record.circle", "●", "开始录屏（最长 3 分钟）",
+     "{\"command\":\"start_screen_recording\"}", "right"},
     {"shippingbox.and.arrow.backward", "↓", "安装 APK",
      "{\"command\":\"choose_install_apk\"}", "right"},
     {"rectangle.stack", "▢", "最近任务",
@@ -86,6 +118,28 @@ static const HDTitlebarControlContract HDTitlebarControlContracts[] = {
     {"chevron.left", "‹", "返回",
      "{\"command\":\"key\",\"key\":\"back\"}", "right"},
 };
+
+bool hd_macos_configure_application_startup(void) {
+    if (![NSThread isMainThread]) {
+        return false;
+    }
+
+    // HD reconstructs its one native window from the current Host/instance state after winit
+    // enters Resumed. AppKit state restoration is therefore both redundant and unsafe: after an
+    // interrupted development or product run, NSPersistentUIRestorer may present a modal
+    // "discard restored windows" alert before winit installs its event handler. Put the standard
+    // launch override in the volatile argument domain so it takes precedence for this process
+    // without changing the user's persistent defaults.
+    NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
+    NSMutableDictionary* argumentDomain =
+        [[defaults volatileDomainForName:NSArgumentDomain] mutableCopy];
+    if (argumentDomain == nil) {
+        argumentDomain = [[NSMutableDictionary alloc] init];
+    }
+    argumentDomain[@"ApplePersistenceIgnoreState"] = @YES;
+    [defaults setVolatileDomain:argumentDomain forName:NSArgumentDomain];
+    return [defaults boolForKey:@"ApplePersistenceIgnoreState"];
+}
 
 size_t hd_macos_titlebar_control_count(void) {
     return sizeof(HDTitlebarControlContracts) / sizeof(HDTitlebarControlContracts[0]);
@@ -109,6 +163,72 @@ const char* hd_macos_titlebar_control_message(size_t index) {
 const char* hd_macos_titlebar_control_placement(size_t index) {
     return index < hd_macos_titlebar_control_count()
         ? HDTitlebarControlContracts[index].placement : NULL;
+}
+
+bool hd_macos_show_error_dialog(const char* title,
+                                const char* message,
+                                const char* reveal_path) {
+    if (title == NULL || message == NULL) {
+        return false;
+    }
+    NSString* alertTitle = [NSString stringWithUTF8String:title];
+    NSString* alertMessage = [NSString stringWithUTF8String:message];
+    NSString* revealPath =
+        reveal_path == NULL ? nil : [NSString stringWithUTF8String:reveal_path];
+    if (alertTitle == nil || alertMessage == nil ||
+        (reveal_path != NULL && revealPath == nil)) {
+        return false;
+    }
+
+    __block bool succeeded = false;
+    void (^present)(void) = ^{
+        @autoreleasepool {
+            NSApplication* application = [NSApplication sharedApplication];
+            [application setActivationPolicy:NSApplicationActivationPolicyRegular];
+            [application activateIgnoringOtherApps:YES];
+
+            NSAlert* alert = [[NSAlert alloc] init];
+            alert.alertStyle = NSAlertStyleCritical;
+            alert.messageText = alertTitle;
+            alert.informativeText = alertMessage;
+            [alert addButtonWithTitle:@"退出"];
+            if (revealPath.length != 0) {
+                [alert addButtonWithTitle:@"打开日志目录"];
+            }
+            NSModalResponse response = [alert runModal];
+            if (response == NSAlertSecondButtonReturn && revealPath.length != 0) {
+                NSURL* url = [NSURL fileURLWithPath:revealPath isDirectory:YES];
+                [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[url]];
+            }
+            succeeded = true;
+        }
+    };
+    if ([NSThread isMainThread]) {
+        present();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), present);
+    }
+    return succeeded;
+}
+
+int32_t hd_macos_activate_existing_application(void) {
+    if (![NSThread isMainThread]) {
+        return -1;
+    }
+    NSString* bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
+    if (bundleIdentifier.length == 0) {
+        return -1;
+    }
+    pid_t currentPID = getpid();
+    for (NSRunningApplication* application in
+         [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleIdentifier]) {
+        if (application.processIdentifier == currentPID || application.terminated) {
+            continue;
+        }
+        [application activateWithOptions:NSApplicationActivateAllWindows];
+        return 1;
+    }
+    return 0;
 }
 
 static bool hd_read_full(int fd, void* buffer, size_t length) {
@@ -314,8 +434,8 @@ static NSButton* hd_titlebar_button(NSString* symbol,
             button.image = image;
         }
     }
-    [button.widthAnchor constraintEqualToConstant:28.0].active = YES;
-    [button.heightAnchor constraintEqualToConstant:28.0].active = YES;
+    [button.widthAnchor constraintEqualToConstant:27.0].active = YES;
+    [button.heightAnchor constraintEqualToConstant:27.0].active = YES;
     return button;
 }
 
@@ -339,6 +459,19 @@ static NSView* hd_titlebar_separator(void) {
     return separator;
 }
 
+static void hd_fit_titlebar_stack(NSStackView* stack) {
+    if (stack == nil) {
+        return;
+    }
+    [stack invalidateIntrinsicContentSize];
+    [stack layoutSubtreeIfNeeded];
+    NSSize fitting = stack.fittingSize;
+    NSRect frame = stack.frame;
+    frame.size.width = ceil(MAX(fitting.width, 1.0));
+    frame.size.height = 32.0;
+    stack.frame = frame;
+}
+
 @interface HDMacNativeDisplayHost : NSObject
 @property(nonatomic, weak) NSView* parentView;
 @property(nonatomic, strong) HDNativeDisplayView* displayView;
@@ -348,7 +481,8 @@ static NSView* hd_titlebar_separator(void) {
 @property(nonatomic) BOOL ownsEndpoint;
 @property(atomic) int lockFD;
 @property(atomic) int listenFD;
-@property(atomic) int clientFD;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber*, id>* connections;
+@property(atomic) uint32_t selectedScanout;
 - (instancetype)initWithParent:(NSView*)parent endpoint:(NSString*)endpoint;
 - (BOOL)setX:(int32_t)x
            y:(int32_t)y
@@ -358,6 +492,16 @@ static NSView* hd_titlebar_separator(void) {
      visible:(BOOL)visible;
 - (void)layoutHostedLayer;
 - (void)shutdown;
+@end
+
+@interface HDCaConnection : NSObject
+@property(nonatomic) int fd;
+@property(nonatomic) uint32_t contextId;
+@property(nonatomic) uint32_t guestWidth;
+@property(nonatomic) uint32_t guestHeight;
+@end
+
+@implementation HDCaConnection
 @end
 
 @implementation HDMacNativeDisplayHost
@@ -372,7 +516,8 @@ static NSView* hd_titlebar_separator(void) {
     self.ownsEndpoint = NO;
     self.lockFD = -1;
     self.listenFD = -1;
-    self.clientFD = -1;
+    self.connections = [[NSMutableDictionary alloc] init];
+    self.selectedScanout = 0;
     parent.wantsLayer = YES;
     parent.layer.backgroundColor = NSColor.blackColor.CGColor;
 
@@ -439,7 +584,7 @@ static NSView* hd_titlebar_separator(void) {
     address.sun_family = AF_UNIX;
     strlcpy(address.sun_path, path, sizeof(address.sun_path));
     if (bind(fd, (const struct sockaddr*)&address, sizeof(address)) != 0 ||
-        chmod(path, S_IRUSR | S_IWUSR) != 0 || listen(fd, 1) != 0) {
+        chmod(path, S_IRUSR | S_IWUSR) != 0 || listen(fd, 8) != 0) {
         close(fd);
         (void)unlink(path);
         flock(lockFD, LOCK_UN);
@@ -467,27 +612,120 @@ static NSView* hd_titlebar_separator(void) {
             }
             int noSigPipe = 1;
             (void)setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe));
-            HDCaHello hello = {0};
-            if (!hd_read_full(client, &hello, sizeof(hello)) ||
-                hello.magic != HD_CA_HELLO_MAGIC || hello.context_id == 0) {
+            uint32_t magic = 0;
+            if (!hd_read_full(client, &magic, sizeof(magic))) {
                 close(client);
                 continue;
             }
-            int previousClient = strongSelf.clientFD;
-            strongSelf.clientFD = client;
-            if (previousClient >= 0 && previousClient != client) {
-                shutdown(previousClient, SHUT_RDWR);
-                close(previousClient);
+            if (magic == HD_CA_SELECT_MAGIC) {
+                HDCaSelect select = {.magic = magic, .scanout_id = 0,
+                                     .guest_width = 0, .guest_height = 0};
+                if (!hd_read_full(client, &select.scanout_id,
+                                  sizeof(select) - sizeof(select.magic))) {
+                    close(client);
+                    continue;
+                }
+                __block uint32_t status = 1;
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    HDMacNativeDisplayHost* mainSelf = weakSelf;
+                    if (mainSelf == nil) {
+                        return;
+                    }
+                    mainSelf.selectedScanout = select.scanout_id;
+                    mainSelf.displayView.guestWidth = MAX(select.guest_width, 1);
+                    mainSelf.displayView.guestHeight = MAX(select.guest_height, 1);
+                    // gfxstream keeps one CAMetalLayer/CAContext and composes the selected Guest
+                    // display into it. Forward the scanout selection to crosvm over the primary
+                    // zero-copy connection instead of creating another AppKit window.
+                    HDCaConnection* connection =
+                        (HDCaConnection*)mainSelf.connections[@0];
+                    if (connection == nil || connection.fd < 0) {
+                        return;
+                    }
+                    HDInputEvent event = {
+                        .kind = HD_INPUT_SELECT_DISPLAY,
+                        .code = (int32_t)select.scanout_id,
+                    };
+                    const uint8_t* cursor = (const uint8_t*)&event;
+                    size_t remaining = sizeof(event);
+                    while (remaining != 0) {
+                        ssize_t count = send(connection.fd, cursor, remaining, 0);
+                        if (count < 0 && errno == EINTR) {
+                            continue;
+                        }
+                        if (count <= 0) {
+                            return;
+                        }
+                        cursor += count;
+                        remaining -= (size_t)count;
+                    }
+                    mainSelf.displayView.clientFD = connection.fd;
+                    [mainSelf layoutHostedLayer];
+                    status = 0;
+                });
+                HDCaSelectResponse response = {.magic = HD_CA_SELECT_MAGIC, .status = status};
+                (void)send(client, &response, sizeof(response), 0);
+                close(client);
+                continue;
+            }
+            uint32_t scanoutId = 0;
+            uint32_t contextId = 0;
+            uint32_t guestWidth = 0;
+            uint32_t guestHeight = 0;
+            if (magic == HD_CA_HELLO_MAGIC) {
+                HDCaHello hello = {.magic = magic};
+                if (!hd_read_full(client, &hello.context_id,
+                                  sizeof(hello) - sizeof(hello.magic))) {
+                    close(client);
+                    continue;
+                }
+                contextId = hello.context_id;
+                guestWidth = hello.guest_width;
+                guestHeight = hello.guest_height;
+            } else if (magic == HD_CA_HELLO_V2_MAGIC) {
+                HDCaHelloV2 hello = {.magic = magic};
+                if (!hd_read_full(client, &hello.scanout_id,
+                                  sizeof(hello) - sizeof(hello.magic))) {
+                    close(client);
+                    continue;
+                }
+                scanoutId = hello.scanout_id;
+                contextId = hello.context_id;
+                guestWidth = hello.guest_width;
+                guestHeight = hello.guest_height;
+            } else {
+                close(client);
+                continue;
+            }
+            if (contextId == 0) {
+                close(client);
+                continue;
             }
             dispatch_async(dispatch_get_main_queue(), ^{
                 HDMacNativeDisplayHost* mainSelf = weakSelf;
-                if (mainSelf == nil || mainSelf.clientFD != client) {
+                if (mainSelf == nil) {
+                    close(client);
                     return;
                 }
-                mainSelf.layerHost.contextId = hello.context_id;
+                HDCaConnection* previous =
+                    (HDCaConnection*)mainSelf.connections[@(scanoutId)];
+                if (previous != nil && previous.fd >= 0 && previous.fd != client) {
+                    shutdown(previous.fd, SHUT_RDWR);
+                    close(previous.fd);
+                }
+                HDCaConnection* connection = [[HDCaConnection alloc] init];
+                connection.fd = client;
+                connection.contextId = contextId;
+                connection.guestWidth = MAX(guestWidth, 1);
+                connection.guestHeight = MAX(guestHeight, 1);
+                mainSelf.connections[@(scanoutId)] = connection;
+                if (mainSelf.selectedScanout != scanoutId) {
+                    return;
+                }
+                mainSelf.layerHost.contextId = contextId;
                 mainSelf.displayView.clientFD = client;
-                mainSelf.displayView.guestWidth = MAX(hello.guest_width, 1);
-                mainSelf.displayView.guestHeight = MAX(hello.guest_height, 1);
+                mainSelf.displayView.guestWidth = MAX(guestWidth, 1);
+                mainSelf.displayView.guestHeight = MAX(guestHeight, 1);
                 mainSelf.layerHost.contentsScale =
                     mainSelf.parentView.window.backingScaleFactor ?: 1.0;
                 [mainSelf layoutHostedLayer];
@@ -577,12 +815,14 @@ static NSView* hd_titlebar_separator(void) {
 
 - (void)shutdown {
     self.displayView.clientFD = -1;
-    int client = self.clientFD;
-    self.clientFD = -1;
-    if (client >= 0) {
-        shutdown(client, SHUT_RDWR);
-        close(client);
+    for (HDCaConnection* connection in self.connections.allValues) {
+        if (connection.fd >= 0) {
+            shutdown(connection.fd, SHUT_RDWR);
+            close(connection.fd);
+            connection.fd = -1;
+        }
     }
+    [self.connections removeAllObjects];
     int listener = self.listenFD;
     self.listenFD = -1;
     if (listener >= 0) {
@@ -685,6 +925,41 @@ int32_t hd_macos_choose_apk_file(char* output, size_t capacity) {
     return 1;
 }
 
+int32_t hd_macos_choose_location_route_file(char* output, size_t capacity) {
+    if (![NSThread isMainThread] || output == NULL || capacity == 0) {
+        return -1;
+    }
+    output[0] = '\0';
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.title = @"选择 GPX 或 KML 路线";
+    panel.prompt = @"导入";
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.resolvesAliases = YES;
+    NSMutableArray<UTType*>* types = [NSMutableArray array];
+    UTType* gpxType = [UTType typeWithFilenameExtension:@"gpx"];
+    UTType* kmlType = [UTType typeWithFilenameExtension:@"kml"];
+    if (gpxType != nil) {
+        [types addObject:gpxType];
+    }
+    if (kmlType != nil) {
+        [types addObject:kmlType];
+    }
+    if (types.count > 0) {
+        panel.allowedContentTypes = types;
+    }
+    if ([panel runModal] != NSModalResponseOK) {
+        return 0;
+    }
+    const char* path = panel.URL.fileSystemRepresentation;
+    if (path == NULL || strlen(path) >= capacity) {
+        return -1;
+    }
+    strlcpy(output, path, capacity);
+    return 1;
+}
+
 bool hd_macos_native_display_focus(void* raw_host) {
     if (raw_host == NULL || ![NSThread isMainThread]) {
         return false;
@@ -762,37 +1037,34 @@ bool hd_macos_install_titlebar_controls(void* parent_view,
         return false;
     }
 
+    // The Player restores instances and geometry from HD's versioned state, never from an AppKit
+    // window archive. Do not create a second, bundle-scoped restoration source on shutdown.
+    window.restorable = NO;
+
     HDTitlebarControls* target =
         [[HDTitlebarControls alloc] initWithContext:context callback:callback];
-    NSStackView* leftStack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 42, 32)];
+    NSStackView* leftStack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 68, 32)];
     leftStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     leftStack.alignment = NSLayoutAttributeCenterY;
-    leftStack.spacing = 5.0;
+    leftStack.spacing = 2.0;
     leftStack.edgeInsets = NSEdgeInsetsMake(0, 6, 0, 6);
-    [leftStack addArrangedSubview:hd_titlebar_contract_button(0, target)];
+    NSButton* sidebarButton = hd_titlebar_contract_button(0, target);
+    [leftStack addArrangedSubview:sidebarButton];
 
-    NSView* leftContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 48, 32)];
-    leftStack.translatesAutoresizingMaskIntoConstraints = NO;
-    [leftContainer addSubview:leftStack];
-    [NSLayoutConstraint activateConstraints:@[
-        [leftStack.leadingAnchor constraintEqualToAnchor:leftContainer.leadingAnchor],
-        [leftStack.trailingAnchor constraintLessThanOrEqualToAnchor:leftContainer.trailingAnchor],
-        [leftStack.centerYAnchor constraintEqualToAnchor:leftContainer.centerYAnchor],
-    ]];
+    hd_fit_titlebar_stack(leftStack);
 
     NSTitlebarAccessoryViewController* leftController =
         [[NSTitlebarAccessoryViewController alloc] init];
-    leftController.view = leftContainer;
+    leftController.view = leftStack;
     leftController.layoutAttribute = NSLayoutAttributeLeft;
     leftController.fullScreenMinHeight = 32.0;
 
-    // Keep the accessory at its intrinsic width. A fixed 400pt container forces
-    // AppKit to squeeze or wrap titlebar accessories in a portrait emulator
-    // window even though the controls themselves need less than 280pt.
-    NSStackView* rightStack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 351, 32)];
+    // Let AppKit size both titlebar accessories from the visible controls. Fixed-width
+    // containers reserve the hidden FPS label and make portrait emulator windows clip or wrap.
+    NSStackView* rightStack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, 345, 32)];
     rightStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     rightStack.alignment = NSLayoutAttributeCenterY;
-    rightStack.spacing = 4.0;
+    rightStack.spacing = 2.0;
     rightStack.edgeInsets = NSEdgeInsetsMake(0, 4, 0, 4);
 
     NSTextField* fpsLabel = [NSTextField labelWithString:@"— FPS"];
@@ -803,28 +1075,28 @@ bool hd_macos_install_titlebar_controls(void* parent_view,
     fpsLabel.toolTip = @"Android 实时渲染帧率";
     fpsLabel.hidden = YES;
     fpsLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [fpsLabel.widthAnchor constraintEqualToConstant:50.0].active = YES;
+    [fpsLabel.widthAnchor constraintEqualToConstant:44.0].active = YES;
     [rightStack addArrangedSubview:fpsLabel];
 
+    NSMutableArray<NSButton*>* actionButtons = [[NSMutableArray alloc] init];
+    NSView* actionSeparator = nil;
     for (size_t index = 1; index < hd_macos_titlebar_control_count(); index++) {
-        if (index == 7) {
-            [rightStack addArrangedSubview:hd_titlebar_separator()];
+        if (index == 8) {
+            actionSeparator = hd_titlebar_separator();
+            actionSeparator.hidden = YES;
+            [rightStack addArrangedSubview:actionSeparator];
         }
-        [rightStack addArrangedSubview:hd_titlebar_contract_button(index, target)];
+        NSButton* button = hd_titlebar_contract_button(index, target);
+        button.enabled = NO;
+        button.hidden = YES;
+        [actionButtons addObject:button];
+        [rightStack addArrangedSubview:button];
     }
-
-    NSView* rightContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 357, 32)];
-    rightStack.translatesAutoresizingMaskIntoConstraints = NO;
-    [rightContainer addSubview:rightStack];
-    [NSLayoutConstraint activateConstraints:@[
-        [rightStack.trailingAnchor constraintEqualToAnchor:rightContainer.trailingAnchor],
-        [rightStack.leadingAnchor constraintGreaterThanOrEqualToAnchor:rightContainer.leadingAnchor],
-        [rightStack.centerYAnchor constraintEqualToAnchor:rightContainer.centerYAnchor],
-    ]];
+    hd_fit_titlebar_stack(rightStack);
 
     NSTitlebarAccessoryViewController* rightController =
         [[NSTitlebarAccessoryViewController alloc] init];
-    rightController.view = rightContainer;
+    rightController.view = rightStack;
     rightController.layoutAttribute = NSLayoutAttributeRight;
     rightController.fullScreenMinHeight = 32.0;
 
@@ -856,16 +1128,151 @@ bool hd_macos_install_titlebar_controls(void* parent_view,
                                usingBlock:^(__unused NSNotification* notification) {
         callback(context, "{\"command\":\"window_expansion\",\"expanded\":false}");
     }];
-    objc_setAssociatedObject(window, "HDTitlebarControlsTarget", target,
+    NSNotificationCenter* workspaceNotifications =
+        NSWorkspace.sharedWorkspace.notificationCenter;
+    NSArray* previousWorkspaceObservers =
+        objc_getAssociatedObject(window, &HDWorkspaceLifecycleObserversKey);
+    for (id observer in previousWorkspaceObservers) {
+        [workspaceNotifications removeObserver:observer];
+    }
+    id willSleep =
+        [workspaceNotifications addObserverForName:NSWorkspaceWillSleepNotification
+                                            object:nil
+                                             queue:NSOperationQueue.mainQueue
+                                        usingBlock:^(__unused NSNotification* notification) {
+        callback(context, "{\"command\":\"native_lifecycle\",\"state\":\"suspended\"}");
+    }];
+    id didWake =
+        [workspaceNotifications addObserverForName:NSWorkspaceDidWakeNotification
+                                            object:nil
+                                             queue:NSOperationQueue.mainQueue
+                                        usingBlock:^(__unused NSNotification* notification) {
+        callback(context, "{\"command\":\"native_lifecycle\",\"state\":\"resumed\"}");
+    }];
+    objc_setAssociatedObject(window, &HDTitlebarTargetKey, target,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(window, "HDTitlebarControlsControllers",
                              @[leftController, rightController],
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(window, &HDTitlebarFpsLabelKey, fpsLabel,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(window, &HDTitlebarSidebarButtonKey, sidebarButton,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(window, &HDTitlebarActionButtonsKey, actionButtons,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(window, &HDTitlebarSeparatorKey, actionSeparator,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(window, &HDTitlebarLeftStackKey, leftStack,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(window, &HDTitlebarRightStackKey, rightStack,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(window, &HDTitlebarExpansionObserversKey,
                              @[enteredFullScreen, exitedFullScreen],
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(window, &HDWorkspaceLifecycleObserversKey,
+                             @[willSleep, didWake],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return true;
+}
+
+bool hd_macos_set_titlebar_player_state(void* parent_view,
+                                         const char* state_json) {
+    if (parent_view == NULL || state_json == NULL || ![NSThread isMainThread]) {
+        return false;
+    }
+    NSView* parent = (__bridge NSView*)parent_view;
+    NSWindow* window = parent.window;
+    if (window == nil) {
+        return false;
+    }
+    NSData* data = [NSData dataWithBytes:state_json length:strlen(state_json)];
+    id decoded = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![decoded isKindOfClass:[NSDictionary class]]) {
+        return false;
+    }
+    NSDictionary* state = (NSDictionary*)decoded;
+    NSNumber* androidSelectedValue = state[@"android_selected"];
+    NSNumber* controlsVisibleValue = state[@"controls_visible"];
+    NSNumber* sidebarVisibleValue = state[@"sidebar_visible"];
+    NSNumber* powerEnabledValue = state[@"power_enabled"];
+    NSNumber* actionsEnabledValue = state[@"actions_enabled"];
+    NSNumber* recordingSupportedValue = state[@"recording_supported"];
+    NSNumber* recordingActiveValue = state[@"recording_active"];
+    NSNumber* recordingEnabledValue = state[@"recording_enabled"];
+    if (![androidSelectedValue isKindOfClass:[NSNumber class]] ||
+        ![controlsVisibleValue isKindOfClass:[NSNumber class]] ||
+        ![sidebarVisibleValue isKindOfClass:[NSNumber class]] ||
+        ![powerEnabledValue isKindOfClass:[NSNumber class]] ||
+        ![actionsEnabledValue isKindOfClass:[NSNumber class]] ||
+        ![recordingSupportedValue isKindOfClass:[NSNumber class]] ||
+        ![recordingActiveValue isKindOfClass:[NSNumber class]] ||
+        ![recordingEnabledValue isKindOfClass:[NSNumber class]]) {
+        return false;
+    }
+
+    NSButton* sidebarButton = objc_getAssociatedObject(window, &HDTitlebarSidebarButtonKey);
+    NSArray<NSButton*>* actionButtons =
+        objc_getAssociatedObject(window, &HDTitlebarActionButtonsKey);
+    NSView* actionSeparator = objc_getAssociatedObject(window, &HDTitlebarSeparatorKey);
+    NSStackView* leftStack = objc_getAssociatedObject(window, &HDTitlebarLeftStackKey);
+    NSStackView* rightStack = objc_getAssociatedObject(window, &HDTitlebarRightStackKey);
+    if (![sidebarButton isKindOfClass:[NSButton class]] ||
+        ![actionButtons isKindOfClass:[NSArray class]] ||
+        actionButtons.count + 1 != hd_macos_titlebar_control_count() ||
+        ![leftStack isKindOfClass:[NSStackView class]] ||
+        ![rightStack isKindOfClass:[NSStackView class]]) {
+        return false;
+    }
+
+    BOOL androidSelected = androidSelectedValue.boolValue;
+    BOOL controlsVisible = controlsVisibleValue.boolValue;
+    if (controlsVisible && !androidSelected) {
+        return false;
+    }
+    BOOL actionsEnabled = actionsEnabledValue.boolValue;
+    BOOL recordingSupported = recordingSupportedValue.boolValue;
+    BOOL recordingActive = recordingActiveValue.boolValue;
+    BOOL sidebarVisible = sidebarVisibleValue.boolValue;
+    sidebarButton.toolTip = sidebarVisible ? @"折叠侧栏" : @"展开侧栏";
+    sidebarButton.accessibilityLabel = sidebarButton.toolTip;
+    for (NSUInteger buttonIndex = 0; buttonIndex < actionButtons.count; buttonIndex++) {
+        NSButton* button = actionButtons[buttonIndex];
+        size_t contractIndex = buttonIndex + 1;
+        BOOL recordingButton = contractIndex == 6;
+        button.hidden = !controlsVisible || (recordingButton && !recordingSupported);
+        if (contractIndex == 1) {
+            button.enabled = powerEnabledValue.boolValue;
+        } else if (recordingButton) {
+            button.enabled = recordingEnabledValue.boolValue;
+        } else {
+            button.enabled = actionsEnabled;
+        }
+    }
+    actionSeparator.hidden = !controlsVisible;
+
+    NSButton* recordingButton = actionButtons[5];
+    NSString* recordingSymbol = recordingActive ? @"stop.circle.fill" : @"record.circle";
+    NSString* recordingTooltip = recordingActive
+        ? @"停止录屏并保存"
+        : @"开始录屏（最长 3 分钟）";
+    NSString* recordingMessage = recordingActive
+        ? @"{\"command\":\"stop_screen_recording\"}"
+        : @"{\"command\":\"start_screen_recording\"}";
+    recordingButton.toolTip = recordingTooltip;
+    objc_setAssociatedObject(recordingButton, &HDTitlebarButtonMessageKey, recordingMessage,
+                             OBJC_ASSOCIATION_COPY_NONATOMIC);
+    if (@available(macOS 11.0, *)) {
+        NSImage* image = [NSImage imageWithSystemSymbolName:recordingSymbol
+                                  accessibilityDescription:recordingTooltip];
+        if (image != nil) {
+            recordingButton.image = image;
+        }
+    }
+
+    hd_fit_titlebar_stack(leftStack);
+    hd_fit_titlebar_stack(rightStack);
+    [window.contentView.superview setNeedsLayout:YES];
+    [window.contentView.superview layoutSubtreeIfNeeded];
     return true;
 }
 
@@ -885,11 +1292,18 @@ bool hd_macos_set_titlebar_fps(void* parent_view,
         return false;
     }
     NSTextField* label = (NSTextField*)value;
+    BOOL visibilityChanged = label.hidden == visible;
     label.hidden = !visible;
     if (visible) {
         label.stringValue = fps_milli == 0
             ? @"— FPS"
             : [NSString stringWithFormat:@"%.1f FPS", (double)fps_milli / 1000.0];
+    }
+    if (visibilityChanged) {
+        NSStackView* rightStack = objc_getAssociatedObject(window, &HDTitlebarRightStackKey);
+        hd_fit_titlebar_stack(rightStack);
+        [window.contentView.superview setNeedsLayout:YES];
+        [window.contentView.superview layoutSubtreeIfNeeded];
     }
     return true;
 }

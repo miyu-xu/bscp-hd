@@ -6,13 +6,15 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::StreamExt as _;
 use hd_core::{
-    AcquireDisplaySessionRequestV2, ActionRequestV2, ApiErrorV2, CONTROL_PROTOCOL_VERSION,
-    CreateInstanceRequestV2, CreateOperationRequestV2, DiagnosticBundleResponseV2,
-    DiagnosticRequestV2, DisplaySessionV2, DisplayViewportV2, HealthResponseV2, HostCapabilitiesV2,
-    HostRuntimeDescriptorV2, InstanceActionV2, InstanceRecordV2, InstanceSummaryV2,
-    NativeDisplayTargetV2, OperationKindV2, OperationRecordV2, OperationStateV2,
-    ReleaseDisplaySessionRequestV2, ScreenshotRecordV2, ShutdownHostRequestV2,
-    UpdateDisplaySessionRequestV2, UpdateInstanceRequestV2, UploadRecordV2, WorkerIdentityV2,
+    AcquireDisplaySessionRequestV2, ActionRequestV2, AndroidBugreportRecordV2, ApiErrorV2,
+    CONTROL_PROTOCOL_VERSION, CapabilityProbeV2, CreateInstanceRequestV2, CreateOperationRequestV2,
+    DiagnosticBundleResponseV2, DiagnosticRequestV2, DisplayIdV2, DisplaySessionV2,
+    DisplayViewportV2, HealthResponseV2, HostCapabilitiesV2, HostRuntimeDescriptorV2,
+    InstanceActionV2, InstanceRecordV2, InstanceSummaryV2, NativeDisplayTargetV2, OperationKindV2,
+    OperationRecordV2, OperationStateV2, ReleaseDisplaySessionRequestV2, ScreenRecordingRecordV2,
+    ScreenRecordingStatusV2, ScreenshotRecordV2, ShutdownHostRequestV2,
+    StartScreenRecordingRequestV2, UiSnapshotV2, UpdateDisplaySessionRequestV2,
+    UpdateInstanceRequestV2, UploadRecordV2, WorkerIdentityV2,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, HOST, HeaderMap, HeaderValue};
 use serde::Serialize;
@@ -23,12 +25,14 @@ use uuid::Uuid;
 const DESCRIPTOR_LIMIT: u64 = 64 * 1024;
 const RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
 const HOST_START_TIMEOUT: Duration = Duration::from_secs(20);
+const HOST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct HostClientV2 {
     paths: hd_platform::DataPaths,
     descriptor: HostRuntimeDescriptorV2,
     http: reqwest::Client,
+    runtime_current: bool,
 }
 
 impl std::fmt::Debug for HostClientV2 {
@@ -39,6 +43,7 @@ impl std::fmt::Debug for HostClientV2 {
             .field("origin", &self.descriptor.origin)
             .field("host_pid", &self.descriptor.pid)
             .field("host_started_at", &self.descriptor.started_at)
+            .field("runtime_current", &self.runtime_current)
             .finish_non_exhaustive()
     }
 }
@@ -88,44 +93,118 @@ impl HostClientV2 {
             paths,
             descriptor,
             http,
+            runtime_current: false,
         };
         let health = client.health().await?;
         if health.protocol_version != CONTROL_PROTOCOL_VERSION
             || health.service != "hd-host"
             || health.pid != client.descriptor.pid
+            || health.executable_sha256 != client.descriptor.executable_sha256
             || health.started_at != client.descriptor.started_at
         {
             return Err(ClientError::HealthIdentity);
         }
-        Ok(client)
+        let expected_sha256 = expected_host_sha256().await?;
+        Ok(Self {
+            runtime_current: expected_sha256.as_ref().is_none_or(|expected| {
+                client.descriptor.executable_sha256.as_ref() == Some(expected)
+            }),
+            ..client
+        })
     }
 
     pub async fn connect_or_start(paths: hd_platform::DataPaths) -> Result<Self, ClientError> {
         paths.validate_root()?;
         let started = Instant::now();
+        let startup_attempt_id = Uuid::new_v4();
         let mut spawned = false;
+        let mut startup_record_error = None;
+        crate::clear_host_startup_failure(&paths, startup_attempt_id)
+            .map_err(ClientError::HostStartupRecord)?;
         let mut last_error = match Self::connect(paths.clone()).await {
-            Ok(client) => return Ok(client),
+            Ok(client) if client.runtime_current() => return Ok(client),
+            Ok(client) => {
+                if !client.retire_if_idle().await? {
+                    return Ok(client);
+                }
+                ClientError::StaleDescriptor
+            }
             Err(error) => error,
         };
         loop {
             if !spawned {
-                spawn_host(&paths)?;
+                spawn_host(&paths, startup_attempt_id)?;
                 spawned = true;
             }
             if started.elapsed() >= HOST_START_TIMEOUT {
+                if let Some(error) = startup_record_error {
+                    return Err(ClientError::HostStartupRecord(error));
+                }
                 return Err(ClientError::HostStartTimeout(last_error.to_string()));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
             match Self::connect(paths.clone()).await {
-                Ok(client) => return Ok(client),
+                Ok(client) if client.runtime_current() => return Ok(client),
+                Ok(client) => {
+                    if !client.retire_if_idle().await? {
+                        return Ok(client);
+                    }
+                    last_error = ClientError::StaleDescriptor;
+                    spawned = false;
+                }
                 Err(error) => last_error = error,
+            }
+            match crate::read_host_startup_failure(&paths, startup_attempt_id) {
+                Ok(Some(failure)) if failure.startup_attempt_id == startup_attempt_id => {
+                    let _ = crate::clear_host_startup_failure(&paths, startup_attempt_id);
+                    return Err(ClientError::HostStartup {
+                        code: failure.code,
+                        message: failure.message,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => startup_record_error = Some(error),
             }
         }
     }
 
     pub fn descriptor(&self) -> &HostRuntimeDescriptorV2 {
         &self.descriptor
+    }
+
+    #[must_use]
+    pub const fn runtime_current(&self) -> bool {
+        self.runtime_current
+    }
+
+    async fn retire_if_idle(&self) -> Result<bool, ClientError> {
+        let Ok(instances) = self.list_instances().await else {
+            // A partial control-plane failure is not authority to interrupt a Guest.
+            return Ok(false);
+        };
+        if instances
+            .iter()
+            .any(|instance| instance.status.observed.is_active())
+        {
+            return Ok(false);
+        }
+
+        let identity = WorkerIdentityV2 {
+            pid: self.descriptor.pid,
+            process_start_marker: self.descriptor.process_start_marker.clone(),
+            nonce: Uuid::nil(),
+        };
+        if let Err(error) = self.shutdown_and_wait(true).await {
+            if matches!(error, ClientError::HostShutdownTimeout) {
+                return Err(error);
+            }
+            if hd_platform::process_identity_is_alive(&identity) {
+                return Ok(false);
+            }
+            let _ = error;
+            return Ok(true);
+        }
+        Ok(true)
     }
 
     pub async fn health(&self) -> Result<HealthResponseV2, ClientError> {
@@ -151,8 +230,37 @@ impl HostClientV2 {
         .await
     }
 
+    pub async fn resource_admission(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<CapabilityProbeV2, ClientError> {
+        let path = format!("/v2/instances/{instance_id}/resource-admission");
+        self.send_json(
+            self.http
+                .get(self.url(&path)?)
+                .timeout(Duration::from_secs(2)),
+        )
+        .await
+    }
+
     pub async fn list_instances(&self) -> Result<Vec<InstanceSummaryV2>, ClientError> {
         self.get_json("/v2/instances").await
+    }
+
+    pub async fn ui_snapshot(
+        &self,
+        selected_id: Option<Uuid>,
+    ) -> Result<UiSnapshotV2, ClientError> {
+        let path = selected_id.map_or_else(
+            || "/v2/ui-snapshot".to_owned(),
+            |id| format!("/v2/ui-snapshot?selected_id={id}"),
+        );
+        self.send_json(
+            self.http
+                .get(self.url(&path)?)
+                .timeout(Duration::from_secs(2)),
+        )
+        .await
     }
 
     pub async fn get_instance(&self, id: Uuid) -> Result<InstanceRecordV2, ClientError> {
@@ -260,9 +368,11 @@ impl HostClientV2 {
         id: Uuid,
         action: InstanceActionV2,
     ) -> Result<hd_core::WorkerStatusV2, ClientError> {
-        self.post_json(
-            &format!("/v2/instances/{id}/actions"),
-            &ActionRequestV2 { action },
+        self.send_json(
+            self.http
+                .post(self.url(&format!("/v2/instances/{id}/actions"))?)
+                .timeout(Duration::from_secs(30))
+                .json(&ActionRequestV2 { action }),
         )
         .await
     }
@@ -270,12 +380,17 @@ impl HostClientV2 {
     pub async fn acquire_display_session(
         &self,
         id: Uuid,
+        display_id: DisplayIdV2,
         target: NativeDisplayTargetV2,
         viewport: DisplayViewportV2,
     ) -> Result<DisplaySessionV2, ClientError> {
         self.post_json(
             &format!("/v2/instances/{id}/display-session"),
-            &AcquireDisplaySessionRequestV2 { target, viewport },
+            &AcquireDisplaySessionRequestV2 {
+                display_id,
+                target,
+                viewport,
+            },
         )
         .await
     }
@@ -315,6 +430,57 @@ impl HostClientV2 {
     pub async fn capture_screenshot(&self, id: Uuid) -> Result<ScreenshotRecordV2, ClientError> {
         self.post_json(&format!("/v2/instances/{id}/screenshots"), &())
             .await
+    }
+
+    pub async fn collect_android_bugreport(
+        &self,
+        id: Uuid,
+    ) -> Result<AndroidBugreportRecordV2, ClientError> {
+        self.send_json(
+            self.http
+                .post(self.url(&format!("/v2/instances/{id}/android-bugreports"))?)
+                .timeout(Duration::from_mins(11)),
+        )
+        .await
+    }
+
+    pub async fn start_screen_recording(
+        &self,
+        id: Uuid,
+        max_duration_seconds: u16,
+    ) -> Result<ScreenRecordingStatusV2, ClientError> {
+        self.start_display_screen_recording(id, DisplayIdV2::Primary, max_duration_seconds)
+            .await
+    }
+
+    pub async fn start_display_screen_recording(
+        &self,
+        id: Uuid,
+        display_id: DisplayIdV2,
+        max_duration_seconds: u16,
+    ) -> Result<ScreenRecordingStatusV2, ClientError> {
+        self.send_json(
+            self.http
+                .post(self.url(&format!("/v2/instances/{id}/screen-recordings"))?)
+                .timeout(Duration::from_secs(35))
+                .json(&StartScreenRecordingRequestV2 {
+                    display_id,
+                    max_duration_seconds,
+                }),
+        )
+        .await
+    }
+
+    pub async fn stop_screen_recording(
+        &self,
+        id: Uuid,
+    ) -> Result<ScreenRecordingRecordV2, ClientError> {
+        self.send_json(
+            self.http
+                .delete(self.url(&format!("/v2/instances/{id}/screen-recordings"))?)
+                .timeout(Duration::from_secs(190)),
+        )
+        .await
     }
 
     pub async fn upload_apk(&self, path: &Path) -> Result<UploadRecordV2, ClientError> {
@@ -392,6 +558,26 @@ impl HostClientV2 {
             .await
             .map_err(ClientError::Transport)?;
         ensure_empty_success(response).await
+    }
+
+    /// Requests shutdown and waits for an out-of-process Host to release its lifecycle boundary.
+    /// Embedded callers that own the Host server should use [`Self::shutdown`] and join the server
+    /// task themselves because their containing process deliberately remains alive.
+    pub async fn shutdown_and_wait(&self, stop_all: bool) -> Result<(), ClientError> {
+        self.shutdown(stop_all).await?;
+        let identity = WorkerIdentityV2 {
+            pid: self.descriptor.pid,
+            process_start_marker: self.descriptor.process_start_marker.clone(),
+            nonce: Uuid::nil(),
+        };
+        let started = Instant::now();
+        while hd_platform::process_identity_is_alive(&identity) {
+            if started.elapsed() >= HOST_SHUTDOWN_TIMEOUT {
+                return Err(ClientError::HostShutdownTimeout);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
@@ -504,7 +690,7 @@ fn validate_descriptor(descriptor: &HostRuntimeDescriptorV2) -> Result<(), Clien
     Ok(())
 }
 
-fn spawn_host(paths: &hd_platform::DataPaths) -> Result<(), ClientError> {
+fn spawn_host(paths: &hd_platform::DataPaths, startup_attempt_id: Uuid) -> Result<(), ClientError> {
     let executable =
         sibling_host().unwrap_or_else(|| PathBuf::from(hd_platform::executable_name("hd-host")));
     if executable.components().count() > 1 && !executable.is_file() {
@@ -513,6 +699,8 @@ fn spawn_host(paths: &hd_platform::DataPaths) -> Result<(), ClientError> {
     let arguments = vec![
         "--data-root".to_owned(),
         paths.root.to_string_lossy().into_owned(),
+        "--startup-attempt-id".to_owned(),
+        startup_attempt_id.to_string(),
     ];
     hd_platform::spawn_detached(&executable, &arguments, &BTreeMap::default(), &paths.root)?;
     Ok(())
@@ -524,6 +712,19 @@ fn sibling_host() -> Option<PathBuf> {
         .parent()?
         .join(hd_platform::executable_name("hd-host"));
     candidate.is_file().then_some(candidate)
+}
+
+async fn expected_host_sha256() -> Result<Option<String>, ClientError> {
+    let Some(executable) = sibling_host() else {
+        // Direct development binaries can resolve hd-host through PATH. Without a concrete
+        // sibling artifact there is no package identity to enforce.
+        return Ok(None);
+    };
+    tokio::task::spawn_blocking(move || crate::sha256_file(&executable))
+        .await
+        .map_err(|error| ClientError::Task(error.to_string()))?
+        .map(Some)
+        .map_err(ClientError::Runtime)
 }
 
 fn read_regular_limited(path: &Path, maximum: u64) -> Result<Vec<u8>, ClientError> {
@@ -544,6 +745,12 @@ pub enum ClientError {
     HostExecutable(PathBuf),
     #[error("HD host did not become ready before the deadline: {0}")]
     HostStartTimeout(String),
+    #[error("HD Host accepted shutdown but did not exit before the deadline")]
+    HostShutdownTimeout,
+    #[error("HD Host startup failed ({code}): {message}")]
+    HostStartup { code: String, message: String },
+    #[error("HD Host startup failure record is invalid: {0}")]
+    HostStartupRecord(String),
     #[error("host response exceeded the client limit")]
     ResponseTooLarge,
     #[error("host API returned HTTP {status}: {error:?}")]

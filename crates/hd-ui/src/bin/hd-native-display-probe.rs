@@ -17,7 +17,7 @@ mod windows {
 
     use anyhow::{Context as _, Result};
     use clap::Parser;
-    use hd_core::{DisplayViewportV2, NativeDisplayTargetV2, OperationKindV2, StopModeV2};
+    use hd_core::{DisplayViewportV2, OperationKindV2, StopModeV2};
     use hd_platform::{
         DataPaths, NativeDisplayBounds, create_native_display_host, current_process_identity,
     };
@@ -81,9 +81,10 @@ mod windows {
             visible: true,
         })?;
         let mut viewport = display_viewport(physical, window.scale_factor(), 1);
-        let target = native_display.target(current_process_identity(Uuid::new_v4())?);
+        let target = native_display.target(current_process_identity(Uuid::new_v4())?, 0);
         let mut session = runtime.block_on(client.acquire_display_session(
             cli.instance_id,
+            hd_core::DisplayIdV2::Primary,
             target,
             viewport.clone(),
         ))?;

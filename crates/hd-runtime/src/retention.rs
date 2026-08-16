@@ -3,19 +3,112 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use hd_core::RunResultV2;
+use hd_core::{GuestKindV2, InstanceSpecV2, RunResultV2};
 use hd_platform::DataPaths;
 use serde::Serialize;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-pub const DISK_LOW_WATERMARK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-pub const RUN_RETENTION_MAX_COUNT: usize = 40;
+pub const RUN_RETENTION_MAX_COUNT: usize = 20;
 pub const RUN_RETENTION_MIN_COUNT: usize = 5;
-pub const RUN_RETENTION_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const RUN_RETENTION_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const RUN_LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const RUN_LOG_RETAINED_TAIL_BYTES: u64 = 16 * 1024 * 1024;
+pub const RUNTIME_DISK_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 const LOG_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15);
+const ANDROID_PATCHED_INITRD: &str = "initrd-android-hd.img";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeDiskRequirementMode {
+    NewInstanceStorage,
+    ExistingInstanceStorage,
+}
+
+impl RuntimeDiskRequirementMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NewInstanceStorage => "new_instance_storage",
+            Self::ExistingInstanceStorage => "existing_instance_storage",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RuntimeDiskRequirement {
+    pub required_free_bytes: u64,
+    pub mode: RuntimeDiskRequirementMode,
+}
+
+pub fn required_runtime_disk_bytes(spec: Option<&InstanceSpecV2>) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    match spec {
+        Some(instance) if instance.guest_kind == GuestKindV2::Microdroid => GIB.saturating_add(
+            instance
+                .microdroid
+                .as_ref()
+                .and_then(|config| config.encrypted_storage_mib)
+                .map_or(0, |size| u64::from(size).saturating_mul(MIB)),
+        ),
+        _ => 10 * GIB,
+    }
+}
+
+/// Returns free-space headroom still needed for the next run. The full provisioning reserve is
+/// required only before instance storage exists; restarting an existing instance must not count
+/// its already allocated private disk a second time.
+pub fn runtime_disk_requirement(
+    paths: &DataPaths,
+    spec: Option<&InstanceSpecV2>,
+) -> RuntimeDiskRequirement {
+    let Some(spec) = spec else {
+        return RuntimeDiskRequirement {
+            required_free_bytes: required_runtime_disk_bytes(None),
+            mode: RuntimeDiskRequirementMode::NewInstanceStorage,
+        };
+    };
+    if instance_storage_is_allocated(paths, spec) {
+        RuntimeDiskRequirement {
+            required_free_bytes: RUNTIME_DISK_HEADROOM_BYTES,
+            mode: RuntimeDiskRequirementMode::ExistingInstanceStorage,
+        }
+    } else {
+        RuntimeDiskRequirement {
+            required_free_bytes: required_runtime_disk_bytes(Some(spec)),
+            mode: RuntimeDiskRequirementMode::NewInstanceStorage,
+        }
+    }
+}
+
+fn instance_storage_is_allocated(paths: &DataPaths, spec: &InstanceSpecV2) -> bool {
+    let (storage, expected_size) = match spec.guest_kind {
+        GuestKindV2::Android => (paths.disk_overlay(spec.id), None),
+        GuestKindV2::Microdroid => {
+            let Some(size_mib) = spec
+                .microdroid
+                .as_ref()
+                .and_then(|config| config.encrypted_storage_mib)
+            else {
+                return false;
+            };
+            (
+                paths
+                    .instance_dir(spec.id)
+                    .join("microdroid")
+                    .join("storage.img"),
+                Some(u64::from(size_mib).saturating_mul(1024 * 1024)),
+            )
+        }
+    };
+    std::fs::symlink_metadata(storage).is_ok_and(|metadata| {
+        metadata.file_type().is_file()
+            && !metadata.file_type().is_symlink()
+            && expected_size.is_none_or(|expected| metadata.len() == expected)
+            && metadata.len() > 0
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrunedRunV2 {
@@ -27,6 +120,8 @@ pub struct PrunedRunV2 {
 pub struct RunRetentionReportV2 {
     pub retained_count: usize,
     pub retained_bytes: u64,
+    pub removed_ephemeral: Vec<PathBuf>,
+    pub compacted: Vec<RotatedRunLogV2>,
     pub pruned: Vec<PrunedRunV2>,
 }
 
@@ -56,6 +151,8 @@ pub fn enforce_run_retention(
             return Ok(RunRetentionReportV2 {
                 retained_count: 0,
                 retained_bytes: 0,
+                removed_ephemeral: Vec::new(),
+                compacted: Vec::new(),
                 pruned: Vec::new(),
             });
         }
@@ -71,6 +168,8 @@ pub fn enforce_run_retention(
         return Err(RuntimeStorageError::UnsafePath(instance_root));
     }
 
+    let mut removed_ephemeral = Vec::new();
+    let mut compacted = Vec::new();
     let mut runs = Vec::new();
     for entry in std::fs::read_dir(&instance_root).map_err(|source| RuntimeStorageError::Io {
         operation: "scan instance runs",
@@ -108,6 +207,8 @@ pub fn enforce_run_retention(
         if result.instance_id != instance_id || result.run_id != run_id {
             return Err(RuntimeStorageError::RunIdentity(path));
         }
+        removed_ephemeral.extend(remove_finished_run_ephemeral_artifacts(&path)?);
+        compacted.extend(rotate_oversized_run_logs(&path)?);
         runs.push(FinishedRun {
             run_id,
             bytes: directory_size(&path)?,
@@ -134,8 +235,55 @@ pub fn enforce_run_retention(
     Ok(RunRetentionReportV2 {
         retained_count: runs.len(),
         retained_bytes,
+        removed_ephemeral,
+        compacted,
         pruned,
     })
+}
+
+/// Removes exact, reproducible launch artifacts after a run has been finalized.
+///
+/// Runtime logs, manifests, results, and instance storage are intentionally outside this
+/// whitelist. Requiring a finished result prevents an active VM from losing a launch input.
+pub fn remove_finished_run_ephemeral_artifacts(
+    run_dir: &Path,
+) -> Result<Vec<PathBuf>, RuntimeStorageError> {
+    validate_run_dir(run_dir)?;
+    if read_finished_result(run_dir)?.is_none() {
+        return Err(RuntimeStorageError::RunNotFinished(run_dir.to_owned()));
+    }
+    let mut removed = Vec::new();
+    for name in finished_run_ephemeral_artifact_names() {
+        let path = run_dir.join(name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(RuntimeStorageError::Io {
+                    operation: "inspect finished run ephemeral artifact",
+                    path,
+                    source,
+                });
+            }
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(RuntimeStorageError::UnsafePath(path));
+        }
+        std::fs::remove_file(&path).map_err(|source| RuntimeStorageError::Io {
+            operation: "remove finished run ephemeral artifact",
+            path: path.clone(),
+            source,
+        })?;
+        removed.push(path);
+    }
+    Ok(removed)
+}
+
+fn finished_run_ephemeral_artifact_names() -> impl Iterator<Item = String> {
+    std::iter::once(ANDROID_PATCHED_INITRD.to_owned()).chain(
+        (0..hd_core::MAX_MICRODROID_EXTRA_APKS)
+            .map(|index| format!("microdroid-extra-{index}.idsig")),
+    )
 }
 
 pub fn available_runtime_disk_bytes(paths: &DataPaths) -> Result<u64, RuntimeStorageError> {
@@ -365,6 +513,8 @@ pub enum RuntimeStorageError {
     UnsafePath(PathBuf),
     #[error("run result identity does not match its directory: {0}")]
     RunIdentity(PathBuf),
+    #[error("runtime run is not finalized: {0}")]
+    RunNotFinished(PathBuf),
     #[error("{operation} failed for {path}: {source}")]
     Io {
         operation: &'static str,

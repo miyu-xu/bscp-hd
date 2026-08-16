@@ -76,7 +76,7 @@ impl ObservedStateV2 {
                     | (StartingWorker, LaunchingGuest | Stopping | Blocked | Failed)
                     | (
                         LaunchingGuest,
-                        NegotiatingDisplay | Stopping | Blocked | Failed
+                        NegotiatingDisplay | GuestBooting | Stopping | Blocked | Failed
                     )
                     | (
                         NegotiatingDisplay,
