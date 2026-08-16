@@ -561,8 +561,7 @@ fn restore_native_display_siblings(
                 }
                 Some(false) => {
                     if SetWindowRgn(snapshot.window, std::ptr::null_mut(), 1) == 0 {
-                        failures
-                            .push("rollback native input full visual region failed".to_owned());
+                        failures.push("rollback native input full visual region failed".to_owned());
                     }
                 }
                 None => {}
